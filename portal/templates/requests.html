@@ -1,14 +1,18 @@
 {% extends "base.html" %}
+{% set active = "requests" %}
 {% block title %}My requests - golden road{% endblock %}
 {% block main %}
+<span class="eyebrow">Registration</span>
 <h1>My requests</h1>
 {% if requests %}
+<div class="table-wrap">
 <table>
 <tr><th>Repository</th><th>State</th><th>Submitted</th></tr>
-{% for r in requests %}<tr><td><a href="/requests/{{ r.id }}">{{ r.repo }}</a></td><td>{{ r.state }}</td><td>{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% for r in requests %}<tr><td class="mono"><a href="/requests/{{ r.id }}">{{ r.repo }}</a></td><td><span class="badge state-{{ r.state }}">{{ r.state }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
 {% endfor %}
 </table>
+</div>
 {% else %}
-<p>You have not registered anything yet. <a href="/register">Register an app</a>.</p>
+<div class="empty"><p>You have not registered anything yet. <a href="/register">Register an app</a>.</p></div>
 {% endif %}
 {% endblock %}

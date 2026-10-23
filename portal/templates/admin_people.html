@@ -1,26 +1,38 @@
 {% extends "base.html" %}
+{% set active = "people" %}
 {% block title %}People - golden road{% endblock %}
 {% block main %}
+<span class="eyebrow">Admin</span>
 <h1>People</h1>
 {% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
-<p><a href="/admin/identity-links.json">Export identity links (identity-link/v1)</a></p>
+<p class="lead"><a href="/admin/identity-links.json">Export identity links (identity-link/v1)</a></p>
 {% for person, links in people %}
 <section>
+<div class="card-head">
 <h2>{{ person.display_name }}</h2>
-<p>{{ person.id }}{% if person.email %} - {{ person.email }}{% endif %} - last roles: {{ person.last_roles|join(", ") or "contributor only" }}</p>
+<span>{% for role in person.last_roles %}<span class="badge role">{{ role }}</span> {% endfor %}</span>
+</div>
+<p class="meta"><span class="mono">{{ person.id }}</span>{% if person.email %} - {{ person.email }}{% endif %} - last roles: {{ person.last_roles|join(", ") or "contributor only" }}</p>
+<h3>GitHub logins</h3>
+{% if links %}
+<ul class="link-list">
 {% for link in links %}
-<form class="inline" method="post" action="/admin/links/{{ link.id }}/remove">
+<li><form method="post" action="/admin/links/{{ link.id }}/remove">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-{{ link.github_login }} ({{ link.source }})
-<input type="text" name="reason" placeholder="Why remove it (10 characters or more)" required minlength="10" maxlength="1000">
-<button type="submit">Remove</button>
-</form><br>
+<span class="login">{{ link.github_login }} <span class="badge">{{ link.source }}</span></span>
+<input type="text" name="reason" placeholder="Why remove it (10 characters or more)" aria-label="Why remove {{ link.github_login }}" required minlength="10" maxlength="1000">
+<button class="danger" type="submit">Remove</button>
+</form></li>
 {% endfor %}
-<form method="post" action="/admin/people/{{ person.id }}/links">
+</ul>
+{% else %}
+<p class="muted">No GitHub login linked.</p>
+{% endif %}
+<form class="add-link" method="post" action="/admin/people/{{ person.id }}/links">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<input type="text" name="github_login" placeholder="GitHub login" required maxlength="100">
-<input type="text" name="reason" placeholder="Why this login is theirs (10 characters or more)" required minlength="10" maxlength="1000">
-<button type="submit">Add link</button>
+<input type="text" name="github_login" placeholder="GitHub login" aria-label="GitHub login" required maxlength="100">
+<input type="text" name="reason" placeholder="Why this login is theirs (10 characters or more)" aria-label="Why this login is theirs" required minlength="10" maxlength="1000">
+<button class="secondary" type="submit">Add link</button>
 </form>
 </section>
 {% endfor %}

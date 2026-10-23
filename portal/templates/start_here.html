@@ -1,25 +1,41 @@
 {% extends "base.html" %}
+{% set active = "start" %}
 {% block title %}Start here - golden road{% endblock %}
 {% block main %}
+<div class="hero">
+<span class="eyebrow">Golden road</span>
 <h1>Start here</h1>
-<p>The golden road packages an app so that it can be deployed, checked and reviewed the same way every time.</p>
+<p class="lead">The golden road packages an app so that it can be deployed, checked and reviewed the same way every time.</p>
+</div>
 
+<ol class="route">
+<li><section>
 <h2>Before you start</h2>
-<ul>
+<ul class="checklist">
 <li>You can read <code>{{ settings.org }}/golden-road-agents</code> on <code>{{ settings.github_host }}</code>. If not, ask the platform team for access.</li>
 <li>Install <code>uv</code>.</li>
 <li>Sign in to GitHub with <code>gh auth login --hostname {{ settings.github_host }}</code>.</li>
 </ul>
+</section></li>
 
+<li><section>
 <h2>Paste this into your agent</h2>
 <p>Open your agent in the app's folder and paste:</p>
+<div class="terminal">
+<div class="terminal-bar">Prompt for your agent <button type="button" data-copy="paste-block">Copy</button></div>
 <pre id="paste-block">{% with org=settings.org, github_host=settings.github_host %}{% include "paste_block.txt" %}{% endwith %}</pre>
-<p><button type="button" data-copy="paste-block">Copy</button></p>
+</div>
+</section></li>
 
+<li><section>
 <h2>Starter files and versions</h2>
 <p>The starter files are in <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents/releases">the golden-road-agents releases</a>.
 The current versions show here once the portal reads those releases.</p>
+</section></li>
 
+<li><section>
 <h2>Register your app</h2>
 <p>When your app is packaged, <a href="/register">register it</a>. An admin reviews every registration.</p>
+</section></li>
+</ol>
 {% endblock %}

@@ -1,28 +1,41 @@
 {% extends "base.html" %}
+{% set active = "requests" %}
 {% block title %}Request - golden road{% endblock %}
 {% block main %}
-<h1>{{ req.repo }}</h1>
+<span class="eyebrow">Registration request</span>
+<h1 class="mono">{{ req.repo }}</h1>
 {% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
-<p>State: <strong>{{ req.state }}</strong>. Submitted {{ req.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
-<h2>Purpose</h2>
-<pre>{{ req.draft.get("purpose", "") }}</pre>
-<p>Data classification: {{ req.draft.get("data_classification", "not given") }}. Proposed tier: {{ req.draft.get("proposed_tier", "not given") }}.</p>
-{% if req.state == "sent_back" and req.decision_note %}
-<h2>Sent back</h2>
-<pre>{{ req.decision_note }}</pre>
-{% endif %}
-{% if req.pr_url %}<p>Pull request: {{ req.pr_url }}</p>{% endif %}
+<p class="meta">State: <strong class="badge state-{{ req.state }}">{{ req.state }}</strong> Submitted {{ req.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
 {% if req.state == "failed" and req.failure_reason %}<p class="error">It could not be recorded: {{ req.failure_reason }}. An admin will look at it.</p>{% endif %}
+{% if req.state == "sent_back" and req.decision_note %}
+<section class="card">
+<h2>Sent back</h2>
+<pre class="prose">{{ req.decision_note }}</pre>
+</section>
+{% endif %}
+<section>
+<h2>Purpose</h2>
+<pre class="prose">{{ req.draft.get("purpose", "") }}</pre>
+<dl class="facts">
+<div><dt>Data classification</dt><dd>{{ req.draft.get("data_classification", "not given") }}</dd></div>
+<div><dt>Proposed tier</dt><dd>{{ req.draft.get("proposed_tier", "not given") }}</dd></div>
+</dl>
+{% if req.pr_url %}<p>Pull request: <span class="mono">{{ req.pr_url }}</span></p>{% endif %}
+</section>
 {% if mine and req.state == "sent_back" %}
+<section class="form-card">
 <h2>Change it and send it again</h2>
 <form method="post" action="/requests/{{ req.id }}">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
 <p><label>Purpose<br><textarea name="purpose" rows="6" cols="70" required minlength="10" maxlength="4000">{{ req.draft.get("purpose", "") }}</textarea></label></p>
+<div class="field-row">
 <p><label>Data classification
 <select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if req.draft.get("data_classification") == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
 <p><label>Proposed tier
 <select name="proposed_tier">{% for t in tiers %}<option value="{{ t }}"{% if req.draft.get("proposed_tier") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
-<p><button type="submit">Send again</button></p>
+</div>
+<p class="actions"><button type="submit">Send again</button></p>
 </form>
+</section>
 {% endif %}
 {% endblock %}
