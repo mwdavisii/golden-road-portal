@@ -1,0 +1,18 @@
+# The security team's scans, called from here. The scanner workflow lives in the security-scans repo; the platform
+# never runs scanners. The job is named `security-scans`, so the checks are `security-scans / semgrep` and
+# `security-scans / trivy`. The ruleset requires both on pull requests, and Gate 1 requires both before a release is signed.
+name: security-scans
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  security-scans:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: mwdavisii/security-scans/.github/workflows/scan.yml@main

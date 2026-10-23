@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}People - golden road{% endblock %}
+{% block main %}
+<h1>People</h1>
+{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
+<p><a href="/admin/identity-links.json">Export identity links (identity-link/v1)</a></p>
+{% for person, links in people %}
+<section>
+<h2>{{ person.display_name }}</h2>
+<p>{{ person.id }}{% if person.email %} - {{ person.email }}{% endif %} - last roles: {{ person.last_roles|join(", ") or "contributor only" }}</p>
+{% for link in links %}
+<form class="inline" method="post" action="/admin/links/{{ link.id }}/remove">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+{{ link.github_login }} ({{ link.source }})
+<input type="text" name="reason" placeholder="Why remove it (10 characters or more)" required minlength="10" maxlength="1000">
+<button type="submit">Remove</button>
+</form><br>
+{% endfor %}
+<form method="post" action="/admin/people/{{ person.id }}/links">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="text" name="github_login" placeholder="GitHub login" required maxlength="100">
+<input type="text" name="reason" placeholder="Why this login is theirs (10 characters or more)" required minlength="10" maxlength="1000">
+<button type="submit">Add link</button>
+</form>
+</section>
+{% endfor %}
+{% endblock %}

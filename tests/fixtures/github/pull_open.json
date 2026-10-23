@@ -1,0 +1,17 @@
+{
+  "number": 12,
+  "html_url": "https://github.com/acme/scorecard-factory/pull/12",
+  "state": "open",
+  "merged": false,
+  "head": {
+    "ref": "portal/request-x",
+    "sha": "2222222222222222222222222222222222222222",
+    "repo": {
+      "full_name": "acme/scorecard-factory"
+    }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "1111111111111111111111111111111111111111"
+  }
+}

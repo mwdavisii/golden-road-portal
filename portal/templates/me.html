@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Me - golden road{% endblock %}
+{% block main %}
+<h1>{{ principal.person.display_name }}</h1>
+{% if principal.person.email %}<p>{{ principal.person.email }}</p>{% endif %}
+<h2>Roles</h2>
+<p>contributor{% for role in principal.roles|sort %}, {{ role }}{% endfor %}</p>
+<h2>GitHub logins</h2>
+{% if links %}
+<table>
+<tr><th>Login</th><th>How it was linked</th><th>Since</th></tr>
+{% for link in links %}<tr><td>{{ link.github_login }}</td><td>{{ link.source }}</td><td>{{ link.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No GitHub login is linked to you yet. Registering an app needs one, and you must be an admin of the repo on GitHub.</p>
+{% endif %}
+<p><a href="/link/github">Link your GitHub login</a></p>
+{% endblock %}

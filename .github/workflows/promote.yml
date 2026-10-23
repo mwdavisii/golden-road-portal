@@ -1,0 +1,21 @@
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Test release tag to promote (test-YYYYMMDDHHMMSS-sha7)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  actions: read
+
+jobs:
+  golden-road:
+    uses: mwdavisii/platform-pipeline/.github/workflows/golden-road-promote.yml@main
+    with:
+      release: ${{ inputs.release }}

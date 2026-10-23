@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}My requests - golden road{% endblock %}
+{% block main %}
+<h1>My requests</h1>
+{% if requests %}
+<table>
+<tr><th>Repository</th><th>State</th><th>Submitted</th></tr>
+{% for r in requests %}<tr><td><a href="/requests/{{ r.id }}">{{ r.repo }}</a></td><td>{{ r.state }}</td><td>{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% endfor %}
+</table>
+{% else %}
+<p>You have not registered anything yet. <a href="/register">Register an app</a>.</p>
+{% endif %}
+{% endblock %}

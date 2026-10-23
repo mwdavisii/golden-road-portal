@@ -1,0 +1,28 @@
+{
+  "default": "deny",
+  "exempt_paths": [
+    "/healthz"
+  ],
+  "identity_header": "X-Platform-Roles",
+  "roles": [
+    {
+      "access": "write",
+      "name": "portal"
+    }
+  ],
+  "rules": [
+    {
+      "methods": [
+        "DELETE",
+        "GET",
+        "PATCH",
+        "POST",
+        "PUT"
+      ],
+      "path": "/**",
+      "roles": [
+        "portal"
+      ]
+    }
+  ]
+}

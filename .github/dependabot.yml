@@ -1,0 +1,18 @@
+# Dependency updates. Dependabot opens pull requests like any contributor, so they get the same checks and review.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7   # wait a week after a release before proposing it: newly published versions can be malicious or broken
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7   # wait a week after a release before proposing it: newly published versions can be malicious or broken
+# For a Node app, use package-ecosystem: npm instead of pip.

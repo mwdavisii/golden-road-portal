@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  golden-road:
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    uses: mwdavisii/platform-pipeline/.github/workflows/golden-road.yml@main
+    with:
+      app_name: golden-road-portal

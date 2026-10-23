@@ -1,0 +1,13 @@
+{
+  "id": 777,
+  "app_id": 424242,
+  "repository_selection": "selected",
+  "permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read",
+    "checks": "read",
+    "administration": "read",
+    "actions": "read"
+  }
+}

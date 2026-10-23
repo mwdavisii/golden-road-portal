@@ -1,0 +1,3 @@
+{% extends "base.html" %}
+{% block title %}Golden road{% endblock %}
+{% block main %}<h1>{{ message }}</h1>{% if not principal.signed_in %}<p><a href="/login">Sign in</a></p>{% endif %}{% endblock %}

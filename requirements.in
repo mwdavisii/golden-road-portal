@@ -1,0 +1,13 @@
+# The portal's direct dependencies. Lock them from the repo root with:
+#   uv pip compile --generate-hashes --python-version 3.12 bootstrap/golden-road-portal/requirements.in -o bootstrap/golden-road-portal/requirements.txt
+#   uv pip compile --generate-hashes --python-version 3.12 bootstrap/golden-road-portal/requirements-test.in -o bootstrap/golden-road-portal/requirements-test.txt
+fastapi
+uvicorn
+jinja2
+python-multipart
+httpx
+psycopg[binary]
+psycopg-pool
+pyjwt[crypto]
+jsonschema
+pyyaml

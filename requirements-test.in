@@ -1,0 +1,4 @@
+# The portal's test dependencies, constrained to the image's pins (requirements.txt) so tests run what ships.
+-c requirements.txt
+-r requirements.in
+pytest

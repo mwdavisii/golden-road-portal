@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/intake.v2.json",
+  "title": "intake/v2",
+  "description": "The factory's intake/<owner>/<repo>.yaml as the portal's writer records it: intake/v1's fields, an owner of record that is a portal person, who registered and approved it, when and why, and when it is next reviewed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "tier", "purpose", "owner", "data_classification", "registered_by", "approved_by", "approved_at", "approval_justification", "review_by", "request"],
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "person": {"type": "string", "pattern": "^p_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  },
+  "properties": {
+    "schema": {"const": "intake/v2"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "tier": {"enum": ["low", "moderate", "high"]},
+    "purpose": {"type": "string", "minLength": 10, "maxLength": 4000},
+    "owner": {"$ref": "#/$defs/person"},
+    "data_classification": {"enum": ["public", "internal", "restricted", "phi"]},
+    "registered_by": {"$ref": "#/$defs/person"},
+    "approved_by": {"$ref": "#/$defs/person"},
+    "approved_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "approval_justification": {"type": "string", "minLength": 10, "maxLength": 1000, "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "review_by": {"type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "request": {"type": "string", "pattern": "^r_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  }
+}

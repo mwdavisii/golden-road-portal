@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/registration-draft.v1.json",
+  "title": "registration-draft/v1",
+  "description": "What `golden-road register` puts in the portal link's fragment. Untrusted: the register page shows it as text, and the person checks and submits it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo"],
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}}
+  },
+  "properties": {
+    "schema": {"const": "registration-draft/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "purpose": {"type": "string", "maxLength": 4000},
+    "data_classification": {"enum": ["public", "internal", "restricted", "phi"]},
+    "proposed_tier": {"enum": ["low", "moderate", "high"]}
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/identity-link.v1.json",
+  "title": "identity-link/v1",
+  "description": "The portal's export and import format for one link from a person to a GitHub login.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "person", "github_login", "source", "created_by", "created_at"],
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "person": {"type": "string", "pattern": "^p_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  },
+  "properties": {
+    "schema": {"const": "identity-link/v1"},
+    "person": {"$ref": "#/$defs/person"},
+    "github_login": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "source": {"enum": ["github-oauth", "admin"]},
+    "created_by": {"$ref": "#/$defs/person"},
+    "created_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  }
+}

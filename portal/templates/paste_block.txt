@@ -1,0 +1,6 @@
+Package this app for the golden road. Read INSTALL_FOR_AGENTS.md from {{ org }}/golden-road-agents with
+gh api --hostname {{ github_host }} -H "Accept: application/vnd.github.raw" repos/{{ org }}/golden-road-agents/contents/INSTALL_FOR_AGENTS.md
+and follow every step of it. If you can't read that repo, stop and tell me to request access from the platform team.
+Ask me every question the builder returns; never answer data classification, roles, or egress yourself. Show me each
+command that changes anything outside this folder and wait for my yes. Never make a repo public. You are done only
+when `golden-road doctor` exits 0.

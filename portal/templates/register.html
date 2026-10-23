@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Register an app - golden road{% endblock %}
+{% block head %}<script src="/static/register.js" defer></script>{% endblock %}
+{% block main %}
+<h1>Register an app</h1>
+<p>A registration says who owns an app, what it is for and how sensitive its data is. An admin reviews it before anything is recorded.</p>
+{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
+{% if not principal.signed_in %}
+<p><a href="/login?next=/register">Sign in</a> to register an app. A draft in the link you opened is kept in this tab and filled in after you sign in.</p>
+{% elif not repos %}
+<p>The portal sees no repository that you are an admin of. <a href="/link/github">Link your GitHub login</a> first, and give the portal a few minutes to see your repositories.</p>
+{% else %}
+<p id="draft-status" role="status"></p>
+<form id="register-form" method="post" action="/register">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p><label>Repository
+<select name="repo" required>
+{% for r in repos %}<option value="{{ r.repo }}"{% if form.repo == r.repo %} selected{% endif %}>{{ r.repo }}</option>
+{% endfor %}
+</select></label></p>
+<p><label>What the app is for, and what it does not do<br>
+<textarea name="purpose" rows="6" cols="70" required minlength="10" maxlength="4000">{{ form.purpose }}</textarea></label></p>
+<p><label>Data classification
+<select name="data_classification" required>
+{% for c in classifications %}<option value="{{ c }}"{% if form.data_classification == c %} selected{% endif %}>{{ c }}</option>
+{% endfor %}
+</select></label></p>
+<p><label>Proposed tier
+<select name="proposed_tier" required>
+{% for t in tiers %}<option value="{{ t }}"{% if form.proposed_tier == t %} selected{% endif %}>{{ t }}</option>
+{% endfor %}
+</select></label></p>
+<p><button type="submit">Submit for review</button></p>
+</form>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Start here - golden road{% endblock %}
+{% block main %}
+<h1>Start here</h1>
+<p>The golden road packages an app so that it can be deployed, checked and reviewed the same way every time.</p>
+
+<h2>Before you start</h2>
+<ul>
+<li>You can read <code>{{ settings.org }}/golden-road-agents</code> on <code>{{ settings.github_host }}</code>. If not, ask the platform team for access.</li>
+<li>Install <code>uv</code>.</li>
+<li>Sign in to GitHub with <code>gh auth login --hostname {{ settings.github_host }}</code>.</li>
+</ul>
+
+<h2>Paste this into your agent</h2>
+<p>Open your agent in the app's folder and paste:</p>
+<pre id="paste-block">{% with org=settings.org, github_host=settings.github_host %}{% include "paste_block.txt" %}{% endwith %}</pre>
+<p><button type="button" data-copy="paste-block">Copy</button></p>
+
+<h2>Starter files and versions</h2>
+<p>The starter files are in <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents/releases">the golden-road-agents releases</a>.
+The current versions show here once the portal reads those releases.</p>
+
+<h2>Register your app</h2>
+<p>When your app is packaged, <a href="/register">register it</a>. An admin reviews every registration.</p>
+{% endblock %}

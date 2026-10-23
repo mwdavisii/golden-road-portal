@@ -1,0 +1,44 @@
+{
+  "total_count": 1,
+  "workflow_runs": [
+    {
+      "id": 8001,
+      "name": "factory-check",
+      "check_suite_id": 5001,
+      "event": "pull_request",
+      "head_branch": "portal/request-x",
+      "head_sha": "2222222222222222222222222222222222222222",
+      "head_repository": {
+        "full_name": "acme/scorecard-factory"
+      },
+      "repository": {
+        "full_name": "acme/scorecard-factory"
+      },
+      "pull_requests": [
+        {
+          "id": 12000,
+          "number": 12,
+          "url": "https://api.github.com/repos/acme/scorecard-factory/pulls/12",
+          "head": {
+            "ref": "portal/request-x",
+            "sha": "2222222222222222222222222222222222222222",
+            "repo": {
+              "id": 1,
+              "name": "scorecard-factory",
+              "url": "https://api.github.com/repos/acme/scorecard-factory"
+            }
+          },
+          "base": {
+            "ref": "main",
+            "sha": "1111111111111111111111111111111111111111",
+            "repo": {
+              "id": 1,
+              "name": "scorecard-factory",
+              "url": "https://api.github.com/repos/acme/scorecard-factory"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

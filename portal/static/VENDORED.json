@@ -1,0 +1,20 @@
+{
+  "htmx.min.js": {
+    "package": "htmx.org",
+    "version": "2.0.4",
+    "url": "https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js",
+    "upstream_sha256": "e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447",
+    "patches": [
+      {
+        "from": "return vn(ne().body,function(){return eval(e)})",
+        "to": "return vn(ne().body,function(){throw new Error(\"htmx: eval is not available in this build\")})"
+      },
+      {
+        "from": "if(!o){o=new Function(\"event\",n)}",
+        "to": "if(!o){throw new Error(\"htmx: hx-on is not available in this build\")}"
+      }
+    ],
+    "patch_reason": "The scanner's rules refuse direct eval and a Function constructor call anywhere in the tree, so those two call sites are removed. Two more Function(...) calls remain, in htmx's evaluation of attribute values and trigger filters; they run only when allowEval is true. The portal sets allowEval to false in its htmx-config, the page's CSP forbids unsafe-eval, and no template uses htmx's evaluated attributes (hx-vals, hx-vars, hx-on), so none of them is reachable.",
+    "sha256": "1ab9a79b105fee24cf2d0d78a3bed497c0a0d507cd51f4300c746584352a6a13"
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "app_name": "golden-road-portal",
+  "app_type": "python",
+  "authz": {
+    "default": "deny",
+    "roles": [
+      {
+        "access": "write",
+        "name": "portal"
+      }
+    ],
+    "rules": [
+      {
+        "methods": [
+          "DELETE",
+          "GET",
+          "PATCH",
+          "POST",
+          "PUT"
+        ],
+        "path": "/**",
+        "roles": [
+          "portal"
+        ]
+      }
+    ]
+  },
+  "data_classification": "internal",
+  "egress": [
+    {
+      "host": "api.github.com",
+      "port": 443,
+      "reason": "GitHub API: identity linking"
+    },
+    {
+      "host": "github.com",
+      "port": 443,
+      "reason": "GitHub OAuth: identity linking"
+    }
+  ],
+  "entrypoint": "portal.main:app",
+  "env": [
+    {
+      "name": "PORTAL_BASE_URL",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_ORG",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_GITHUB_HOST",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_OIDC_ISSUER",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_OIDC_CLIENT_ID",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_OIDC_CLIENT_SECRET",
+      "secret": true
+    },
+    {
+      "name": "PORTAL_ROLE_GROUPS",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_GITHUB_OAUTH_CLIENT_ID",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_GITHUB_OAUTH_CLIENT_SECRET",
+      "secret": true
+    },
+    {
+      "name": "PORTAL_DATABASE_URL",
+      "secret": true
+    }
+  ],
+  "health_path": "/healthz",
+  "port": 8080,
+  "resources_tier": "default",
+  "server": "uvicorn"
+}

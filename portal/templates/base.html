@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false, "selfRequestsOnly": true}'>
+<title>{% block title %}Golden road{% endblock %}</title>
+<link rel="stylesheet" href="/static/portal.css">
+<script src="/static/htmx.min.js" defer></script>
+<script src="/static/copy.js" defer></script>
+{% block head %}{% endblock %}
+</head>
+<body hx-headers='{"X-CSRF-Token": {{ csrf|tojson }}}'>
+<header>
+<nav>
+<a href="/">Start here</a>
+{% if principal.signed_in %}
+<a href="/me">Me</a>
+<a href="/register">Register</a>
+<a href="/requests">My requests</a>
+{% if principal.is_admin %}
+<a href="/admin/approvals">Approvals</a>
+<a href="/admin/people">People</a>
+<a href="/admin/audit">Audit log</a>
+{% endif %}
+<form class="inline" method="post" action="/logout">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<button type="submit">Sign out ({{ principal.person.display_name }})</button>
+</form>
+{% else %}
+<a href="/login">Sign in</a>
+{% endif %}
+</nav>
+</header>
+<main>
+{% block main %}{% endblock %}
+</main>
+</body>
+</html>
