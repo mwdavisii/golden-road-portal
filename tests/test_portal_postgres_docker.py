@@ -66,7 +66,7 @@ def test_the_collector_role_sees_repo_admins_and_nothing_else(pg_db):
         conn.execute("INSERT INTO repo_admin VALUES ('acme/notes', 'pat', 1001, 'github', now())")
         for table in ("person", "session", "request", "audit_log", "identity_link", "login_state"):
             with pytest.raises(errors.InsufficientPrivilege):
-                conn.execute(sql.SQL("SELECT 1 FROM {}").format(sql.Identifier(table)))
+                conn.execute(sql.Composed([sql.SQL("SELECT 1 FROM "), sql.Identifier(table)]))
 
 
 def test_each_process_role_can_do_its_work_through_the_store(pg_db):
@@ -241,9 +241,10 @@ def test_a_request_is_inserted_without_commits(pg_db):
 def test_an_admin_link_is_never_made_by_the_person_it_names(pg_db):
     ids = seed_requests(pg_db)
     link = ("INSERT INTO identity_link (id, person_id, github_login, source, created_by, created_at) "
-            "VALUES ('l_" + "1" * 32 + "', %s, 'me-gh', %s, %s, now())")
+            "VALUES (%s, %s, 'me-gh', %s, %s, now())")
+    link_id = "l_" + "1" * 32
     with pytest.raises(errors.CheckViolation):
         with as_role(pg_db, "portal_web") as conn:
-            conn.execute(link, (ids["admin"], "admin", ids["admin"]))
+            conn.execute(link, (link_id, ids["admin"], "admin", ids["admin"]))
     with as_role(pg_db, "portal_web") as conn:  # github-oauth links are made by the person: that is the point of them
-        conn.execute(link, (ids["owner"], "github-oauth", ids["owner"]))
+        conn.execute(link, (link_id, ids["owner"], "github-oauth", ids["owner"]))
