@@ -150,3 +150,12 @@ def test_the_vendored_htmx_patch_reason_names_what_remains():
     assert text.count("Function(") == 2, "the reason says exactly two Function calls remain"
     for template in (PORTAL_DIR / "templates").rglob("*"):
         assert not any(a in template.read_text() for a in ("hx-vals", "hx-vars", "hx-on", "hx-trigger")), template.name
+
+
+def test_start_here_links_the_agents_repo_and_says_how_to_install_uv(portal):
+    text = portal.client().get("/").text
+    assert '<a href="https://github.com/acme/golden-road-agents">' in text  # "you can read" this repo: one click to check
+    assert 'href="https://docs.astral.sh/uv/getting-started/installation/"' in text
+    for command in ("brew install uv", "winget install --id=astral-sh.uv -e", "curl -LsSf https://astral.sh/uv/install.sh | sh",
+                    "uv --version"):
+        assert command in text, command

@@ -12,8 +12,15 @@
 <li><section>
 <h2>Before you start</h2>
 <ul class="checklist">
-<li>You can read <code>{{ settings.org }}/golden-road-agents</code> on <code>{{ settings.github_host }}</code>. If not, ask the platform team for access.</li>
-<li>Install <code>uv</code>.</li>
+<li>You can read <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents"><code>{{ settings.org }}/golden-road-agents</code></a> on <code>{{ settings.github_host }}</code>. Open the link: if you see the repository, you're set. If not, ask the platform team for access.</li>
+<li>Install <code>uv</code>, the Python tool the skill uses to install the builder:
+<ul>
+<li>macOS: <code>brew install uv</code></li>
+<li>Windows: <code>winget install --id=astral-sh.uv -e</code></li>
+<li>Linux, or macOS without Homebrew: <code>curl -LsSf https://astral.sh/uv/install.sh | sh</code></li>
+</ul>
+Then open a new terminal and check that <code>uv --version</code> prints a version. Other ways to install it are in
+<a href="https://docs.astral.sh/uv/getting-started/installation/">uv's installation guide</a>.</li>
 <li>Sign in to GitHub with <code>gh auth login --hostname {{ settings.github_host }}</code>.</li>
 </ul>
 </section></li>
