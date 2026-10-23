@@ -77,17 +77,26 @@ def _ruleset_problems(gh, repo, cfg) -> list[str]:
     for ruleset_id in ids:
         try:
             ruleset = gh.call("GET", f"/repos/{repo}/rulesets/{ruleset_id}", params={"includes_parents": "true"}).json()
-            actors = ruleset["bypass_actors"] if isinstance(ruleset, dict) else None
-        except (GitHubError, KeyError, TypeError, ValueError):
-            actors = None
-        if not isinstance(actors, list):
+        except (GitHubError, TypeError, ValueError):
+            ruleset = None
+        if not isinstance(ruleset, dict):
             problems.append(f"can't read the bypass actors of ruleset {ruleset_id} in {repo}")
             continue
+        actors = ruleset.get("bypass_actors")
+        can_bypass = ruleset.get("current_user_can_bypass")  # what GitHub says about the caller (the installation), when it says
+        # GitHub shows bypass_actors only to a caller that can edit the ruleset; the write App (administration: read) gets
+        # current_user_can_bypass instead, which is GitHub's own word on this caller and covers role and org bypasses too.
+        if not isinstance(actors, list):
+            if not isinstance(can_bypass, str):
+                problems.append(f"can't read the bypass actors of ruleset {ruleset_id} in {repo}")
+                continue
+            actors = []
         # Every ruleset counts, whatever its enforcement: one that is off or only evaluating today can be switched on tomorrow.
         where = f"ruleset {ruleset_id} in {repo}"
         types = [r.get("type") for r in ruleset.get("rules") or [] if isinstance(r, dict)]
         ours = [a for a in actors if _is_ours(a, cfg)]
-        can_bypass = ruleset.get("current_user_can_bypass")  # what GitHub says about the caller (the installation), when it says
+        if not ours and can_bypass == "pull_requests_only":  # a pull request bypass GitHub reports is judged like a listed one
+            ours = [{"actor_type": "Integration", "actor_id": cfg.app_id, "bypass_mode": "pull_request"}]
         if "required_status_checks" in types and (ours or can_bypass not in (None, "never")):
             problems.append(f"the write App can bypass status checks in {where}")
         if ours:

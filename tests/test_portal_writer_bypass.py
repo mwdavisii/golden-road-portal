@@ -139,3 +139,40 @@ def test_the_recorded_github_refuses_a_call_the_installation_has_no_permission_f
         c.call("GET", R + "/actions/runs", params={"check_suite_id": 1})
     assert err.value.status == 403
     assert FakeGitHub().routes == {} and FakeGitHub().permissions["actions"] == "read"
+
+
+def as_the_app_sees_it(checks_bypass, review_bypass):
+    """GitHub hides bypass_actors from a caller that can't edit the ruleset (the write App has administration: read) and gives
+    current_user_can_bypass instead: GitHub's own word on whether this caller can bypass the ruleset."""
+    def edit(d):
+        for name, value in (("ruleset_checks", checks_bypass), ("ruleset_review", review_bypass)):
+            d[name].pop("bypass_actors", None)
+            if value is None:
+                d[name].pop("current_user_can_bypass", None)
+            else:
+                d[name]["current_user_can_bypass"] = value
+    return edit
+
+
+def test_without_bypass_actors_github_s_word_for_the_app_is_enough():
+    assert run(recorded(as_the_app_sees_it("never", "pull_requests_only"))) == []
+
+
+@pytest.mark.parametrize("checks, review, needle", [
+    (None, "pull_requests_only", "can't read the bypass actors"),       # neither the list nor GitHub's word: unchecked
+    ("never", None, "can't read the bypass actors"),
+    ("pull_requests_only", "pull_requests_only", "bypass status checks"),  # the checks ruleset must be never
+    ("always", "pull_requests_only", "bypass status checks"),
+    ("never", "always", "current_user_can_bypass"),                     # more than a pull request bypass on the review ruleset
+    ("never", "exempt", "current_user_can_bypass"),
+])
+def test_without_bypass_actors_anything_but_never_and_pull_requests_only_is_a_problem(checks, review, needle):
+    problems = run(recorded(as_the_app_sees_it(checks, review)))
+    assert any(needle in p for p in problems), problems
+
+
+def test_a_pull_request_bypass_github_reports_still_needs_the_review_ruleset_s_shape():
+    def edit(d):
+        as_the_app_sees_it("never", "pull_requests_only")(d)
+        d["ruleset_review"]["conditions"]["ref_name"]["include"] = ["~ALL"]
+    assert any("only the default branch" in p for p in run(recorded(edit)))
