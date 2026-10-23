@@ -11,29 +11,35 @@
 {% block head %}{% endblock %}
 </head>
 <body hx-headers='{"X-CSRF-Token": {{ csrf|tojson }}}'>
+{% set active = active|default("") %}
+{% macro nav_link(href, key, label) %}<a href="{{ href }}"{% if active == key %} aria-current="page"{% endif %}>{{ label }}</a>{% endmacro %}
 <header>
-<nav>
-<a href="/">Start here</a>
+<nav aria-label="Main">
+<a class="brand" href="/">Golden road</a>
+{{ nav_link("/", "start", "Start here") }}
 {% if principal.signed_in %}
-<a href="/me">Me</a>
-<a href="/register">Register</a>
-<a href="/requests">My requests</a>
+{{ nav_link("/me", "me", "Me") }}
+{{ nav_link("/register", "register", "Register") }}
+{{ nav_link("/requests", "requests", "My requests") }}
 {% if principal.is_admin %}
-<a href="/admin/approvals">Approvals</a>
-<a href="/admin/people">People</a>
-<a href="/admin/audit">Audit log</a>
+<span class="admin-group"><span class="admin-label">Admin</span>
+{{ nav_link("/admin/approvals", "approvals", "Approvals") }}
+{{ nav_link("/admin/people", "people", "People") }}
+{{ nav_link("/admin/audit", "audit", "Audit log") }}
+</span>
 {% endif %}
 <form class="inline" method="post" action="/logout">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
 <button type="submit">Sign out ({{ principal.person.display_name }})</button>
 </form>
 {% else %}
-<a href="/login">Sign in</a>
+<a class="sign-in" href="/login">Sign in</a>
 {% endif %}
 </nav>
 </header>
 <main>
 {% block main %}{% endblock %}
 </main>
+<footer><p>Golden road portal. Every registration is reviewed by an admin, and every decision is in the audit log.</p></footer>
 </body>
 </html>

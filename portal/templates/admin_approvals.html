@@ -1,43 +1,57 @@
 {% extends "base.html" %}
+{% set active = "approvals" %}
 {% block title %}Approvals - golden road{% endblock %}
 {% block main %}
+<span class="eyebrow">Admin</span>
 <h1>Approvals</h1>
 {% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
-{% if not items %}<p>No registrations are waiting.</p>{% endif %}
+{% if not items %}<div class="empty"><p>No registrations are waiting.</p></div>{% else %}<p class="lead">{{ items|length }} waiting for a decision.</p>{% endif %}
 {% for item in items %}
 {% set r = item.request %}
 <section>
-<h2>{{ r.repo }}</h2>
-<p>Requested by {{ item.requester.display_name if item.requester else r.requested_by }}
+<div class="card-head">
+<h2 class="repo">{{ r.repo }}</h2>
+<span class="badge state-{{ r.state }}">{{ r.state }}</span>
+</div>
+<p class="meta">Requested by {{ item.requester.display_name if item.requester else r.requested_by }}
 {% if item.links %}(GitHub:{% for link in item.links %} {{ link.github_login }} [{{ link.source }}{% if link.github_user_id is none %}, no GitHub user ID{% endif %}]{% endfor %}){% else %}(no GitHub login linked){% endif %}
 on {{ r.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
-{% if item.unverified %}<p class="error">Unverified: the requester's linked login has no GitHub user ID, so it was matched by name only. A renamed or reused login would match too.</p>{% endif %}
-{% if item.admin_seen %}<p>Admin of {{ r.repo }} on GitHub, as the portal last saw it ({{ item.admin_seen.observed_at.strftime("%Y-%m-%d %H:%M") }} UTC).</p>
-{% elif item.stale_note %}<p class="error">{{ item.stale_note }} Approving will be refused until the collector has run again.</p>
+{% if item.unverified %}<p class="error warn">Unverified: the requester's linked login has no GitHub user ID, so it was matched by name only. A renamed or reused login would match too.</p>{% endif %}
+{% if item.admin_seen %}<p class="callout ok">Admin of {{ r.repo }} on GitHub, as the portal last saw it ({{ item.admin_seen.observed_at.strftime("%Y-%m-%d %H:%M") }} UTC).</p>
+{% elif item.stale_note %}<p class="error warn">{{ item.stale_note }} Approving will be refused until the collector has run again.</p>
 {% else %}<p class="error">The portal does not see the requester as an admin of {{ r.repo }}. Approving will be refused.</p>{% endif %}
 <h3>Purpose</h3>
-<pre>{{ r.draft.get("purpose", "") }}</pre>
-<p>Requested classification: {{ r.draft.get("data_classification", "not given") }}. Proposed tier: {{ r.draft.get("proposed_tier", "not given") }}.</p>
+<pre class="prose">{{ r.draft.get("purpose", "") }}</pre>
+<dl class="facts">
+<div><dt>Requested classification</dt><dd>{{ r.draft.get("data_classification", "not given") }}</dd></div>
+<div><dt>Proposed tier</dt><dd>{{ r.draft.get("proposed_tier", "not given") }}</dd></div>
+</dl>
+<div class="decision">
 {% if item.mine %}
-<p>You requested this, so another admin must decide it.</p>
+<p class="callout info">You requested this, so another admin must decide it.</p>
 {% else %}
+<h3>Decide</h3>
 <form method="post" action="/admin/requests/{{ r.id }}/approve">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
+<div class="field-row">
 <p><label>Tier
-<select name="tier">{% for t in tiers %}<option value="{{ t }}"{% if r.draft.get("proposed_tier") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label>
-<label>Data classification
-<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if r.draft.get("data_classification") == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
-<label>Review by <input type="date" name="review_by" value="{{ review_by }}" required></label></p>
-<p><label>Why this is right (10 to 1000 characters, one line)<br>
+<select name="tier">{% for t in tiers %}<option value="{{ t }}"{% if r.draft.get("proposed_tier") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
+<p><label>Data classification
+<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if r.draft.get("data_classification") == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
+<p><label>Review by <input type="date" name="review_by" value="{{ review_by }}" required></label></p>
+</div>
+<p><label>Why this is right <span class="hint">(10 to 1000 characters, one line)</span><br>
 <input type="text" name="justification" size="80" required minlength="10" maxlength="1000"></label></p>
-<p><button type="submit">Approve</button></p>
+<p class="actions"><button type="submit">Approve</button></p>
 </form>
-<form method="post" action="/admin/requests/{{ r.id }}/send-back">
+<form class="send-back" method="post" action="/admin/requests/{{ r.id }}/send-back">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<p><label>What to change<br><input type="text" name="justification" size="80" required minlength="10" maxlength="1000"></label>
-<button type="submit">Send back</button></p>
+<label for="send-back-{{ r.id }}">What to change</label>
+<p class="inline-field"><input id="send-back-{{ r.id }}" type="text" name="justification" size="80" required minlength="10" maxlength="1000">
+<button class="secondary" type="submit">Send back</button></p>
 </form>
 {% endif %}
+</div>
 </section>
 {% endfor %}
 {% endblock %}

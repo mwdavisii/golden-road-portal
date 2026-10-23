@@ -1,19 +1,27 @@
 {% extends "base.html" %}
+{% set active = "me" %}
 {% block title %}Me - golden road{% endblock %}
 {% block main %}
+<span class="eyebrow">Your account</span>
 <h1>{{ principal.person.display_name }}</h1>
-{% if principal.person.email %}<p>{{ principal.person.email }}</p>{% endif %}
+{% if principal.person.email %}<p class="lead">{{ principal.person.email }}</p>{% endif %}
+<section>
 <h2>Roles</h2>
-<p>contributor{% for role in principal.roles|sort %}, {{ role }}{% endfor %}</p>
+<p><span class="badge">contributor</span>{% for role in principal.roles|sort %} <span class="badge role">{{ role }}</span>{% endfor %}</p>
+</section>
+<section>
 <h2>GitHub logins</h2>
 {% if links %}
+<div class="table-wrap">
 <table>
 <tr><th>Login</th><th>How it was linked</th><th>Since</th></tr>
-{% for link in links %}<tr><td>{{ link.github_login }}</td><td>{{ link.source }}</td><td>{{ link.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% for link in links %}<tr><td class="mono">{{ link.github_login }}</td><td>{{ link.source }}</td><td class="when">{{ link.created_at.strftime("%Y-%m-%d") }}</td></tr>
 {% endfor %}
 </table>
+</div>
 {% else %}
-<p>No GitHub login is linked to you yet. Registering an app needs one, and you must be an admin of the repo on GitHub.</p>
+<p class="error warn">No GitHub login is linked to you yet. Registering an app needs one, and you must be an admin of the repo on GitHub.</p>
 {% endif %}
 <p><a href="/link/github">Link your GitHub login</a></p>
+</section>
 {% endblock %}
