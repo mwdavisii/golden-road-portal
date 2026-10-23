@@ -20,3 +20,15 @@ def test_the_csrf_header_works_for_htmx_requests(portal):
 
 def test_sign_out_without_a_session_is_401(portal):
     assert portal.client().post("/logout").status_code == 401
+
+
+def test_the_referrer_policy_lets_the_browser_send_the_real_origin(portal):
+    """With Referrer-Policy: no-referrer a browser sends `Origin: null` on its own form POSTs (Fetch: serializing a request origin),
+    so the Origin check refused every same-origin form. same-origin sends the real origin to us and no referrer to anyone else."""
+    assert portal.client().get("/").headers["referrer-policy"] == "same-origin"
+
+
+def test_a_null_origin_is_still_refused(portal):
+    client = portal.client("owner")
+    response = client.post("/logout", data={"csrf_token": portal.csrfs["owner"]}, headers={"Origin": "null"})
+    assert response.status_code == 403

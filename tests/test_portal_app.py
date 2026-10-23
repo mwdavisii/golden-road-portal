@@ -57,7 +57,7 @@ def test_every_response_carries_the_security_headers(portal):
         headers = portal.client().get(path).headers
         csp = headers["content-security-policy"]
         assert "script-src 'self'" in csp and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp and "unsafe-eval" not in csp
-        assert headers["x-content-type-options"] == "nosniff" and headers["referrer-policy"] == "no-referrer"
+        assert headers["x-content-type-options"] == "nosniff" and headers["referrer-policy"] == "same-origin"
         assert headers["cache-control"] == "no-store"
     static = portal.client().get("/static/portal.css").headers
     assert "content-security-policy" in static and static.get("cache-control") != "no-store"  # static files may be cached
