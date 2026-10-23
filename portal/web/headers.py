@@ -2,7 +2,7 @@
 
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; "
        "frame-ancestors 'none'; base-uri 'none'")
-HEADERS = [(b"content-security-policy", CSP.encode()), (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer"),
+HEADERS = [(b"content-security-policy", CSP.encode()), (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"),
            (b"x-frame-options", b"DENY"), (b"strict-transport-security", b"max-age=31536000")]
 NAMES = {name for name, _ in HEADERS} | {b"cache-control"}
 
