@@ -1,5 +1,7 @@
 """The image's entry point (builder-spec.json: portal.main:app, wrapped by the generated _platform/entry.py)."""
 
-from portal.web.app import create_app
+import os
 
-app = create_app()
+from portal.web.app import create_app_from_env
+
+app = create_app_from_env(os.environ)

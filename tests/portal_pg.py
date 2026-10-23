@@ -48,7 +48,7 @@ def pg_server():
                 time.sleep(0.5)
         with psycopg.connect(server.dsn(), autocommit=True) as conn:
             for role in ROLES:
-                conn.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD 'test'").format(sql.Identifier(role)))
+                conn.execute(sql.Composed([sql.SQL("CREATE ROLE "), sql.Identifier(role), sql.SQL(" LOGIN PASSWORD 'test'")]))
         yield server
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
@@ -59,8 +59,8 @@ def pg_db(pg_server):
     from portal.migrate import apply
     name = f"portal_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
-        conn.execute(sql.SQL("CREATE DATABASE {} OWNER portal_owner").format(sql.Identifier(name)))
+        conn.execute(sql.Composed([sql.SQL("CREATE DATABASE "), sql.Identifier(name), sql.SQL(" OWNER portal_owner")]))
     apply(pg_server.dsn("portal_owner", name))
     yield lambda role="portal_owner": pg_server.dsn(role, name)
     with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
-        conn.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
+        conn.execute(sql.Composed([sql.SQL("DROP DATABASE "), sql.Identifier(name), sql.SQL(" WITH (FORCE)")]))
