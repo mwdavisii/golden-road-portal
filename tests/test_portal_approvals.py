@@ -5,7 +5,7 @@ from portal.store.base import RepoAdmin
 
 
 def approve(portal, who="admin", **form):
-    data = {"csrf_token": portal.csrfs[who], "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
+    data = {"csrf_token": portal.csrfs[who], "submission": "1", "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
             "justification": "Purpose and classification checked.", **form}
     return portal.client(who).post(f"/admin/requests/{portal.seeds['request']}/approve", data=data)
 

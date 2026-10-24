@@ -34,7 +34,8 @@
 <select name="proposed_tier" required>
 {% for t in tiers %}<option value="{{ t }}"{% if form.proposed_tier == t %} selected{% endif %}>{{ t }}</option>
 {% endfor %}
-</select></label></p>
+</select></label>
+<span class="hint">The platform computes a minimum tier and classification from the repo; an admin decides.</span></p>
 </div>
 <p class="actions"><button type="submit">Submit for review</button></p>
 </form>

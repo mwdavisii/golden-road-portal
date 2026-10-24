@@ -5,9 +5,9 @@ import datetime as dt
 import re
 
 from .contracts import validate
+from .floor import CLASSIFICATIONS, TIERS, below_floor
 
-CLASSIFICATIONS = ("public", "internal", "restricted", "phi")
-TIERS = ("low", "moderate", "high")
+NO_EVIDENCE = "The platform hasn't computed this repo's evidence yet: approving waits for it."
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
@@ -35,8 +35,13 @@ def form_draft(repo, purpose, classification, tier) -> tuple[dict | None, list[s
     return (None, [f"The registration is not valid: {problems[0]}"]) if problems else (draft, [])
 
 
-def intake_record(request, *, approver_id, tier, classification, review_by, justification, now) -> tuple[dict | None, list[str]]:
+def intake_record(request, *, approver_id, tier, classification, review_by, justification, now, evidence,
+                  override_reason="") -> tuple[dict | None, list[str]]:
+    """The intake/v2 record an approval turns a registration into. `evidence` is the stored Evidence of the request's current
+    submission (or None while the collector hasn't computed it). The record carries its commit and floor; a tier or classification
+    below the floor needs the approver's written reason, which goes into the record. A reason given when nothing is below is ignored."""
     justification, errors, today = (justification or "").strip(), [], now.date()
+    override_reason = (override_reason or "").strip()
     if approver_id == request.requested_by:
         errors.append("Only another admin can approve a request: you registered this one.")
     if tier not in TIERS:
@@ -56,11 +61,24 @@ def intake_record(request, *, approver_id, tier, classification, review_by, just
         errors.append("Write the justification on one line.")
     elif not 10 <= len(justification) <= 1000:
         errors.append("Give a justification of 10 to 1000 characters.")
+    below = []
+    if evidence is not None and tier in TIERS and classification in CLASSIFICATIONS:
+        below = below_floor(tier, classification, evidence.floor_tier, evidence.floor_classification)
+        if below and re.search(r"[\r\n]", override_reason):
+            errors.append("Write the reason for approving below the floor on one line.")
+        elif below and not 30 <= len(override_reason) <= 1000:
+            errors.append(f"The {' and '.join(below)} is below the platform's floor ({evidence.floor_tier}, {evidence.floor_classification}): "
+                          "give a reason of 30 to 1000 characters to approve it anyway.")
     if errors:
         return None, errors
+    if evidence is None:
+        return None, [NO_EVIDENCE]
     doc = {"schema": "intake/v2", "repo": request.repo, "tier": tier, "purpose": request.draft["purpose"], "owner": request.requested_by,
            "data_classification": classification, "registered_by": request.requested_by, "approved_by": approver_id,
            "approved_at": now.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "approval_justification": justification,
-           "review_by": review.isoformat(), "request": request.id}
+           "review_by": review.isoformat(), "request": request.id,
+           "evidence_commit": evidence.commit, "floor_tier": evidence.floor_tier, "floor_classification": evidence.floor_classification}
+    if below:
+        doc["floor_override"] = {"by": approver_id, "at": doc["approved_at"], "reason": override_reason}
     problems = validate("intake.v2", doc)
     return (None, [f"The record is not valid: {problems[0]}"]) if problems else (doc, [])

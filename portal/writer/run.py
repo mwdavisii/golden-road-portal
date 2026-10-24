@@ -13,14 +13,13 @@ import datetime as dt
 import re
 
 from ..github.client import GitHubError
+from ..github.shapes import BRANCH, SHA
 from ..store.base import Conflict
 from .allowlist import target_for
 from .recheck import recheck
 from .render import branch_name, intake_yaml, pr_body, title
 
 ACTIONS_APP_ID = 15368  # the GitHub Actions app: the source the factory's ruleset pins its required checks to
-BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
-SHA = re.compile(r"[0-9a-f]{40}")
 PR_URL = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]{1,300}")
 
 
@@ -162,7 +161,7 @@ def _finish(store, gh, cfg, target, req, merge_sha, now, merged_at=None) -> str:
 
 
 def _write(store, gh, cfg, req, now) -> str:
-    problems = recheck(req, cfg)
+    problems = recheck(req, cfg, store.evidence_for(req.id, req.submission))
     if problems:
         return _fail(store, req, "recheck: " + ", ".join(problems), now)
     target, branch = target_for(cfg.org, req), branch_name(req.id)

@@ -115,7 +115,12 @@ def test_repo_admins_are_replaced_as_a_whole(store):
 
 DRAFT = {"schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes.",
          "data_classification": "internal", "proposed_tier": "low"}
-FINAL = {"schema": "intake/v2"}  # the store doesn't check it; the web and the writer do
+
+
+def final_for(evidence, **changes):
+    """The final record an approval carries: the store checks its tier, classification and the evidence it names (the rest is the web's)."""
+    return {"schema": "intake/v2", "tier": "moderate", "data_classification": "internal", "approved_at": "2026-10-23T12:00:00Z", "evidence_commit": evidence.commit,
+            "floor_tier": evidence.floor_tier, "floor_classification": evidence.floor_classification, **changes}
 
 
 def people(store):
@@ -128,9 +133,10 @@ def test_a_registration_goes_from_pending_to_merged_and_every_step_is_audited(st
     owner, admin = people(store)
     req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
     assert (req.state, req.repo, req.requested_by, req.draft) == ("pending", "acme/notes", owner.id, DRAFT)
+    final = final_for(give_evidence(store, req))
     approved = store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["golden-road-admins"], approve=True,
-                            note="Purpose checked.", final=FINAL, now=T0 + HOUR)
-    assert (approved.state, approved.decided_by, approved.decision_groups, approved.final) == ("approved", admin.id, ("golden-road-admins",), FINAL)
+                            note="Purpose checked.", final=final, now=T0 + HOUR)
+    assert (approved.state, approved.decided_by, approved.decision_groups, approved.final) == ("approved", admin.id, ("golden-road-admins",), final)
     claimed = store.claim_approved(now=T0 + 2 * HOUR)
     assert claimed.id == req.id and claimed.state == "writing" and store.claim_approved(now=T0 + 2 * HOUR) is None
     opened = store.mark_pr_open(request_id=req.id, branch="portal/request-x", pr_number=12, pr_url="https://github.com/acme/scorecard-factory/pull/12",
@@ -150,7 +156,7 @@ def test_only_one_open_registration_per_repo(store):
     with pytest.raises(Conflict) as err:
         store.create_registration(person_id=admin.id, draft={**DRAFT, "repo": "ACME/Notes"}, now=T0)
     assert err.value.code == "open_request_exists"
-    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=[], approve=True, note="ok", final=FINAL, now=T0)
+    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=[], approve=True, note="ok", final=final_for(give_evidence(store, req)), now=T0)
     store.claim_approved(now=T0)
     store.mark_failed(request_id=req.id, reason="check_failed: factory-check", now=T0)
     store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)  # a failed one no longer blocks
@@ -159,16 +165,17 @@ def test_only_one_open_registration_per_repo(store):
 def test_only_a_pending_request_is_decided_and_never_by_its_requester(store):
     owner, admin = people(store)
     req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req))
     for actor in (owner,):
         with pytest.raises(Conflict) as err:
-            store.decide(request_id=req.id, actor_id=actor.id, actor_groups=[], approve=True, note="mine", final=FINAL, now=T0)
+            store.decide(request_id=req.id, actor_id=actor.id, actor_groups=[], approve=True, note="mine", final=final, now=T0)
         assert err.value.code == "self_decision"
     store.decide(request_id=req.id, actor_id=admin.id, actor_groups=[], approve=False, note="Name what it does not do.", final=None, now=T0)
     with pytest.raises(Conflict) as err:
-        store.decide(request_id=req.id, actor_id=admin.id, actor_groups=[], approve=True, note="x", final=FINAL, now=T0)
+        store.decide(request_id=req.id, actor_id=admin.id, actor_groups=[], approve=True, note="x", final=final, now=T0)
     assert err.value.code == "wrong_state"
     with pytest.raises(Conflict):
-        store.decide(request_id="r_" + "0" * 32, actor_id=admin.id, actor_groups=[], approve=True, note="x", final=FINAL, now=T0)
+        store.decide(request_id="r_" + "0" * 32, actor_id=admin.id, actor_groups=[], approve=True, note="x", final=final, now=T0)
 
 
 def test_a_sent_back_request_is_resubmitted_by_its_requester_only(store):
@@ -219,3 +226,147 @@ def test_an_admin_cannot_link_a_login_to_their_own_person(store):
         store.add_link(person_id=admin.id, github_login="me-gh", github_user_id=None, source="admin", actor_id=admin.id, reason="r" * 10, now=T0)
     assert err.value.code == "self_link" and store.links_for(admin.id) == []
     store.add_link(person_id=admin.id, github_login="me-gh", github_user_id=5, source="github-oauth", actor_id=admin.id, reason="authorized", now=T0)
+
+
+# ---- registration evidence (spec 2026-10-23): one row per submission, insert-only, plus the reasons it is waiting ----
+
+import dataclasses  # noqa: E402
+
+from portal_fakes import give_evidence  # noqa: E402
+
+
+def test_a_pending_registration_awaits_evidence_until_it_has_some(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    assert [(a.request_id, a.repo, a.submission) for a in store.awaiting_evidence()] == [(req.id, "acme/notes", 1)]
+    store.add_evidence_problem(request_id=req.id, submission=1, problem="rules_missing", now=T0)
+    store.add_evidence_problem(request_id=req.id, submission=1, problem="rules_missing", now=T0)  # once only, no error
+    assert store.evidence_problem_for(req.id, 1) == "rules_missing" and store.awaiting_evidence()
+    give_evidence(store, req, floor_tier="moderate")
+    assert store.awaiting_evidence() == [] and store.evidence_for(req.id, 1).floor_tier == "moderate"
+    with pytest.raises(Conflict, match="evidence_exists"):
+        give_evidence(store, req)
+
+
+def test_a_resubmission_counts_up_and_awaits_new_evidence(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    give_evidence(store, req)
+    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=False, note="Say what it stores.", final=None, now=T0)
+    again = store.resubmit(request_id=req.id, person_id=owner.id, draft=DRAFT, now=T0)
+    assert again.submission == 2 and store.evidence_for(req.id, 2) is None and store.evidence_for(req.id, 1) is not None
+    assert [a.submission for a in store.awaiting_evidence()] == [2]
+
+
+def test_evidence_is_only_for_a_pending_request_s_current_submission(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    with pytest.raises(Conflict, match="not_awaiting"):
+        give_evidence(store, dataclasses.replace(req, submission=2))
+    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=False, note="Say what it stores.", final=None, now=T0)
+    with pytest.raises(Conflict, match="not_awaiting"):
+        give_evidence(store, req)
+
+
+# ---- the store enforces the floor on approval (spec E5): evidence of the current submission, the stored commit and floor, an override below ----
+
+from portal.store.base import Evidence  # noqa: E402
+
+LONG = "The spec over-declares egress; checked with the team."
+
+
+def override(by, reason=LONG):
+    return {"by": by, "at": "2026-10-23T12:00:00Z", "reason": reason}
+
+
+def approve(store, req, actor, final, floor_override=None):
+    return store.decide(request_id=req.id, actor_id=actor.id, actor_groups=["g"], approve=True, note="Checked.", final=final,
+                        floor_override=floor_override, now=T0)
+
+
+def test_an_approval_needs_the_evidence_of_the_current_submission(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    stub = Evidence(req.id, 1, "e" * 40, {}, "low", "internal", "f" * 40, T0)
+    with pytest.raises(Conflict, match="no_evidence"):
+        approve(store, req, admin, final_for(stub))
+    give_evidence(store, req)
+    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=False, note="Say what it stores.", final=None, now=T0)
+    store.resubmit(request_id=req.id, person_id=owner.id, draft=DRAFT, now=T0)
+    with pytest.raises(Conflict, match="no_evidence"):  # submission 1's evidence doesn't count for submission 2
+        approve(store, req, admin, final_for(stub))
+    assert store.get_request(req.id).state == "pending"
+
+
+@pytest.mark.parametrize("change", [{"evidence_commit": "d" * 40}, {"floor_tier": "high"}, {"floor_classification": "phi"}])
+def test_the_approved_record_must_carry_the_stored_commit_and_floor(store, change):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="moderate"), **change)
+    with pytest.raises(Conflict, match="evidence_mismatch"):
+        approve(store, req, admin, final)
+    assert store.get_request(req.id).state == "pending"
+
+
+def test_an_approval_below_the_floor_needs_the_approver_s_override(store):
+    owner, admin = people(store)
+    other, _, _ = sign_in(store, "sub-other", roles=["admin"], groups=["g"])
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="high"))
+    for given in (None, override(admin.id, "x" * 29), override(other.id)):
+        with pytest.raises(Conflict, match="below_floor"):
+            approve(store, req, admin, {**final, **({"floor_override": given} if given else {})}, given)
+    assert store.get_request(req.id).state == "pending"
+    good = override(admin.id)
+    approved = approve(store, req, admin, {**final, "floor_override": good}, good)
+    assert approved.state == "approved" and approved.floor_override == good
+
+
+@pytest.mark.parametrize("change", [{"at": "2026-10-24T12:00:00Z"}, {"reason": LONG + "\nand a second line"}, {"reason": "r" * 1001}])
+def test_the_override_must_carry_the_approval_time_and_a_single_line_of_at_most_1000_characters(store, change):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="high"))
+    bad = {**override(admin.id), **change}
+    with pytest.raises(Conflict, match="below_floor"):
+        approve(store, req, admin, {**final, "floor_override": bad}, bad)
+    assert store.get_request(req.id).state == "pending"
+
+
+def test_an_override_is_refused_when_nothing_is_below_the_floor(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="low"))
+    unneeded = override(admin.id)
+    with pytest.raises(Conflict, match="below_floor"):
+        approve(store, req, admin, {**final, "floor_override": unneeded}, unneeded)
+
+
+def test_the_override_and_the_record_must_agree(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="high"))
+    with pytest.raises(Conflict, match="evidence_mismatch"):
+        approve(store, req, admin, {**final, "floor_override": override(admin.id)}, override(admin.id, "A different reason, also long enough."))
+
+
+def test_the_override_is_stored_and_audited(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    final = final_for(give_evidence(store, req, floor_tier="high"))
+    good = override(admin.id)
+    approve(store, req, admin, {**final, "floor_override": good}, good)
+    assert store.get_request(req.id).floor_override == good
+    entry = next(e for e in store.audit_entries() if e.action == "request.approved")
+    assert entry.after["floor_override"] == good and entry.after["final"]["floor_override"] == good
+
+
+def test_requests_with_a_waiting_reason_do_not_starve_new_ones(store):
+    owner, _ = people(store)
+    made = [store.create_registration(person_id=owner.id, draft={**DRAFT, "repo": f"acme/r{i:02d}"}, now=T0) for i in range(51)]
+    ordered = sorted(made, key=lambda r: r.id)
+    for req in ordered[:50]:  # 50 requests whose repos the collector can't read, ahead of the 51st by id
+        store.add_evidence_problem(request_id=req.id, submission=1, problem="repo_unreadable", now=T0)
+    first = store.awaiting_evidence(limit=50)
+    assert len(first) == 50 and first[0].request_id == ordered[50].id  # the one without a problem row comes first
+    assert [a.request_id for a in first[1:]] == [r.id for r in ordered[:49]]  # then the rest by id

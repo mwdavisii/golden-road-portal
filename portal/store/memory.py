@@ -5,7 +5,7 @@ import secrets
 import threading
 
 from ..ids import new_id
-from .base import LINK_SOURCES, OPEN_STATES, AuditEntry, Conflict, Link, Person, RepoAdmin, Request, Session, token_hash
+from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, token_hash
 
 
 class MemoryStore:
@@ -15,6 +15,7 @@ class MemoryStore:
         self._sessions, self._login = {}, {}
         self._links, self._admins, self._requests = {}, [], {}
         self._audit: list[AuditEntry] = []
+        self._evidence, self._problems = {}, []  # (request_id, submission) -> Evidence; (request_id, submission, problem, at)
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -173,13 +174,13 @@ class MemoryStore:
             if draft["repo"] != req.repo:
                 raise Conflict("repo_changed")
             new = dc.replace(req, state="pending", draft=dict(draft), updated_at=now, decided_by=None, decided_at=None,
-                             decision_groups=(), decision_note=None)
+                             decision_groups=(), decision_note=None, submission=req.submission + 1, floor_override=None)
             self._requests[req.id] = new
             self._log(now, "person", person_id, "request.resubmitted", "request", req.id, {"state": "sent_back"}, {"state": "pending"},
                       "resubmitted after it was sent back")
             return new
 
-    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now):
+    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now, floor_override=None):
         with self._lock:
             req = self._need(request_id)
             if req.state != "pending":
@@ -188,13 +189,58 @@ class MemoryStore:
                 raise Conflict("self_decision")
             if approve and final is None:
                 raise ValueError("an approval needs the final record")
+            if approve:
+                check_approval(self._evidence.get((req.id, req.submission)), final, floor_override, actor_id)
             state = "approved" if approve else "sent_back"
             new = dc.replace(req, state=state, updated_at=now, decided_by=actor_id, decided_at=now, decision_groups=tuple(actor_groups),
-                             decision_note=note, final=dict(final) if approve else None)
+                             decision_note=note, final=dict(final) if approve else None, floor_override=dict(floor_override) if approve and floor_override else None)
             self._requests[req.id] = new
             self._log(now, "person", actor_id, f"request.{state}", "request", req.id, {"state": "pending"},
-                      {"state": state, **({"final": dict(final)} if approve else {})}, note)
+                      {"state": state, **({"final": dict(final)} if approve else {}),
+                       **({"floor_override": dict(floor_override)} if approve and floor_override else {})}, note)
             return new
+
+    # ---- the platform's evidence (the collector inserts it; nobody changes it) ----
+
+    def awaiting_evidence(self, limit=50):
+        with self._lock:
+            failing = {(p[0], p[1]) for p in self._problems}  # requests the collector already tried and couldn't finish go last
+            pending = sorted((r for r in self._requests.values() if r.kind == "registration" and r.state == "pending"
+                              and (r.id, r.submission) not in self._evidence), key=lambda r: ((r.id, r.submission) in failing, r.id))
+            return [Awaiting(r.id, r.repo, r.submission) for r in pending[:limit]]
+
+    def _awaiting(self, request_id, submission):
+        req = self._requests.get(request_id)
+        if req is None or req.kind != "registration" or req.state != "pending" or req.submission != submission:
+            raise Conflict("not_awaiting")
+        return req
+
+    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now):
+        with self._lock:
+            req = self._awaiting(request_id, submission)
+            if (request_id, submission) in self._evidence:
+                raise Conflict("evidence_exists")
+            if evidence.get("repo") != req.repo or evidence.get("commit") != commit:
+                raise Conflict("not_awaiting")  # the evidence must name its request's repo and its own commit
+            row = Evidence(request_id, submission, commit, dict(evidence), floor_tier, floor_classification, rules_commit, now)
+            self._evidence[(request_id, submission)] = row
+            return row
+
+    def add_evidence_problem(self, *, request_id, submission, problem, now):
+        if problem not in PROBLEMS:
+            raise ValueError(f"unknown evidence problem {problem!r}")
+        with self._lock:
+            self._awaiting(request_id, submission)
+            if not any(p[:3] == (request_id, submission, problem) for p in self._problems):
+                self._problems.append((request_id, submission, problem, now))
+
+    def evidence_for(self, request_id, submission):
+        return self._evidence.get((request_id, submission))
+
+    def evidence_problem_for(self, request_id, submission):
+        with self._lock:
+            found = [p for p in self._problems if p[:2] == (request_id, submission)]
+            return found[-1][2] if found else None
 
     def claim_approved(self, *, now):
         with self._lock:

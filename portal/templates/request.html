@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_evidence.html" import evidence_view %}
 {% set active = "requests" %}
 {% block title %}Request - golden road{% endblock %}
 {% block main %}
@@ -18,8 +19,20 @@
 <pre class="prose">{{ req.draft.get("purpose", "") }}</pre>
 <dl class="facts">
 <div><dt>Data classification</dt><dd>{{ req.draft.get("data_classification", "not given") }}</dd></div>
-<div><dt>Proposed tier</dt><dd>{{ req.draft.get("proposed_tier", "not given") }}</dd></div>
+<div><dt>Your proposed tier</dt><dd>{{ req.draft.get("proposed_tier", "not given") }}</dd></div>
 </dl>
+</section>
+<section>
+<h2>What the platform found</h2>
+{{ evidence_view(evidence, problem, claim, effective, mismatch) }}
+{% if req.final %}
+<h3>Approved</h3>
+<dl class="facts">
+<div><dt>Approved tier</dt><dd>{{ req.final.get("tier") }}</dd></div>
+<div><dt>Approved data classification</dt><dd>{{ req.final.get("data_classification") }}</dd></div>
+</dl>
+{% if req.floor_override %}<p class="callout info">An admin approved this below the platform's floor and recorded why.</p>{% endif %}
+{% endif %}
 {% if req.pr_url %}<p>Pull request: <span class="mono">{{ req.pr_url }}</span></p>{% endif %}
 </section>
 {% if mine and req.state == "sent_back" %}

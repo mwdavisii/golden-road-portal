@@ -1,0 +1,45 @@
+{# The platform's evidence for a registration, beside what the person claimed. Everything printed here is escaped (autoescape is on):
+   the evidence is repo data checked against patterns, or lines the collector wrote, but nothing here is trusted as HTML. The sentences
+   for a waiting reason are written here, in the template, and chosen by code. #}
+{% macro evidence_view(evidence, problem, claim, effective, mismatch) %}
+{% set reasons = {
+  "rules_missing": "the factory has no config/registration.yaml on its default branch",
+  "rules_invalid": "the factory's config/registration.yaml is not valid",
+  "rules_unreadable": "the factory's config/registration.yaml can't be read",
+  "repo_unreadable": "the portal's read App can't read this repository"} %}
+{% if not evidence %}
+<p class="callout info">Waiting for the platform's evidence: the collector computes it on its next pass.</p>
+{% if problem %}<p class="error warn">{{ reasons.get(problem, "the evidence could not be computed") }}</p>{% endif %}
+{% else %}
+{% set ev = evidence.evidence %}
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>Claimed</th><th>Computed by the platform (floor)</th><th>Effective</th></tr></thead>
+<tbody>
+<tr{% if "tier" in mismatch %} class="mismatch"{% endif %}><th scope="row">Tier</th><td>{{ claim[0] or "not given" }}</td><td>{{ evidence.floor_tier }}</td>
+<td>{{ effective[0] }}{% if "tier" in mismatch %} <span class="badge state-sent_back">raised by the floor</span>{% endif %}</td></tr>
+<tr{% if "data_classification" in mismatch %} class="mismatch"{% endif %}><th scope="row">Data classification</th><td>{{ claim[1] or "not given" }}</td><td>{{ evidence.floor_classification }}</td>
+<td>{{ effective[1] }}{% if "data_classification" in mismatch %} <span class="badge state-sent_back">raised by the floor</span>{% endif %}</td></tr>
+</tbody>
+</table>
+</div>
+<h3>What the platform read</h3>
+{% if ev.get("signals") %}
+<ul class="checklist">{% for s in ev.signals %}<li>{{ s.line }}</li>{% endfor %}</ul>
+{% else %}
+<p class="meta">Nothing in the repo raised the floor.</p>
+{% endif %}
+<dl class="facts">
+<div><dt>Commit</dt><dd class="mono">{{ evidence.commit }}</dd></div>
+<div><dt>Spec present</dt><dd>{{ "yes" if ev.get("spec_present") else "no" }}</dd></div>
+<div><dt>App type</dt><dd>{{ ev.get("app_type") or "unknown" }}</dd></div>
+<div><dt>Resources tier</dt><dd>{{ ev.get("resources_tier") or "unknown" }}</dd></div>
+<div><dt>Egress</dt><dd>{% for e in ev.get("egress", []) %}{{ e.host }}:{{ e.port }} ({{ "model gateway" if e.model_gateway else "other" }}){% if not loop.last %}, {% endif %}{% else %}none{% endfor %}</dd></div>
+<div><dt>Secret settings</dt><dd>{{ ev.get("secret_env", [])|join(", ") or "none" }}</dd></div>
+<div><dt>Write roles</dt><dd>{{ ev.get("write_roles", [])|join(", ") or "none" }}</dd></div>
+<div><dt>Write routes</dt><dd>{{ ev.get("write_routes", 0) }}</dd></div>
+<div><dt>Builder version</dt><dd>{{ ev.get("builder_version") or "unknown" }}</dd></div>
+<div><dt>Dependencies</dt><dd>{{ ev.get("dependencies", {}).get("count", 0) }} pinned{% if ev.get("dependencies", {}).get("lockfile") %} ({{ ev.dependencies.lockfile }}){% else %}, no lockfile{% endif %}</dd></div>
+</dl>
+{% endif %}
+{% endmacro %}

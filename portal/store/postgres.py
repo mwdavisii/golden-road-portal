@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ..ids import new_id
-from .base import LINK_SOURCES, AuditEntry, Conflict, Link, LoginState, Person, RepoAdmin, Request, Session, token_hash
+from .base import LINK_SOURCES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, LoginState, Person, RepoAdmin, Request, Session, check_approval, token_hash
 
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason) "
          "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
@@ -28,7 +28,12 @@ def _request(r):
                    created_at=r["created_at"], updated_at=r["updated_at"], decided_by=r["decided_by"], decided_at=r["decided_at"],
                    decision_groups=tuple(r["decision_groups"] or ()), decision_note=r["decision_note"], final=r["final"],
                    branch=r["branch"], pr_number=r["pr_number"], pr_url=r["pr_url"], merge_sha=r["merge_sha"], failure_reason=r["failure_reason"],
-                   head_sha=r["head_sha"], base_sha=r["base_sha"])
+                   head_sha=r["head_sha"], base_sha=r["base_sha"], submission=r["submission"], floor_override=r["floor_override"])
+
+
+def _evidence(r):
+    return Evidence(r["request_id"], r["submission"], r["commit_sha"], r["evidence"], r["floor_tier"], r["floor_classification"], r["rules_commit"],
+                    r["computed_at"])
 
 
 def _json(value):
@@ -222,12 +227,13 @@ class PostgresStore:
             if draft["repo"] != row["repo"]:
                 raise Conflict("repo_changed")
             row = conn.execute("UPDATE request SET state = 'pending', draft = %s, updated_at = %s, decided_by = NULL, decided_at = NULL, "
-                               "decision_groups = NULL, decision_note = NULL WHERE id = %s RETURNING *", (Jsonb(dict(draft)), now, request_id)).fetchone()
+                               "decision_groups = NULL, decision_note = NULL, "
+                               "submission = submission + 1 WHERE id = %s RETURNING *", (Jsonb(dict(draft)), now, request_id)).fetchone()
             self._log(conn, now, "person", person_id, "request.resubmitted", "request", request_id, {"state": "sent_back"}, {"state": "pending"},
                       "resubmitted after it was sent back")
             return _request(row)
 
-    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now):
+    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now, floor_override=None):
         if approve and final is None:
             raise ValueError("an approval needs the final record")
         state = "approved" if approve else "sent_back"
@@ -237,12 +243,71 @@ class PostgresStore:
                 raise Conflict("wrong_state")
             if row["requested_by"] == actor_id:
                 raise Conflict("self_decision")
-            row = conn.execute("UPDATE request SET state = %s, updated_at = %s, decided_by = %s, decided_at = %s, decision_groups = %s, "
-                               "decision_note = %s, final = %s WHERE id = %s RETURNING *",
-                               (state, now, actor_id, now, list(actor_groups), note, _json(dict(final) if approve else None), request_id)).fetchone()
+            if approve:
+                evidence = conn.execute("SELECT * FROM registration_evidence WHERE request_id = %s AND submission = %s AND problem IS NULL",
+                                        (request_id, row["submission"])).fetchone()
+                check_approval(_evidence(evidence) if evidence else None, final, floor_override, actor_id)
+            kept = dict(floor_override) if approve and floor_override else None
+            try:
+                with conn.transaction():
+                    row = conn.execute("UPDATE request SET state = %s, updated_at = %s, decided_by = %s, decided_at = %s, decision_groups = %s, "
+                                       "decision_note = %s, final = %s, floor_override = %s WHERE id = %s RETURNING *",
+                                       (state, now, actor_id, now, list(actor_groups), note, _json(dict(final) if approve else None),
+                                        _json(kept), request_id)).fetchone()
+            except errors.RaiseException:  # the database's own rule (migration 0005) saw what check_approval did not
+                raise Conflict("below_floor") from None
             self._log(conn, now, "person", actor_id, f"request.{state}", "request", request_id, {"state": "pending"},
-                      {"state": state, **({"final": dict(final)} if approve else {})}, note)
+                      {"state": state, **({"final": dict(final)} if approve else {}), **({"floor_override": kept} if kept else {})}, note)
             return _request(row)
+
+    # ---- the platform's evidence (the collector inserts it; nobody changes it) ----
+
+    def awaiting_evidence(self, limit=50):
+        # runs as the collector, which may read only these request columns (never the draft), so it names them; created_at isn't one
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT r.id, r.repo, r.submission FROM request r WHERE r.kind = 'registration' AND r.state = 'pending' "
+                                "AND NOT EXISTS (SELECT 1 FROM registration_evidence e WHERE e.request_id = r.id AND e.submission = r.submission "
+                                "AND e.problem IS NULL) "
+                                "ORDER BY EXISTS (SELECT 1 FROM registration_evidence p WHERE p.request_id = r.id AND p.submission = r.submission "
+                                "AND p.problem IS NOT NULL), r.id LIMIT %s", (limit,)).fetchall()
+        return [Awaiting(r["id"], r["repo"], r["submission"]) for r in rows]
+
+    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now):
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO registration_evidence (request_id, submission, commit_sha, evidence, floor_tier, "
+                                       "floor_classification, rules_commit, computed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                                       (request_id, submission, commit, Jsonb(dict(evidence)), floor_tier, floor_classification, rules_commit,
+                                        now)).fetchone()
+            except errors.UniqueViolation:
+                raise Conflict("evidence_exists") from None
+            except errors.RaiseException:
+                raise Conflict("not_awaiting") from None
+            return _evidence(row)
+
+    def add_evidence_problem(self, *, request_id, submission, problem, now):
+        if problem not in PROBLEMS:
+            raise ValueError(f"unknown evidence problem {problem!r}")
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    conn.execute("INSERT INTO registration_evidence (request_id, submission, problem, computed_at) VALUES (%s, %s, %s, %s) "
+                                 "ON CONFLICT DO NOTHING", (request_id, submission, problem, now))
+            except errors.RaiseException:
+                raise Conflict("not_awaiting") from None
+
+    def evidence_for(self, request_id, submission):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM registration_evidence WHERE request_id = %s AND submission = %s AND problem IS NULL",
+                               (request_id, submission)).fetchone()
+        return _evidence(row) if row else None
+
+    def evidence_problem_for(self, request_id, submission):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT problem FROM registration_evidence WHERE request_id = %s AND submission = %s AND problem IS NOT NULL "
+                               "ORDER BY computed_at DESC, problem DESC LIMIT 1", (request_id, submission)).fetchone()
+        return row["problem"] if row else None
 
     def claim_approved(self, *, now):
         with self.pool.connection() as conn:

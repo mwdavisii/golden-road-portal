@@ -6,7 +6,7 @@ import datetime as dt
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from portal_fakes import BASE, ISSUER, T0, Clock, FakeGitHub, make_settings, transport, writer_config
+from portal_fakes import BASE, ISSUER, T0, Clock, FakeGitHub, evidence_doc, make_settings, transport, writer_config
 from portal_pg import pg_db, pg_server  # noqa: F401
 from test_portal_writer_run import FILE, advancing, client, gh_for_write
 
@@ -44,7 +44,9 @@ def test_registration_flow_on_postgres_within_the_database_rules(pg_db):
         created = owner_http.post("/register", data=form)
         assert created.status_code == 303
         rid = created.headers["location"].rsplit("/", 1)[1]
-        approval = {"csrf_token": admin_csrf, "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
+        collector.add_evidence(request_id=rid, submission=1, commit="e" * 40, evidence=evidence_doc("acme/notes", "e" * 40), floor_tier="low",
+                               floor_classification="internal", rules_commit="f" * 40, now=T0)
+        approval = {"csrf_token": admin_csrf, "submission": "1", "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
                     "justification": "Purpose and classification checked."}
         assert admin_http.post(f"/admin/requests/{rid}/approve", data=approval).status_code == 303
         approved = web.get_request(rid)
