@@ -1,5 +1,7 @@
 import psycopg
+from psycopg.types.json import Jsonb
 import pytest
+from portal_fakes import evidence_doc
 from portal_pg import pg_db, pg_server  # noqa: F401
 
 pytestmark = pytest.mark.docker
@@ -64,7 +66,7 @@ def test_the_collector_role_sees_repo_admins_and_nothing_else(pg_db):
     with as_role(pg_db, "portal_collector") as conn:
         conn.execute("DELETE FROM repo_admin")
         conn.execute("INSERT INTO repo_admin VALUES ('acme/notes', 'pat', 1001, 'github', now())")
-        for table in ("person", "session", "request", "audit_log", "identity_link", "login_state"):
+        for table in ("person", "session", "audit_log", "identity_link", "login_state"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(sql.Composed([sql.SQL("SELECT 1 FROM "), sql.Identifier(table)]))
 
@@ -80,7 +82,12 @@ def test_each_process_role_can_do_its_work_through_the_store(pg_db):
         admin, token, _ = web.sign_in(issuer="i", subject="a", display_name="A", email=None, groups=["g"], roles=["admin"], now=now, max_age=day)
         collector.replace_repo_admins([RepoAdmin("acme/notes", "o", 1, now)], observed_at=now)
         req = web.create_registration(person_id=owner.id, draft={"schema": "registration-draft/v1", "repo": "acme/notes"}, now=now)
-        web.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final={"schema": "intake/v2"}, now=now)
+        assert [a.request_id for a in collector.awaiting_evidence()] == [req.id]
+        collector.add_evidence(request_id=req.id, submission=1, commit="e" * 40, evidence=evidence_doc("acme/notes"), floor_tier="low",
+                               floor_classification="internal", rules_commit="f" * 40, now=now)
+        assert collector.awaiting_evidence() == [] and web.evidence_for(req.id, 1).commit == "e" * 40
+        web.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final={"schema": "intake/v2", "tier": "moderate", "data_classification": "internal", "evidence_commit": "e" * 40,
+                                                                                      "floor_tier": "low", "floor_classification": "internal"}, now=now)
         assert writer.claim_approved(now=now).id == req.id
         writer.mark_pr_open(request_id=req.id, branch="b", pr_number=1, pr_url="u", head_sha="2" * 40, base_sha="1" * 40, now=now)
         writer.mark_merged(request_id=req.id, merge_sha="d" * 40, now=now)
@@ -111,7 +118,14 @@ def test_tokens_are_stored_only_as_hashes(pg_db):
 import datetime as _dt  # noqa: E402
 
 NOW = _dt.datetime(2026, 10, 23, 12, tzinfo=_dt.UTC)
-FINAL = {"schema": "intake/v2"}
+COMMIT = "e" * 40
+FINAL = {"schema": "intake/v2", "tier": "moderate", "data_classification": "internal", "evidence_commit": COMMIT, "floor_tier": "low",
+         "floor_classification": "internal"}  # carries the evidence commit and floor that evidence_for() below stores
+
+
+def evidence_for_request(store, request_id, repo, now):
+    store.add_evidence(request_id=request_id, submission=1, commit=COMMIT, evidence=evidence_doc(repo, COMMIT), floor_tier="low",
+                       floor_classification="internal", rules_commit="f" * 40, now=now)
 DRAFT = {"schema": "registration-draft/v1", "repo": "acme/notes"}
 
 
@@ -124,9 +138,12 @@ def seed_requests(pg_db):
         owner, _, _ = store.sign_in(issuer="i", subject="o", display_name="O", email=None, groups=[], roles=[], now=NOW, max_age=day)
         admin, _, _ = store.sign_in(issuer="i", subject="a", display_name="A", email=None, groups=["g"], roles=["admin"], now=NOW, max_age=day)
         pending = store.create_registration(person_id=owner.id, draft={**DRAFT, "repo": "acme/pending"}, now=NOW)
+        evidence_for_request(store, pending.id, "acme/pending", NOW)
         approved = store.create_registration(person_id=owner.id, draft={**DRAFT, "repo": "acme/approved"}, now=NOW)
+        evidence_for_request(store, approved.id, "acme/approved", NOW)
         store.decide(request_id=approved.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final=FINAL, now=NOW)
         writing = store.create_registration(person_id=owner.id, draft={**DRAFT, "repo": "acme/writing"}, now=NOW)
+        evidence_for_request(store, writing.id, "acme/writing", NOW)
         store.decide(request_id=writing.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final=FINAL, now=NOW)
         assert store.claim_approved(now=NOW).id in (approved.id, writing.id)
         claimed = {r.state: r.id for r in store.requests_in(("approved", "writing"))}
@@ -144,7 +161,7 @@ def test_nobody_approves_their_own_request_even_by_a_direct_update(pg_db):
     ids = seed_requests(pg_db)
     with pytest.raises(errors.CheckViolation):
         update(pg_db, "portal_web", "UPDATE request SET state = 'approved', decided_by = requested_by, decided_at = now(), decision_groups = '{}', "
-                                    "decision_note = 'mine', final = '{}'::jsonb WHERE id = %s", ids["pending"])
+                                    "decision_note = 'mine', final = %s WHERE id = %s", Jsonb(FINAL), ids["pending"])  # evidence and record are in order
     with pytest.raises(errors.CheckViolation):  # nor does the owner role, which skips the transition rules' role check but not the constraint
         update(pg_db, "portal_owner", "UPDATE request SET state = 'sent_back', decided_by = requested_by, decided_at = now(), decision_groups = '{}', "
                                       "decision_note = 'mine' WHERE id = %s", ids["pending"])

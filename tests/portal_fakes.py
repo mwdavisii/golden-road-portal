@@ -121,6 +121,8 @@ REPO_PATH = r"/repos/[^/]+/[^/]+"
 PERMISSION_RULES = (
     ("GET", rf"{REPO_PATH}", "metadata", "read"),
     ("GET", rf"{REPO_PATH}/(contents/.*|git/ref/.*|commits/[0-9a-f]{{40}})", "contents", "read"),
+    ("GET", rf"{REPO_PATH}/git/blobs/[0-9a-f]{{40}}", "contents", "read"),
+    ("GET", rf"{REPO_PATH}/git/trees/[0-9a-f]{{40}}", "contents", "read"),
     ("PUT", rf"{REPO_PATH}/contents/.*", "contents", "write"),
     ("POST", rf"{REPO_PATH}/git/refs", "contents", "write"),
     ("GET", rf"{REPO_PATH}/(pulls|pulls/\d+|pulls/\d+/files)", "pull_requests", "read"),
@@ -187,8 +189,9 @@ def approved_request(store, people, now, repo="acme/notes"):
         person_id=people["owner"].id, now=now, draft={"schema": "registration-draft/v1", "repo": repo,
                                                       "purpose": "Stores short team notes; no email, no files.",
                                                       "data_classification": "internal", "proposed_tier": "low"})
+    evidence = store.evidence_for(req.id, req.submission) or give_evidence(store, req, now=now)
     final, errors = intake_record(req, approver_id=people["admin"].id, tier="moderate", classification="internal", review_by="2027-10-23",
-                                  justification="Purpose and classification checked.", now=now)
+                                  justification="Purpose and classification checked.", now=now, evidence=evidence)
     assert not errors
     store.decide(request_id=req.id, actor_id=people["admin"].id, actor_groups=["golden-road-admins"], approve=True,
                  note=final["approval_justification"], final=final, now=now)
@@ -220,4 +223,55 @@ def seed(store, people, now):
     request = store.create_registration(person_id=people["owner"].id, now=now, draft={
         "schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes; no email, no files.",
         "data_classification": "internal", "proposed_tier": "low"})
+    give_evidence(store, request, now=now)  # the platform's evidence at the floor low/internal, so an admin can approve
     return {"link": link.id, "request": request.id, "owner": people["owner"].id}
+
+
+# The factory's config/registration.yaml as a dict (registration-rules/v1): what the floor tests and the collector tests use.
+RULES = {"schema": "registration-rules/v1", "no_spec": {"tier": "high", "data_classification": "restricted"},
+         "classification_tier": {"public": "low", "internal": "low", "restricted": "high", "phi": "high"},
+         "raise_to": {"write_roles": "moderate", "secret_env": "moderate", "model_gateway_egress": "moderate",
+                      "other_egress": "moderate", "many_dependencies": "moderate"},
+         "many_dependencies_over": 50}
+
+
+# What the read installation is granted (the collector's App): Metadata and Contents, read only. A call needing more gets 403.
+READ_PERMISSIONS = {"metadata": "read", "contents": "read"}
+KNOWN_FILES = ("builder-spec.json", ".builder.lock", "requirements.txt", "package-lock.json", "config/registration.yaml")
+
+
+def repo_at(gh, repo, files, *, commit="a" * 40, branch="main", modes=None):
+    """Register a repo's default branch, its head at `commit` and its files on `gh`. A file is bytes (a 200 with base64 content), an int
+    (that status) or a dict (used as the body). Known paths that `files` leaves out answer 404."""
+    gh.on("GET", f"/repos/{repo}", (200, {"default_branch": branch}))
+    gh.on("GET", f"/repos/{repo}/git/ref/heads/{branch}", (200, {"object": {"sha": commit}}))
+    # the commit's root tree: each root file is a regular file unless `modes` says otherwise (120000 symlink, 160000 submodule)
+    root = [{"path": p, "mode": (modes or {}).get(p, "100644"), "type": "blob", "sha": "b" * 40} for p in sorted(files) if "/" not in p]
+    gh.on("GET", f"/repos/{repo}/git/trees/{commit}", (200, {"sha": commit, "tree": root, "truncated": False}))
+    for path in sorted(set(KNOWN_FILES) | set(files)):
+        entry = files.get(path)
+        if entry is None:
+            answer = (404, {"message": "Not Found"})
+        elif isinstance(entry, bytes):
+            answer = (200, {"type": "file", "encoding": "base64", "size": len(entry), "content": base64.b64encode(entry).decode()})
+        elif isinstance(entry, int):
+            answer = (entry, {"message": "status"})
+        else:
+            answer = (200, entry)
+        gh.on("GET", f"/repos/{repo}/contents/{path}", answer)
+    return gh
+
+
+def evidence_doc(repo, commit="e" * 40, **changes):
+    """A valid registration-evidence/v1 for `repo` with a spec, no signals and nothing noteworthy."""
+    doc = {"schema": "registration-evidence/v1", "repo": repo, "commit": commit, "spec_present": True, "data_classification": "internal",
+           "app_type": "python", "resources_tier": "default", "egress": [], "secret_env": [], "write_roles": [], "write_routes": 0,
+           "builder_version": "0.3.10", "dependencies": {"count": 3, "lockfile_present": True, "lockfile": "requirements.txt"}, "signals": []}
+    return {**doc, **changes}
+
+
+def give_evidence(store, request, *, floor_tier="low", floor_classification="internal", commit="e" * 40, now=T0, **changes):
+    """Record the collector's evidence for `request`'s current submission, as the collector would."""
+    return store.add_evidence(request_id=request.id, submission=request.submission, commit=commit,
+                              evidence=evidence_doc(request.repo, commit, **changes), floor_tier=floor_tier,
+                              floor_classification=floor_classification, rules_commit="f" * 40, now=now)

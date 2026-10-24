@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import RedirectResponse
 
+from ..floor import below_floor, effective
 from ..registration import CLASSIFICATIONS, TIERS, form_draft
 from ..store.base import Conflict
 from .access import PUBLIC, REQUESTER, REQUESTER_OR_ADMIN, SIGNED_IN
@@ -33,6 +34,16 @@ def stale_message(stale) -> str:
     last = max(r.observed_at for r in stale).strftime("%Y-%m-%d %H:%M")
     return (f"The portal last saw your repositories at {last} UTC, which is too old to rely on: the collector that reads them from GitHub "
             "may be down. Try again later, or ask an admin.")
+
+
+def evidence_context(store, req) -> dict:
+    """What the evidence macro shows for a request's current submission: the evidence (or why it waits), the claim as submitted, the
+    effective values (the higher of the claim and the floor) and what the floor raised."""
+    found = store.evidence_for(req.id, req.submission)
+    claim = (req.draft.get("proposed_tier"), req.draft.get("data_classification"))
+    return {"evidence": found, "problem": None if found else store.evidence_problem_for(req.id, req.submission), "claim": claim,
+            "effective": effective(*claim, found.floor_tier, found.floor_classification) if found else claim,
+            "mismatch": below_floor(*claim, found.floor_tier, found.floor_classification) if found else []}
 
 
 def admin_repos(request, principal):
@@ -89,7 +100,7 @@ def my_requests(request: Request, principal=SIGNED_IN):
 def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     found = request.state.found_request
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],
-                classifications=CLASSIFICATIONS, tiers=TIERS)
+                classifications=CLASSIFICATIONS, tiers=TIERS, **evidence_context(request.app.state.store, found))
 
 
 @router.post("/requests/{request_id}")
@@ -100,7 +111,8 @@ def resubmit(request: Request, request_id: str, purpose: str = Form(""), data_cl
         return page(request, "error.html", 409, message="Only a request that was sent back can be changed.")
     draft, errors = form_draft(found.repo, purpose, data_classification, proposed_tier)
     if draft is None:
-        return page(request, "request.html", 400, req=found, mine=True, errors=errors, classifications=CLASSIFICATIONS, tiers=TIERS)
+        return page(request, "request.html", 400, req=found, mine=True, errors=errors, classifications=CLASSIFICATIONS, tiers=TIERS,
+                    **evidence_context(request.app.state.store, found))
     try:
         request.app.state.store.resubmit(request_id=found.id, person_id=principal.person.id, draft=draft, now=request.app.state.clock())
     except Conflict:

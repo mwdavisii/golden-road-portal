@@ -15,11 +15,34 @@ LINK_SOURCES = ("github-oauth", "admin")
 
 
 class Conflict(Exception):
-    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed."""
+    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, evidence_exists, not_awaiting, no_evidence, evidence_mismatch, below_floor."""
 
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+MIN_OVERRIDE, MAX_OVERRIDE = 30, 1000
+
+
+def check_approval(evidence, final, floor_override, actor_id):
+    """The rules an approval must meet, the same in every Store (the database enforces them again): the evidence of the request's
+    current submission exists, the record carries its commit and floor and the very override the request does, and a tier or
+    classification below the floor needs the approver's own override of at least MIN_OVERRIDE characters (and none otherwise)."""
+    from ..floor import below_floor
+    if evidence is None:
+        raise Conflict("no_evidence")
+    if (final.get("evidence_commit"), final.get("floor_tier"), final.get("floor_classification")) != (
+            evidence.commit, evidence.floor_tier, evidence.floor_classification) or final.get("floor_override") != floor_override:
+        raise Conflict("evidence_mismatch")
+    below = below_floor(final.get("tier"), final.get("data_classification"), evidence.floor_tier, evidence.floor_classification)
+    if below:
+        reason = (floor_override or {}).get("reason")
+        if (not isinstance(reason, str) or not MIN_OVERRIDE <= len(reason) <= MAX_OVERRIDE or "\n" in reason or "\r" in reason
+                or (floor_override or {}).get("by") != actor_id or (floor_override or {}).get("at") != final.get("approved_at")):
+            raise Conflict("below_floor")
+    elif floor_override is not None:
+        raise Conflict("below_floor")
 
 
 def token_hash(token: str) -> bytes:
@@ -98,6 +121,32 @@ class Request:
     failure_reason: str | None = None
     head_sha: str | None = None  # the commit the writer opened the pull request with: the only one it merges
     base_sha: str | None = None  # the default branch's commit it branched from
+    submission: int = 1  # counts up each time a sent-back request is resubmitted; the platform's evidence is per submission
+    floor_override: dict | None = None  # {by, at, reason}: the approver's written reason for approving below the floor
+
+
+@dc.dataclass(frozen=True)
+class Evidence:
+    """What the collector read from the repo at one commit (registration-evidence/v1) and the floor computed from it."""
+    request_id: str
+    submission: int
+    commit: str
+    evidence: dict
+    floor_tier: str
+    floor_classification: str
+    rules_commit: str
+    computed_at: dt.datetime
+
+
+@dc.dataclass(frozen=True)
+class Awaiting:
+    """A pending registration that has no evidence yet. Never carries the draft: the collector may not read it."""
+    request_id: str
+    repo: str
+    submission: int
+
+
+PROBLEMS = ("rules_missing", "rules_invalid", "rules_unreadable", "repo_unreadable")
 
 
 @dc.dataclass(frozen=True)
@@ -133,9 +182,14 @@ class Store(Protocol):
     def requests_by(self, person_id) -> list[Request]: ...
     def requests_in(self, states) -> list[Request]: ...
     def resubmit(self, *, request_id, person_id, draft, now) -> Request: ...
-    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now) -> Request: ...
+    def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now, floor_override=None) -> Request: ...
     def claim_approved(self, *, now) -> Request | None: ...
     def mark_pr_open(self, *, request_id, branch, pr_number, pr_url, head_sha, base_sha, now) -> Request: ...
     def mark_merged(self, *, request_id, merge_sha, now) -> Request: ...
     def mark_failed(self, *, request_id, reason, now) -> Request: ...
+    def awaiting_evidence(self, limit: int = 50) -> list[Awaiting]: ...
+    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now) -> Evidence: ...
+    def add_evidence_problem(self, *, request_id, submission, problem, now) -> None: ...
+    def evidence_for(self, request_id, submission) -> Evidence | None: ...
+    def evidence_problem_for(self, request_id, submission) -> str | None: ...
     def audit_entries(self, limit: int = 200) -> list[AuditEntry]: ...

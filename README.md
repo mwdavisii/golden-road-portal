@@ -76,7 +76,15 @@ triggered a run, so the writer doesn't decide: it waits, and fails the request a
 the merge commit; if GitHub can't say yet (an error, or a 404 within 30 minutes of the merge) it keeps the request open as "merge confirmation pending" and tries again next pass. Once a PR is merged the writer never fails the request for want of an answer: it fails only on other content, or on a definite 404 after that grace period.
 
 Migrations: `0001` the tables and grants, `0002` the database's own rules (the request state machine, no self-approval, the audit
-log's id and time), `0003` the pinned commits and no admin link to one's own person.
+log's id and time), `0003` the pinned commits and no admin link to one's own person, `0004` the platform's registration evidence and
+`0005` the approval rule that uses it.
+
+Registration evidence: the collector inserts into and reads `registration_evidence` (one evidence row per submission, and the reasons a
+request waits), and reads only the id, kind, repo, state and submission of `request`, never the draft. Nobody updates or deletes
+evidence, not even the schema owner (a trigger refuses it). A resubmission counts `request.submission` up, so it gets fresh
+evidence. `0005` makes the database refuse an approval without the evidence of the request's current submission, and one below the
+stored floor unless the approver recorded an override reason of at least 30 characters. The collector needs `PORTAL_ORG` and
+`PORTAL_MODEL_GATEWAY_HOSTS` (comma-separated host names).
 
 ## Development
 
@@ -86,4 +94,4 @@ PYTHONPATH=src .venv/bin/pytest bootstrap/golden-road-portal/tests -q
 PYTHONPATH=src .venv/bin/pytest -m docker bootstrap/golden-road-portal/tests -q   # Postgres: needs docker
 ```
 
-`requirements.txt` and `requirements-test.txt` are locked with `uv pip compile --generate-hashes --python-version 3.12` (see the header of `requirements.in`). The portal vendors three schemas into `portal/schemas/`; a repo-level test keeps them identical to the platform's contracts.
+`requirements.txt` and `requirements-test.txt` are locked with `uv pip compile --generate-hashes --python-version 3.12` (see the header of `requirements.in`). The portal vendors six schemas into `portal/schemas/`; a repo-level test keeps them identical to the platform's contracts.

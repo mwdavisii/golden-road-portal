@@ -23,3 +23,14 @@ def test_a_date_time_that_is_not_a_real_instant_is_rejected():
     assert validate("intake.v2", intake) == []
     for stamp in ("2026-99-99T99:99:99Z", "2026-02-30T12:00:00Z", "2026-10-23T24:00:00Z"):
         assert validate("intake.v2", {**intake, "approved_at": stamp}), stamp
+
+
+def test_a_floor_override_time_that_is_not_a_real_instant_is_rejected():
+    p = "p_" + "a" * 32
+    intake = {"schema": "intake/v2", "repo": "acme/notes", "tier": "low", "purpose": "Stores short team notes.", "owner": p,
+              "data_classification": "internal", "registered_by": p, "approved_by": "p_" + "b" * 32, "approved_at": "2026-10-23T12:00:00Z",
+              "approval_justification": "Purpose and classification checked.", "review_by": "2027-10-23", "request": "r_" + "c" * 32,
+              "evidence_commit": "e" * 40, "floor_tier": "moderate", "floor_classification": "internal",
+              "floor_override": {"by": "p_" + "b" * 32, "at": "2026-10-23T12:00:00Z", "reason": "The spec over-declares egress; checked it."}}
+    assert validate("intake.v2", intake) == []
+    assert validate("intake.v2", {**intake, "floor_override": {**intake["floor_override"], "at": "2026-02-30T12:00:00Z"}})

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/registration-rules.v1.json",
+  "title": "registration-rules/v1",
+  "description": "Security's floor rules for portal registrations (the factory's config/registration.yaml).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "no_spec", "classification_tier", "raise_to", "many_dependencies_over"],
+  "$defs": {
+    "tier": {"enum": ["low", "moderate", "high"]},
+    "classification": {"enum": ["public", "internal", "restricted", "phi"]}
+  },
+  "properties": {
+    "schema": {"const": "registration-rules/v1"},
+    "no_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tier", "data_classification"],
+      "properties": {
+        "tier": {"$ref": "#/$defs/tier"},
+        "data_classification": {"$ref": "#/$defs/classification"}
+      }
+    },
+    "classification_tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public", "internal", "restricted", "phi"],
+      "properties": {
+        "public": {"$ref": "#/$defs/tier"},
+        "internal": {"$ref": "#/$defs/tier"},
+        "restricted": {"$ref": "#/$defs/tier"},
+        "phi": {"$ref": "#/$defs/tier"}
+      }
+    },
+    "raise_to": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["write_roles", "secret_env", "model_gateway_egress", "other_egress", "many_dependencies"],
+      "properties": {
+        "write_roles": {"$ref": "#/$defs/tier"},
+        "secret_env": {"$ref": "#/$defs/tier"},
+        "model_gateway_egress": {"$ref": "#/$defs/tier"},
+        "other_egress": {"$ref": "#/$defs/tier"},
+        "many_dependencies": {"$ref": "#/$defs/tier"}
+      }
+    },
+    "many_dependencies_over": {"type": "integer", "minimum": 0, "maximum": 100000}
+  }
+}

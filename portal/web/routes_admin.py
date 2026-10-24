@@ -6,11 +6,11 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..auth.github_link import LOGIN
 from ..contracts import validate
-from ..registration import CLASSIFICATIONS, TIERS, add_months, intake_record
+from ..registration import CLASSIFICATIONS, NO_EVIDENCE, TIERS, add_months, intake_record
 from ..store.base import Conflict
 from .access import ADMIN
 from .render import page
-from .routes_register import fresh_admin_repos, stale_message
+from .routes_register import evidence_context, fresh_admin_repos, stale_message
 
 router = APIRouter()
 
@@ -90,7 +90,7 @@ def approvals_page(request, principal, status=200, errors=()):
                       "admin_seen": next((a for a in fresh if a.repo == r.repo), None),
                       "unverified": bool(store.links_for(r.requested_by)) and all(link.github_user_id is None for link in store.links_for(r.requested_by)),
                       "stale_note": stale_message(stale) if any(a.repo == r.repo for a in stale) and not any(a.repo == r.repo for a in fresh) else None,
-                      "mine": r.requested_by == principal.person.id})
+                      "mine": r.requested_by == principal.person.id, **evidence_context(store, r)})
     return page(request, "admin_approvals.html", status, items=items, errors=list(errors), tiers=TIERS, classifications=CLASSIFICATIONS,
                 review_by=add_months(today, settings.review_months).isoformat())
 
@@ -111,19 +111,32 @@ def _pending(request, principal, request_id):
     return found, None
 
 
+DECIDE_CONFLICT = {
+    "no_evidence": NO_EVIDENCE,
+    "evidence_mismatch": "The platform's evidence changed under this approval: reload the page and decide again.",
+    "below_floor": "That tier or data classification is below the platform's floor, and the reason to approve it anyway is missing or not valid.",
+}
+
+
 @router.post("/admin/requests/{request_id}/approve")
 def approve(request: Request, request_id: str, tier: str = Form(""), data_classification: str = Form(""), review_by: str = Form(""),
-            justification: str = Form(""), principal=ADMIN):
+            justification: str = Form(""), floor_override_reason: str = Form(""), submission: str = Form(""), principal=ADMIN):
     store, now = request.app.state.store, request.app.state.clock()
     found = store.get_request(request_id)
     if found is not None and found.requested_by == principal.person.id:
         return approvals_page(request, principal, 403, ["You requested this, so another admin must decide it."])
     if found is None:
         return approvals_page(request, principal, 404, ["No such request."])
+    if not (submission.isascii() and submission.isdigit() and int(submission) >= 1):
+        return approvals_page(request, principal, 400, ["Reload the page: the form didn't say which submission it was loaded for."])
+    if int(submission) != found.submission:  # sent back and submitted again since the page loaded: what the admin judged is gone
+        return approvals_page(request, principal, 409, ["This registration changed since you loaded this page (it was sent back and submitted again). "
+                                                        "Reload the page and look at it again."])
     record, errors = intake_record(found, approver_id=principal.person.id, tier=tier, classification=data_classification,
-                                   review_by=review_by, justification=justification, now=now)
+                                   review_by=review_by, justification=justification, now=now,
+                                   evidence=store.evidence_for(found.id, found.submission), override_reason=floor_override_reason)
     if errors:
-        return approvals_page(request, principal, 400, errors)
+        return approvals_page(request, principal, 409 if errors == [NO_EVIDENCE] else 400, errors)
     found, refused = _pending(request, principal, request_id)
     if refused:
         return refused
@@ -134,9 +147,9 @@ def approve(request: Request, request_id: str, tier: str = Form(""), data_classi
         return approvals_page(request, principal, 409, ["The requester is no longer an admin of that repository, as the portal last saw it."])
     try:
         store.decide(request_id=found.id, actor_id=principal.person.id, actor_groups=principal.session.groups, approve=True,
-                     note=record["approval_justification"], final=record, now=now)
-    except Conflict:
-        return approvals_page(request, principal, 409, ["That request was already decided."])
+                     note=record["approval_justification"], final=record, floor_override=record.get("floor_override"), now=now)
+    except Conflict as exc:
+        return approvals_page(request, principal, 409, [DECIDE_CONFLICT.get(exc.code, "That request was already decided.")])
     return RedirectResponse("/admin/approvals", status_code=303)
 
 

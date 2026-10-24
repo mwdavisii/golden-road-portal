@@ -22,6 +22,17 @@ def test_the_pr_carries_the_request_the_approver_and_the_justification(portal):
     assert title(req) == f"Register acme/notes (portal request {req.id})" and branch_name(req.id) == f"portal/request-{req.id}"
 
 
+def test_the_pr_body_names_the_evidence_commit_the_floor_and_any_override(portal):
+    req = approved_request(portal.store, portal.people, T0)
+    body = pr_body(req, portal.people["owner"], portal.people["admin"])
+    assert "- Evidence: commit `" + "e" * 40 + "`, floor tier `low`, classification `internal`" in body
+    assert "Approved below the floor" not in body
+    override = {"by": req.decided_by, "at": req.final["approved_at"], "reason": "``` @org/security <img src=x> ```` override"}
+    body = pr_body(dc.replace(req, final={**req.final, "floor_override": override}), portal.people["owner"], portal.people["admin"])
+    assert f"- Approved below the floor by `Admin` (`{req.decided_by}`):" in body
+    assert "`````text\n``` @org/security <img src=x> ```` override\n`````" in body
+
+
 def test_untrusted_text_cannot_break_out_of_the_pr_body(portal):
     req = approved_request(portal.store, portal.people, T0)
     req = dc.replace(req, final={**req.final, "approval_justification": "``` @org/security <img src=x> ````"})

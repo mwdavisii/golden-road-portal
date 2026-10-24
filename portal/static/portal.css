@@ -448,6 +448,8 @@ form.inline { display: inline; }
 
 /* ---------- Tables ---------- */
 
+tr.mismatch td { background: var(--warn-wash); }
+
 .table-wrap {
   background: var(--surface);
   border: 1px solid var(--line);

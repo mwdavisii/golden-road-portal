@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_evidence.html" import evidence_view %}
 {% set active = "approvals" %}
 {% block title %}Approvals - golden road{% endblock %}
 {% block main %}
@@ -22,10 +23,7 @@ on {{ r.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
 {% else %}<p class="error">The portal does not see the requester as an admin of {{ r.repo }}. Approving will be refused.</p>{% endif %}
 <h3>Purpose</h3>
 <pre class="prose">{{ r.draft.get("purpose", "") }}</pre>
-<dl class="facts">
-<div><dt>Requested classification</dt><dd>{{ r.draft.get("data_classification", "not given") }}</dd></div>
-<div><dt>Proposed tier</dt><dd>{{ r.draft.get("proposed_tier", "not given") }}</dd></div>
-</dl>
+{{ evidence_view(item.evidence, item.problem, item.claim, item.effective, item.mismatch) }}
 <div class="decision">
 {% if item.mine %}
 <p class="callout info">You requested this, so another admin must decide it.</p>
@@ -33,16 +31,19 @@ on {{ r.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
 <h3>Decide</h3>
 <form method="post" action="/admin/requests/{{ r.id }}/approve">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="hidden" name="submission" value="{{ r.submission }}">
 <div class="field-row">
 <p><label>Tier
-<select name="tier">{% for t in tiers %}<option value="{{ t }}"{% if r.draft.get("proposed_tier") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
+<select name="tier">{% for t in tiers %}<option value="{{ t }}"{% if item.effective[0] == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
 <p><label>Data classification
-<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if r.draft.get("data_classification") == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
+<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if item.effective[1] == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
 <p><label>Review by <input type="date" name="review_by" value="{{ review_by }}" required></label></p>
 </div>
 <p><label>Why this is right <span class="hint">(10 to 1000 characters, one line)</span><br>
 <input type="text" name="justification" size="80" required minlength="10" maxlength="1000"></label></p>
-<p class="actions"><button type="submit">Approve</button></p>
+<p><label>Reason to approve below the floor <span class="hint">(only when you choose a lower tier or classification than the floor; 30 to 1000 characters, one line)</span><br>
+<input type="text" name="floor_override_reason" size="80" maxlength="1000"></label></p>
+<p class="actions"><button type="submit"{% if not item.evidence %} disabled{% endif %}>Approve</button></p>
 </form>
 <form class="send-back" method="post" action="/admin/requests/{{ r.id }}/send-back">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/registration-evidence.v1.json",
+  "title": "registration-evidence/v1",
+  "description": "What the portal's collector read from a registered repo's default branch at one commit. Every string is repo data checked against a pattern, or written by the collector. Nothing comes from the registration draft.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "commit", "spec_present", "data_classification", "app_type", "resources_tier", "egress", "secret_env", "write_roles", "write_routes", "builder_version", "dependencies", "signals"],
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "classification": {"enum": ["public", "internal", "restricted", "phi"]}
+  },
+  "properties": {
+    "schema": {"const": "registration-evidence/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "spec_present": {"type": "boolean"},
+    "data_classification": {"oneOf": [{"$ref": "#/$defs/classification"}, {"type": "null"}]},
+    "app_type": {"enum": ["python", "node", "static", null]},
+    "resources_tier": {"enum": ["default", "medium", null]},
+    "egress": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "port", "model_gateway"],
+        "properties": {
+          "host": {"type": "string", "maxLength": 253, "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\\.[a-z]([a-z0-9-]*[a-z0-9])?$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+          "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+          "model_gateway": {"type": "boolean"}
+        }
+      }
+    },
+    "secret_env": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"type": "string", "maxLength": 200, "pattern": "^[A-Z_][A-Z0-9_]*$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+    },
+    "write_roles": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"type": "string", "maxLength": 200, "pattern": "^[a-z][a-z0-9_-]*$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+    },
+    "write_routes": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "builder_version": {"oneOf": [{"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$", "allOf": [{"$ref": "#/$defs/single_line"}]}, {"type": "null"}]},
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "lockfile_present", "lockfile"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "lockfile_present": {"type": "boolean"},
+        "lockfile": {"enum": ["requirements.txt", "package-lock.json", null]}
+      }
+    },
+    "signals": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule", "line"],
+        "properties": {
+          "rule": {"type": "string", "pattern": "^(no_spec|write_roles|secret_env|model_gateway_egress|other_egress|many_dependencies|unreadable:(builder-spec\\.json|\\.builder\\.lock|requirements\\.txt|package-lock\\.json))$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+          "line": {"type": "string", "minLength": 1, "maxLength": 300, "allOf": [{"$ref": "#/$defs/single_line"}]}
+        }
+      }
+    }
+  }
+}

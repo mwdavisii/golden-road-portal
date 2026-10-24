@@ -195,6 +195,17 @@ def test_a_recheck_failure_makes_no_github_call(portal):
     assert portal.store.get_request(req.id).failure_reason == "recheck: approver_not_admin" and gh.calls == []
 
 
+def test_a_record_below_the_floor_makes_no_github_call(portal):
+    import dataclasses as dc
+    req = approved_request(portal.store, portal.people, T0)
+    row = portal.store._evidence[(req.id, req.submission)]
+    portal.store._evidence[(req.id, req.submission)] = dc.replace(row, floor_tier="high")  # the stored floor rose after the approval
+    portal.store._requests[req.id] = dc.replace(portal.store._requests[req.id], final={**req.final, "floor_tier": "high"})
+    gh = FakeGitHub()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "recheck: below_floor" and gh.calls == []
+
+
 def test_a_github_error_fails_the_request_with_a_code_written_reason(portal):
     req = approved_request(portal.store, portal.people, T0)
     gh = gh_for_write()

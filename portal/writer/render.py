@@ -31,13 +31,28 @@ def _name(person) -> str:
     return "`" + (person.display_name if person else "unknown").replace("`", "'").replace("\n", " ") + "`"
 
 
+def _evidence_lines(f) -> list[str]:
+    if "evidence_commit" not in f:
+        return []
+    return [f"- Evidence: commit `{f['evidence_commit']}`, floor tier `{f['floor_tier']}`, classification `{f['floor_classification']}`"]
+
+
+def _override_lines(f, approver) -> list[str]:
+    override = f.get("floor_override")
+    if not override:
+        return []
+    return [f"- Approved below the floor by {_name(approver)} (`{override['by']}`):", fenced(override["reason"]), ""]
+
+
 def pr_body(request, requester, approver) -> str:
     f = request.final
     return "\n".join([
         f"Portal request `{request.id}`: register `{request.repo}`.", "",
         f"- Requested by {_name(requester)} (`{request.requested_by}`)",
         f"- Approved by {_name(approver)} (`{request.decided_by}`) at {f['approved_at']}",
-        f"- Tier `{f['tier']}`, data classification `{f['data_classification']}`, review by {f['review_by']}", "",
+        f"- Tier `{f['tier']}`, data classification `{f['data_classification']}`, review by {f['review_by']}",
+        *_evidence_lines(f), "",
         "Justification:", fenced(f["approval_justification"]), "",
+        *_override_lines(f, approver),
         "Written by the golden road portal's writer. It merges once the required checks pass. Change this record through the portal.",
     ])
