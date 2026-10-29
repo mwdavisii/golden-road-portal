@@ -27,10 +27,11 @@ def github_bases(host: str) -> tuple[str, str]:
     return f"https://{host}", f"https://{host}/api/v3"
 
 
-def _https(name: str, value: str, *, root_only: bool = False) -> str:
+def _https(name: str, value: str, *, root_only: bool = False, query: bool = False) -> str:
     parts = urlsplit(value)
-    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
-        raise SettingsError(f"{name} must be an https URL with a host and no user info, query or fragment")
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or (parts.query and not query) \
+            or parts.fragment or "#" in value:
+        raise SettingsError(f"{name} must be an https URL with a host and no user info, {'' if query else 'query or '}fragment")
     if root_only:
         if parts.path not in ("", "/"):
             raise SettingsError(f"{name} must have no path: the session cookie is a __Host- cookie on /")
@@ -77,6 +78,9 @@ class Settings:
     session_max: dt.timedelta = dt.timedelta(hours=8)
     review_months: int = 12
     repo_admins_stale_after: dt.timedelta = dt.timedelta(minutes=10)  # two collector intervals of 5 minutes
+    directory: object = None  # portal.directory.Directory when PORTAL_DIRECTORY is set; None hides the app's connections
+    identity_process_url: str = ""  # where security's process for service principals is described (link text on the app page)
+    data_process_url: str = ""  # where analytics' process for warehouse grants is described
 
     @property
     def origin(self) -> str:
@@ -148,6 +152,8 @@ class Settings:
             return months
 
         def stale_ok(value):
+            if value == "":
+                value = "600"  # empty (the kit's config map leaves it so) is the default, as the writer reads it
             try:
                 stale = int(value)
             except ValueError as exc:
@@ -155,6 +161,20 @@ class Settings:
             if not 60 <= stale <= 7 * 86400:
                 raise SettingsError("PORTAL_REPO_ADMINS_STALE_AFTER must be from 60 seconds to 7 days")
             return stale
+
+        def directory_ok(value):
+            if value == "":
+                return None
+            if value != "mock":
+                raise SettingsError("PORTAL_DIRECTORY must be mock or unset (the only directory there is is the mock)")
+            from .directory import DirectoryError, load_mock
+            try:
+                return load_mock()
+            except DirectoryError as exc:
+                raise SettingsError("PORTAL_DIRECTORY is mock, but the mock directory is not valid") from exc
+
+        def link_ok(name):
+            return lambda value: _https(name, value, query=True) if value else ""  # a wiki page link may need its query
 
         values = dict(
             base_url=need("PORTAL_BASE_URL", lambda v: _https("PORTAL_BASE_URL", v, root_only=True)),
@@ -167,7 +187,10 @@ class Settings:
             oidc_scopes=env.get("PORTAL_OIDC_SCOPES", "openid profile email"),
             oidc_groups_claim=get("PORTAL_OIDC_GROUPS_CLAIM", claim_ok, "groups"),
             oidc_algorithms=get("PORTAL_OIDC_ALGORITHMS", algorithms_ok, "RS256"),
-            review_months=get("PORTAL_REVIEW_MONTHS", months_ok, "12"))
+            review_months=get("PORTAL_REVIEW_MONTHS", months_ok, "12"),
+            directory=get("PORTAL_DIRECTORY", directory_ok, ""),
+            identity_process_url=get("PORTAL_IDENTITY_PROCESS_URL", link_ok("PORTAL_IDENTITY_PROCESS_URL"), ""),
+            data_process_url=get("PORTAL_DATA_PROCESS_URL", link_ok("PORTAL_DATA_PROCESS_URL"), ""))
         stale = get("PORTAL_REPO_ADMINS_STALE_AFTER", stale_ok, "600")
         if problems:
             return None, problems

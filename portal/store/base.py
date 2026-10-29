@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses as dc
 import datetime as dt
 import hashlib
+import re
 from typing import Protocol
 
 OPEN_STATES = ("pending", "sent_back", "approved", "writing", "pr_open")
@@ -15,7 +16,7 @@ LINK_SOURCES = ("github-oauth", "admin")
 
 
 class Conflict(Exception):
-    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, evidence_exists, not_awaiting, no_evidence, evidence_mismatch, below_floor."""
+    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, evidence_mismatch, below_floor."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -43,6 +44,24 @@ def check_approval(evidence, final, floor_override, actor_id):
             raise Conflict("below_floor")
     elif floor_override is not None:
         raise Conflict("below_floor")
+
+
+REQUEST_ID = re.compile(r"r_[0-9a-f]{32}")  # portal.ids.new_id("r"), as migration 0001's request_id_check
+
+
+def check_binding(request_id, person_id, final):
+    """A binding request's id has the portal's format, and its record is a valid binding/v1 that names the request, its repo and
+    the person. Every Store checks this before it writes anything; the database checks the naming again (0006). Who may change
+    the app's connections is the web's check and the writer's recheck (the requester is still an admin of the repo); not the store's."""
+    from ..contracts import validate
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        raise ValueError("a binding request's id is not a portal request id")
+    if not isinstance(final, dict) or final.get("schema") != "binding/v1" or final.get("request") != request_id \
+            or final.get("linked_by") != person_id or not isinstance(final.get("repo"), str) or not final["repo"]:
+        raise ValueError("a binding request's record must name its request, its repo and its person")
+    problems = validate("binding.v1", final)
+    if problems:
+        raise ValueError(f"a binding request's record is not a valid binding/v1: {problems[0]}")
 
 
 def token_hash(token: str) -> bytes:
@@ -177,9 +196,13 @@ class Store(Protocol):
     def replace_repo_admins(self, rows, *, observed_at) -> None: ...
     def admin_repos(self, github_user_ids) -> list[RepoAdmin]: ...
     def admin_repos_by_login(self, logins) -> list[RepoAdmin]: ...
+    def admin_repos_of_person(self, person_id) -> list[RepoAdmin]: ...  # through the person's active links: by user ID, else by login
+    def observed_repo(self, repo) -> str | None: ...  # the collector's name of a repo, matched case-insensitively, or None
     def create_registration(self, *, person_id, draft, now) -> Request: ...
+    def create_binding(self, *, request_id, person_id, final, now, current=None) -> Request: ...  # approved, no decision (B1); audits current as before
     def get_request(self, request_id) -> Request | None: ...
     def requests_by(self, person_id) -> list[Request]: ...
+    def requests_for_repo(self, repo) -> list[Request]: ...  # every kind, newest first, the repo matched case-insensitively
     def requests_in(self, states) -> list[Request]: ...
     def resubmit(self, *, request_id, person_id, draft, now) -> Request: ...
     def decide(self, *, request_id, actor_id, actor_groups, approve, note, final, now, floor_override=None) -> Request: ...

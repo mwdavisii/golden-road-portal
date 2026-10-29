@@ -5,7 +5,7 @@ import secrets
 import threading
 
 from ..ids import new_id
-from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, token_hash
+from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, check_binding, token_hash
 
 
 class MemoryStore:
@@ -134,6 +134,18 @@ class MemoryStore:
         with self._lock:
             return sorted((r for r in self._admins if r.github_user_id in ids), key=lambda r: (r.repo.lower(), r.github_login))
 
+    def admin_repos_of_person(self, person_id):
+        """The repo admin rows the person's active links match (by user ID where the link has one, by login where it hasn't): what
+        the writer reads to re-check a binding's requester (on Postgres, through person_admin_repos, migration 0006)."""
+        links = self.links_for(person_id)
+        rows = self.admin_repos([l.github_user_id for l in links if l.github_user_id is not None])
+        rows += self.admin_repos_by_login([l.github_login.lower() for l in links if l.github_user_id is None])
+        return sorted(set(rows), key=lambda r: (r.repo.lower(), r.github_login))
+
+    def observed_repo(self, repo):
+        with self._lock:
+            return next((r.repo for r in sorted(self._admins, key=lambda r: r.repo) if r.repo.lower() == str(repo).lower()), None)
+
     # ---- requests ----
 
     def create_registration(self, *, person_id, draft, now):
@@ -147,12 +159,32 @@ class MemoryStore:
                       "registration submitted")
             return req
 
+    def create_binding(self, *, request_id, person_id, final, now, current=None):
+        check_binding(request_id, person_id, final)
+        repo = final["repo"]
+        with self._lock:
+            if person_id not in self._people:
+                raise Conflict("unknown_person")
+            if request_id in self._requests:
+                raise Conflict("request_exists")
+            if any(r.kind == "binding" and r.repo.lower() == repo.lower() and r.state in OPEN_STATES for r in self._requests.values()):
+                raise Conflict("open_request_exists")
+            req = Request(request_id, "binding", repo, "approved", dict(final), person_id, now, now, final=dict(final))
+            self._requests[req.id] = req
+            self._log(now, "person", person_id, "request.created", "request", req.id, {"binding": dict(current) if current else None},
+                      {"state": "approved", "repo": repo, "final": dict(final)}, "connection change requested in the portal")
+            return req
+
     def get_request(self, request_id):
         return self._requests.get(request_id)
 
     def requests_by(self, person_id):
         with self._lock:
             return sorted((r for r in self._requests.values() if r.requested_by == person_id), key=lambda r: (r.created_at, r.id), reverse=True)
+
+    def requests_for_repo(self, repo):
+        with self._lock:
+            return sorted((r for r in self._requests.values() if r.repo.lower() == repo.lower()), key=lambda r: (r.created_at, r.id), reverse=True)
 
     def requests_in(self, states):
         with self._lock:
@@ -244,7 +276,7 @@ class MemoryStore:
 
     def claim_approved(self, *, now):
         with self._lock:
-            ready = sorted((r for r in self._requests.values() if r.state == "approved"), key=lambda r: (r.decided_at, r.id))
+            ready = sorted((r for r in self._requests.values() if r.state == "approved"), key=lambda r: (r.decided_at or r.created_at, r.id))  # a binding has no decision
             if not ready:
                 return None
             return self._move(ready[0].id, ("approved",), "writing", now, "the writer picked up the approved request")

@@ -1,10 +1,10 @@
 import dataclasses as dc
 
 import yaml
-from portal_fakes import T0, approved_request
+from portal_fakes import T0, approved_request, binding_request
 
 from portal.contracts import validate
-from portal.writer.render import branch_name, fenced, intake_yaml, pr_body, title
+from portal.writer.render import binding_yaml, branch_name, content_for, fenced, intake_yaml, pr_body, title
 
 
 def test_the_file_is_the_approved_record_with_a_header(portal):
@@ -44,3 +44,28 @@ def test_untrusted_text_cannot_break_out_of_the_pr_body(portal):
 
 def test_fenced_uses_a_fence_longer_than_any_backtick_run():
     assert fenced("a ```` b").startswith("`````text\n")
+
+
+def test_a_binding_file_is_the_binding_with_a_header(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    text = binding_yaml(req.final, req.id)
+    assert text.startswith(f"# Written by the golden road portal (request {req.id}).")
+    assert "# Change it on the app's page in the portal.\n" in text.split("schema:")[0]
+    assert yaml.safe_load(text) == req.final and validate("binding.v1", yaml.safe_load(text)) == []
+    assert list(yaml.safe_load(text)) == list(req.final), "the binding's own key order"
+    assert content_for(req) == text
+    reg = approved_request(portal.store, portal.people, T0)
+    assert content_for(reg) == intake_yaml(reg.final, reg.id)
+
+
+def test_a_binding_pr_names_the_person_the_directory_entries_and_the_time(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    assert title(req) == f"Connections for acme/notes (portal request {req.id})"
+    body = pr_body(req, portal.people["owner"], None)
+    for needle in (f"`{req.id}`", "`acme/notes`", "`Owner`", f"(`{req.requested_by}`)", req.final["linked_at"],
+                   "Azure identity `sp-notes`", "Databricks connection `wh-notes`", "`mock-directory`"):
+        assert needle in body, needle
+    final = {k: v for k, v in req.final.items() if k not in ("azure_identity", "databricks")}
+    assert "Now linked: neither (unlinked)" in pr_body(dc.replace(req, final=final), portal.people["owner"], None)
+    sneaky = dc.replace(portal.people["owner"], display_name="`@everyone` <b>")
+    assert "`'@everyone' <b>`" in pr_body(req, sneaky, None)

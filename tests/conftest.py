@@ -58,12 +58,12 @@ class Portal:
 @pytest.fixture
 def portal():
     import httpx
-    from portal_fakes import Clock, FakeGitHub, FakeIdP, transport
+    from portal_fakes import Clock, FakeGitHub, FakeIdP, fake_directory, transport
     from portal.roles import roles_for
     from portal.store.memory import MemoryStore
     from portal.web.app import create_app
 
-    store, clock, settings = MemoryStore(), Clock(T0), make_settings()
+    store, clock, settings = MemoryStore(), Clock(T0), make_settings(directory=fake_directory())
     fakes = {"idp": FakeIdP(ISSUER), "github": FakeGitHub()}
     http = httpx.Client(transport=transport(*fakes.values()))
     app = create_app(settings=settings, store=store, http=http, clock=clock)

@@ -113,6 +113,49 @@ def test_repo_admins_are_replaced_as_a_whole(store):
     assert store.admin_repos([1001]) == [] and store.admin_repos([1002])[0].observed_at == later
 
 
+
+def test_a_person_s_admin_repos_come_from_their_active_links_by_user_id_or_by_login(store):
+    """What the writer reads to re-check a binding's requester (it can't read the links or the repo admins themselves)."""
+    pat, _, _ = sign_in(store)
+    sam, _, _ = sign_in(store, subject="sub-2", name="Sam")
+    lead, _, _ = sign_in(store, subject="sub-3", name="Lead", roles=["admin"], groups=["golden-road-admins"])
+    by_id = store.add_link(person_id=pat.id, github_login="pat-gh", github_user_id=1001, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    store.add_link(person_id=pat.id, github_login="Pat-Old", github_user_id=None, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    store.add_link(person_id=sam.id, github_login="sam-gh", github_user_id=1002, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    store.replace_repo_admins([RepoAdmin("acme/notes", "renamed-pat", 1001, T0), RepoAdmin("acme/Old", "pat-old", 1003, T0),
+                               RepoAdmin("acme/sams", "sam-gh", 1002, T0), RepoAdmin("acme/byname", "pat-gh", 1009, T0)], observed_at=T0)
+    assert [r.repo for r in store.admin_repos_of_person(pat.id)] == ["acme/notes", "acme/Old"], "by user ID, or by login without one"
+    assert store.admin_repos_of_person(pat.id)[0].observed_at == T0
+    store.remove_link(link_id=by_id.id, actor_id=lead.id, reason="r" * 10, now=T0)
+    assert [r.repo for r in store.admin_repos_of_person(pat.id)] == ["acme/Old"], "a removed link no longer counts"
+    assert store.admin_repos_of_person("p_" + "0" * 32) == []
+
+
+def test_the_web_s_admin_repos_and_the_writer_s_agree(store):
+    """The web decides with ownership.admin_repos_of, the writer re-checks with store.admin_repos_of_person: the same repos, seen at the
+    same time, for every person (one row per repo on the web, one per matching login in the store)."""
+    from portal.web.ownership import admin_repos_of
+    pat, _, _ = sign_in(store)
+    sam, _, _ = sign_in(store, subject="sub-2", name="Sam")
+    kim, _, _ = sign_in(store, subject="sub-4", name="Kim")
+    lead, _, _ = sign_in(store, subject="sub-3", name="Lead", roles=["admin"], groups=["golden-road-admins"])
+    store.add_link(person_id=pat.id, github_login="pat-gh", github_user_id=1001, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    store.add_link(person_id=pat.id, github_login="Pat-Old", github_user_id=None, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    gone = store.add_link(person_id=sam.id, github_login="sam-gh", github_user_id=1002, source="admin", actor_id=lead.id, reason="r" * 10, now=T0)
+    store.replace_repo_admins([RepoAdmin("acme/notes", "renamed-pat", 1001, T0), RepoAdmin("acme/notes", "pat-old", 1003, T0),
+                               RepoAdmin("acme/Old", "PAT-OLD", 1003, T0), RepoAdmin("acme/zeta", "pat-gh", 1001, T0),
+                               RepoAdmin("acme/sams", "sam-gh", 1002, T0), RepoAdmin("acme/byname", "pat-gh", 1009, T0)], observed_at=T0)
+
+    def agree():
+        for person in (pat, sam, kim, lead):
+            web = {(r.repo, r.observed_at) for r in admin_repos_of(store, person.id)}
+            writer = {(r.repo, r.observed_at) for r in store.admin_repos_of_person(person.id)}
+            assert web == writer, person.display_name
+    agree()
+    assert {r.repo for r in admin_repos_of(store, pat.id)} == {"acme/notes", "acme/Old", "acme/zeta"}
+    store.remove_link(link_id=gone.id, actor_id=lead.id, reason="r" * 10, now=T0)
+    agree()
+
 DRAFT = {"schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes.",
          "data_classification": "internal", "proposed_tier": "low"}
 
@@ -218,6 +261,12 @@ def test_admin_repos_by_login_matches_case_insensitively(store):
                               observed_at=T0)
     assert [r.repo for r in store.admin_repos_by_login(["pat"])] == ["acme/notes", "acme/Zeta"]
     assert store.admin_repos_by_login([]) == [] and store.admin_repos_by_login(["nobody"]) == []
+
+
+def test_observed_repo_is_the_collector_s_name_of_a_repo(store):
+    store.replace_repo_admins([RepoAdmin("acme/Zeta", "pat", 1001, T0), RepoAdmin("acme/Zeta", "sam", 1002, T0)], observed_at=T0)
+    assert store.observed_repo("ACME/zeta") == "acme/Zeta" and store.observed_repo("acme/Zeta") == "acme/Zeta"
+    assert store.observed_repo("acme/zet") is None and store.observed_repo("acme/zet_") is None and store.observed_repo("%") is None
 
 
 def test_an_admin_cannot_link_a_login_to_their_own_person(store):
@@ -370,3 +419,133 @@ def test_requests_with_a_waiting_reason_do_not_starve_new_ones(store):
     first = store.awaiting_evidence(limit=50)
     assert len(first) == 50 and first[0].request_id == ordered[50].id  # the one without a problem row comes first
     assert [a.request_id for a in first[1:]] == [r.id for r in ordered[:49]]  # then the rest by id
+
+
+# ---- binding requests (spec 2026-10-29 app bindings, B1): the app's admin's change starts approved, with no decision ----
+
+from portal.ids import new_id  # noqa: E402
+
+
+def binding_final(repo, person_id, request_id):
+    return {"schema": "binding/v1", "repo": repo, "linked_by": person_id, "linked_at": "2026-10-23T12:00:00Z", "request": request_id,
+            "azure_identity": {"directory_id": "sp-notes", "tenant_id": "00000000-0000-4000-8000-00000000a2e0",
+                               "client_id": "11111111-1111-4111-8111-111111111111", "verified_by": "mock-directory"}}
+
+
+def test_a_binding_request_starts_approved_without_a_decision_and_is_audited(store):
+    person, _, _ = sign_in(store)
+    rid = new_id("r")
+    final = binding_final("acme/Notes", person.id, rid)
+    req = store.create_binding(request_id=rid, person_id=person.id, final=final, now=T0)
+    assert (req.id, req.kind, req.repo, req.state, req.requested_by) == (rid, "binding", "acme/Notes", "approved", person.id)
+    assert (req.decided_by, req.decided_at, req.decision_note, req.floor_override) == (None, None, None, None)
+    assert req.final == req.draft == final and store.get_request(rid) == req
+    entry = store.audit_entries()[0]
+    assert (entry.action, entry.subject_id, entry.actor_id, entry.reason) == ("request.created", rid, person.id, "connection change requested in the portal")
+    assert (entry.before, entry.after) == ({"binding": None}, {"state": "approved", "repo": "acme/Notes", "final": final})
+    assert store.awaiting_evidence() == []   # the collector reads registrations only
+    with pytest.raises(Conflict, match="wrong_state"):   # nobody decides a binding
+        store.decide(request_id=rid, actor_id=person.id, actor_groups=[], approve=True, note="x", final=final, now=T0)
+
+
+def test_one_open_binding_request_per_repo(store):
+    person, _, _ = sign_in(store)
+    first = new_id("r")
+    store.create_binding(request_id=first, person_id=person.id, final=binding_final("acme/notes", person.id, first), now=T0)
+    second = new_id("r")
+    with pytest.raises(Conflict) as exc:
+        store.create_binding(request_id=second, person_id=person.id, final=binding_final("ACME/notes", person.id, second), now=T0)
+    assert exc.value.code == "open_request_exists" and store.get_request(second) is None
+    store.create_registration(person_id=person.id, draft={**DRAFT, "repo": "acme/notes"}, now=T0)  # a registration is another kind
+    store.claim_approved(now=T0)
+    store.mark_failed(request_id=first, reason="the writer could not write it", now=T0)
+    third = new_id("r")
+    store.create_binding(request_id=third, person_id=person.id, final=binding_final("acme/notes", person.id, third), now=T0)  # a failed one no longer blocks
+
+
+def test_the_writer_claims_bindings_in_creation_order_alongside_registrations(store):
+    owner, admin = people(store)
+    a, b = new_id("r"), new_id("r")
+    store.create_binding(request_id=a, person_id=owner.id, final=binding_final("acme/a", owner.id, a), now=T0)
+    reg = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    evidence = give_evidence(store, reg)
+    store.decide(request_id=reg.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final=final_for(evidence), now=T0 + HOUR / 2)
+    store.create_binding(request_id=b, person_id=owner.id, final=binding_final("acme/b", owner.id, b), now=T0 + HOUR)
+    claimed = [store.claim_approved(now=T0 + 2 * HOUR).id for _ in range(3)]
+    assert claimed == [a, reg.id, b] and store.claim_approved(now=T0 + 2 * HOUR) is None
+
+
+def test_requests_for_repo_lists_both_kinds_newest_first(store):
+    person, _, _ = sign_in(store)
+    reg = store.create_registration(person_id=person.id, now=T0, draft={"schema": "registration-draft/v1", "repo": "acme/notes",
+                                    "purpose": "Stores short team notes.", "data_classification": "internal", "proposed_tier": "low"})
+    rid = new_id("r")
+    store.create_binding(request_id=rid, person_id=person.id, final=binding_final("acme/notes", person.id, rid), now=T0 + HOUR)
+    other = new_id("r")
+    store.create_binding(request_id=other, person_id=person.id, final=binding_final("acme/other", person.id, other), now=T0 + HOUR)
+    assert [r.id for r in store.requests_for_repo("ACME/Notes")] == [rid, reg.id]
+    assert store.requests_for_repo("acme/nothing") == []
+
+
+@pytest.mark.parametrize("change", [
+    {"request": "r_" + "9" * 32},          # names another request
+    {"linked_by": "p_" + "9" * 32},        # names another person
+    {"schema": "intake/v2"},
+    {"repo": None},
+])
+def test_a_binding_final_must_name_its_request_its_person_and_its_repo(store, change):
+    person, _, _ = sign_in(store)
+    rid = new_id("r")
+    with pytest.raises(ValueError):
+        store.create_binding(request_id=rid, person_id=person.id, final={**binding_final("acme/notes", person.id, rid), **change}, now=T0)
+    assert store.get_request(rid) is None and [e.action for e in store.audit_entries()] == ["person.created"]
+
+
+def test_the_audit_entry_records_the_binding_it_replaces(store):
+    person, _, _ = sign_in(store)
+    first = new_id("r")
+    current = binding_final("acme/notes", person.id, first)
+    store.create_binding(request_id=first, person_id=person.id, final=current, now=T0)
+    store.claim_approved(now=T0)
+    store.mark_failed(request_id=first, reason="the writer could not write it", now=T0)
+    second = new_id("r")
+    store.create_binding(request_id=second, person_id=person.id, final=binding_final("acme/notes", person.id, second), current=current, now=T0)
+    entry = store.audit_entries()[0]
+    assert (entry.subject_id, entry.before) == (second, {"binding": current})
+
+
+def test_a_binding_never_reuses_a_request_id(store):
+    person, _, _ = sign_in(store)
+    reg = store.create_registration(person_id=person.id, draft={**DRAFT, "repo": "acme/registered"}, now=T0)
+    with pytest.raises(Conflict) as exc:   # a registration's id, for another repo: not an open-request clash
+        store.create_binding(request_id=reg.id, person_id=person.id, final=binding_final("acme/notes", person.id, reg.id), now=T0)
+    assert exc.value.code == "request_exists" and store.get_request(reg.id).kind == "registration"
+    rid = new_id("r")
+    store.create_binding(request_id=rid, person_id=person.id, final=binding_final("acme/a", person.id, rid), now=T0)
+    with pytest.raises(Conflict) as exc:
+        store.create_binding(request_id=rid, person_id=person.id, final=binding_final("acme/b", person.id, rid), now=T0)
+    assert exc.value.code == "request_exists" and store.get_request(rid).repo == "acme/a"
+
+
+@pytest.mark.parametrize("request_id", ["r_" + "A" * 32, "r_123", "x_" + "a" * 32, "r_" + "a" * 32 + "\n"])
+def test_a_binding_request_id_has_the_portal_s_format(store, request_id):
+    person, _, _ = sign_in(store)
+    with pytest.raises(ValueError):
+        store.create_binding(request_id=request_id, person_id=person.id, final=binding_final("acme/notes", person.id, request_id), now=T0)
+
+
+@pytest.mark.parametrize("change", [{"token": "x"}, {"linked_at": "yesterday"}, {"repo": "notes"},
+                                    {"databricks": {"directory_id": "wh-notes", "host": "evil.example.com", "http_path": "/x", "verified_by": "mock-directory"}}])
+def test_a_binding_record_must_be_a_valid_binding_v1(store, change):
+    person, _, _ = sign_in(store)
+    rid = new_id("r")
+    with pytest.raises(ValueError):
+        store.create_binding(request_id=rid, person_id=person.id, final={**binding_final("acme/notes", person.id, rid), **change}, now=T0)
+    assert store.get_request(rid) is None
+
+
+def test_a_binding_by_an_unknown_person_is_refused_cleanly(store):
+    nobody, rid = "p_" + "0" * 32, new_id("r")
+    with pytest.raises(Conflict) as exc:
+        store.create_binding(request_id=rid, person_id=nobody, final=binding_final("acme/notes", nobody, rid), now=T0)
+    assert exc.value.code == "unknown_person" and store.get_request(rid) is None and store.audit_entries() == []

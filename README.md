@@ -45,6 +45,8 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_OIDC_SCOPES`, `PORTAL_OIDC_GROUPS_CLAIM`, `PORTAL_OIDC_ALGORITHMS` | Optional; default `openid profile email`, `groups`, `RS256` |
 | `PORTAL_REVIEW_MONTHS` | Optional; months until a registration's review date (1 to 36, default 12) |
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; seconds after which the collector's observation of a person's admin repos is too old to register or approve on (60 to 604800, default 600: two collector intervals) |
+| `PORTAL_DIRECTORY` | Optional; `mock` turns on each app's connections (an Azure identity and a Databricks connection, picked from `portal/mock_directory.json`); unset, the app page shows none. The writer must get the same value |
+| `PORTAL_IDENTITY_PROCESS_URL`, `PORTAL_DATA_PROCESS_URL` | Optional; `https://` pages that say how to ask for a service principal and for a warehouse grant (linked on the app page) |
 
 Anything missing or malformed stops the process at startup.
 
@@ -58,11 +60,15 @@ Anything missing or malformed stops the process at startup.
 | `PORTAL_WRITE_APP_ID`, `PORTAL_WRITE_INSTALLATION_ID`, `PORTAL_WRITE_APP_KEY_FILE` | The write App installation and its RSA private key (a PEM file, never printed) |
 | `PORTAL_WRITER_INTERVAL` | Optional; seconds between passes (5 to 3600, default 30) |
 | `PORTAL_WRITER_REQUIRED_CHECKS` | Optional; comma-separated checks that must pass before a merge. `factory-check` is always required; others can be added |
+| `PORTAL_DIRECTORY` | Optional; as for the web (`mock` or unset). Every binding is re-checked against it before it is written; unset, bindings fail with `no_directory` |
+| `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; the web's setting, and it must be the same value (the homelab kit passes both processes the one config map key; empty is the default, 600). A binding's requester must have been seen as the repo's admin within it, or it fails with `requester_not_admin` |
 
 It checks the write App's bypass before the first pass and again before every pass, and writes nothing in a pass whose check finds a
 problem. Exit codes: 2 for a missing or bad setting or key, 3 when the bypass check refuses to start it.
 It merges only the commit it opened the pull request with (migration 0003 stores it), and only while the pull request still adds
-exactly the one allowlisted file on the default branch.
+exactly the one allowlisted file on the default branch (`intake/<owner>/<repo>.yaml` for a registration; for a binding,
+`bindings/<owner>/<repo>.yaml`, which it may also modify in place: the contents `PUT` then names the blob it replaces, and an
+unlink rewrites the file, never deletes it).
 
 The writer's GitHub surface is exactly these calls (the write installation needs `contents` and `pull_requests` write, and `metadata`, `checks`, `administration` and `actions` read: `actions: read` is for the workflow-run call, which a private repo refuses without it). As the App (a short JWT): `POST /app/installations/{id}/access_tokens`, `GET /app/installations/{id}`.
 As the write installation: `GET /installation/repositories`, `GET /repos/{r}`, `GET /repos/{r}/git/ref/heads/{branch}`, `POST /repos/{r}/git/refs`,
@@ -77,7 +83,11 @@ the merge commit; if GitHub can't say yet (an error, or a 404 within 30 minutes 
 
 Migrations: `0001` the tables and grants, `0002` the database's own rules (the request state machine, no self-approval, the audit
 log's id and time), `0003` the pinned commits and no admin link to one's own person, `0004` the platform's registration evidence and
-`0005` the approval rule that uses it.
+`0005` the approval rule that uses it, `0006` binding requests (the one kind that starts approved, with no decision).
+
+Migrations are forward-only: there are no down migrations. After `0006` an older image still handles registrations, but its
+writer fails every binding request it claims (it knows only registrations). Don't roll the image back once bindings exist; if you
+must, expect open binding requests to fail, and link them again after rolling forward.
 
 Registration evidence: the collector inserts into and reads `registration_evidence` (one evidence row per submission, and the reasons a
 request waits), and reads only the id, kind, repo, state and submission of `request`, never the draft. Nobody updates or deletes

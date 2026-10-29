@@ -54,12 +54,20 @@ def test_the_writer_role_reads_people_and_moves_requests_only(pg_db):
     with as_role(pg_db, "portal_writer") as conn:
         conn.execute("SELECT * FROM person")
         conn.execute(AUDIT)
+        conn.execute("SELECT * FROM person_admin_repos('p_" + "0" * 32 + "')")  # one person's admin repos, for a binding's re-check
         for statement in ("INSERT INTO person (id, issuer, subject, display_name, created_at, last_sign_in_at) "
                           "VALUES ('p_" + "0" * 32 + "', 'i', 's', 'n', now(), now())",
                           "SELECT * FROM session", "SELECT * FROM identity_link", "INSERT INTO repo_admin VALUES ('a/b', 'x', 1, 's', now())",
                           "DELETE FROM request"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
+
+
+def test_only_the_writer_may_call_person_admin_repos(pg_db):
+    for role in ("portal_web", "portal_collector"):
+        with as_role(pg_db, role) as conn:
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute("SELECT * FROM person_admin_repos('p_" + "0" * 32 + "')")
 
 
 def test_the_collector_role_sees_repo_admins_and_nothing_else(pg_db):
@@ -265,3 +273,43 @@ def test_an_admin_link_is_never_made_by_the_person_it_names(pg_db):
             conn.execute(link, (link_id, ids["admin"], "admin", ids["admin"]))
     with as_role(pg_db, "portal_web") as conn:  # github-oauth links are made by the person: that is the point of them
         conn.execute(link, (link_id, ids["owner"], "github-oauth", ids["owner"]))
+
+
+# ---- migration 0006: a binding request starts approved with no decision; a registration still starts pending ----
+
+def _doc(rid, person, repo="acme/x"):
+    return {"schema": "binding/v1", "repo": repo, "linked_by": person, "linked_at": "2026-10-23T12:00:00Z", "request": rid}
+
+
+def insert_binding(pg_db, rid, requester, *, kind="binding", state="approved", final=None, draft=None, decided_by=None, repo="acme/x"):
+    final = _doc(rid, requester) if final is None else final
+    update(pg_db, "portal_web", "INSERT INTO request (id, kind, repo, state, draft, final, requested_by, created_at, updated_at, decided_by) "
+                                "VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now(), %s)",
+           rid, kind, repo, state, Jsonb(final if draft is None else draft), Jsonb(final), requester, decided_by)
+
+
+def test_only_a_binding_starts_approved_and_only_without_a_decision(pg_db):
+    ids = seed_requests(pg_db)
+    owner, admin = ids["owner"], ids["admin"]
+    rid = "r_" + "3" * 32
+    with pytest.raises(errors.RaiseException, match="starts pending"):   # a registration still can't start approved
+        insert_binding(pg_db, rid, owner, kind="registration")
+    with pytest.raises(errors.RaiseException, match="no decision"):      # no decider, not even someone else
+        insert_binding(pg_db, rid, owner, decided_by=admin)
+    bad = [dict(draft={"schema": "binding/v1"}),                                   # the record is not its draft
+           dict(state="pending"),                                                  # it starts approved
+           dict(final=_doc("r_" + "4" * 32, owner)),                               # it names another request
+           dict(final=_doc(rid, admin)),                                           # or another person
+           dict(final=_doc(rid, owner, repo="acme/y"))]                            # or another repo
+    for change in bad:
+        with pytest.raises(errors.RaiseException, match="a binding request starts approved"):
+            insert_binding(pg_db, rid, owner, **change)
+    with pytest.raises(errors.CheckViolation):   # no other kind: a row the guard passes still meets request_kind_check
+        update(pg_db, "portal_web", "INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at) "
+                                    "VALUES (%s, 'other', 'acme/x', 'pending', '{}'::jsonb, %s, now(), now())", rid, owner)
+    insert_binding(pg_db, rid, owner)
+    with pytest.raises(errors.RaiseException, match="illegal request transition"):   # the web can't move it on
+        update(pg_db, "portal_web", "UPDATE request SET state = 'writing' WHERE id = %s", rid)
+    update(pg_db, "portal_writer", "UPDATE request SET state = 'writing' WHERE id = %s", rid)
+    with pytest.raises(errors.InsufficientPrivilege):   # nor can the writer rewrite the record it writes
+        update(pg_db, "portal_writer", "UPDATE request SET final = '{}'::jsonb WHERE id = %s", rid)

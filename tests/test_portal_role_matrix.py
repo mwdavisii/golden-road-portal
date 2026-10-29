@@ -47,11 +47,17 @@ ROUTES = {
     ("POST", "/admin/requests/{request_id}/send-back"): admin_only(400, anonymous=401),
     ("GET", "/admin/audit"): admin_only(),
     ("GET", "/admin/identity-links.json"): admin_only(),
+    ("GET", "/admin/directory"): admin_only(),
+    # the app page: the repo's admin (owner) and portal admins see it; only the repo's admin changes it (an empty choice is a 400)
+    ("GET", "/apps/{owner}/{repo}"): {A: 303, O: 200, X: 404, P: 404, D: 200},
+    ("POST", "/apps/{owner}/{repo}/azure-identity"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/databricks"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
 }
 
 
 def fill(path, seeds):
-    return path.format(request_id=seeds["request"], person_id=seeds["owner"], link_id=seeds["link"])
+    return path.format(request_id=seeds["request"], person_id=seeds["owner"], link_id=seeds["link"], owner="acme", repo="notes")
 
 
 def call(portal, who, method, path, headers=None):

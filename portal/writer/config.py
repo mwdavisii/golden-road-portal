@@ -11,6 +11,8 @@ class WriterConfig:
     merge_method: str = "squash"
     merge_timeout: dt.timedelta = dt.timedelta(minutes=30)  # how long a PR may wait for its checks, from when it opened
     confirm_grace: dt.timedelta = dt.timedelta(minutes=30)  # how long after the merge a definite 404 at the merge commit may last
+    directory: object = None  # portal.directory.Directory (PORTAL_DIRECTORY): what a binding is re-checked against; None refuses bindings
+    repo_admins_stale_after: dt.timedelta = dt.timedelta(minutes=10)  # the portal's limit: a binding's requester must be a recent admin
 
     @property
     def targets(self) -> tuple[str, ...]:

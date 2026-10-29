@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/binding.v1.json",
+  "title": "binding/v1",
+  "description": "The factory's bindings/<owner>/<repo>.yaml as the portal's writer records it: the app's Azure identity (a service principal security's process created) and its Databricks connection (a SQL warehouse analytics' process granted to that principal). The release renders it into the signed manifests; no value is a secret. A binding with neither is an unlink: who unlinked and when stay on record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "linked_by", "linked_at", "request"],
+  "dependentRequired": {"databricks": ["azure_identity"]},
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "guid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "directory_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "identifier": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "verified_by": {"enum": ["mock-directory"]}
+  },
+  "properties": {
+    "schema": {"const": "binding/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "azure_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["directory_id", "tenant_id", "client_id", "verified_by"],
+      "properties": {
+        "directory_id": {"$ref": "#/$defs/directory_id"},
+        "tenant_id": {"$ref": "#/$defs/guid"},
+        "client_id": {"$ref": "#/$defs/guid"},
+        "verified_by": {"$ref": "#/$defs/verified_by"}
+      }
+    },
+    "databricks": {
+      "type": "object", "additionalProperties": false,
+      "required": ["directory_id", "host", "http_path", "verified_by"],
+      "properties": {
+        "directory_id": {"$ref": "#/$defs/directory_id"},
+        "host": {"type": "string", "pattern": "^adb-[0-9]{1,20}\\.[0-9]{1,4}\\.azuredatabricks\\.net$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "http_path": {"type": "string", "pattern": "^/sql/1\\.0/warehouses/[A-Za-z0-9]{1,64}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "catalog": {"$ref": "#/$defs/identifier"},
+        "schema": {"$ref": "#/$defs/identifier"},
+        "verified_by": {"$ref": "#/$defs/verified_by"}
+      }
+    },
+    "linked_by": {"type": "string", "pattern": "^p_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "linked_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "request": {"type": "string", "pattern": "^r_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  }
+}

@@ -5,35 +5,11 @@ from ..floor import below_floor, effective
 from ..registration import CLASSIFICATIONS, TIERS, form_draft
 from ..store.base import Conflict
 from .access import PUBLIC, REQUESTER, REQUESTER_OR_ADMIN, SIGNED_IN
+from .ownership import admin_repos_of, fresh_admin_repos, stale_message  # noqa: F401 (tests import them from here)
 from .render import page
 
 router = APIRouter()
 EMPTY = {"repo": "", "purpose": "", "data_classification": "", "proposed_tier": ""}
-
-
-def admin_repos_of(store, person_id):
-    """The repos this person is an admin of, as the collector last saw it, through their linked GitHub logins (by user ID where the
-    link has one, by login where an admin made the link without it). One row per repo, sorted."""
-    links = store.links_for(person_id)
-    rows = store.admin_repos([link.github_user_id for link in links if link.github_user_id is not None])
-    rows += store.admin_repos_by_login([link.github_login.lower() for link in links if link.github_user_id is None])
-    unique = {r.repo: r for r in rows}
-    return [unique[k] for k in sorted(unique, key=str.lower)]
-
-
-def fresh_admin_repos(store, person_id, now, stale_after):
-    """(fresh, stale): the person's admin repos split by whether the collector saw them within stale_after. A repo seen both ways
-    is fresh. Nothing is decided on a stale observation: the collector may be down, and a person's rights may have changed."""
-    rows = admin_repos_of(store, person_id)
-    fresh = [r for r in rows if now - r.observed_at <= stale_after]
-    stale = [r for r in rows if now - r.observed_at > stale_after]
-    return fresh, stale
-
-
-def stale_message(stale) -> str:
-    last = max(r.observed_at for r in stale).strftime("%Y-%m-%d %H:%M")
-    return (f"The portal last saw your repositories at {last} UTC, which is too old to rely on: the collector that reads them from GitHub "
-            "may be down. Try again later, or ask an admin.")
 
 
 def evidence_context(store, req) -> dict:
@@ -93,12 +69,14 @@ def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data
 
 @router.get("/requests")
 def my_requests(request: Request, principal=SIGNED_IN):
-    return page(request, "requests.html", requests=request.app.state.store.requests_by(principal.person.id))
+    return page(request, "requests.html", requests=request.app.state.store.requests_by(principal.person.id), apps=admin_repos(request, principal))
 
 
 @router.get("/requests/{request_id}")
 def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     found = request.state.found_request
+    if found.kind == "binding":  # request.html is for registrations: a connection change is shown on its app's page
+        return RedirectResponse(f"/apps/{found.repo}", status_code=303)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],
                 classifications=CLASSIFICATIONS, tiers=TIERS, **evidence_context(request.app.state.store, found))
 

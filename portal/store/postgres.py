@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ..ids import new_id
-from .base import LINK_SOURCES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, LoginState, Person, RepoAdmin, Request, Session, check_approval, token_hash
+from .base import LINK_SOURCES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, LoginState, Person, RepoAdmin, Request, Session, check_approval, check_binding, token_hash
 
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason) "
          "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
@@ -180,6 +180,17 @@ class PostgresStore:
                                 ([str(x).lower() for x in logins],)).fetchall()
         return [RepoAdmin(r["repo"], r["github_login"], r["github_user_id"], r["observed_at"]) for r in rows]
 
+    def admin_repos_of_person(self, person_id):
+        """Through person_admin_repos (migration 0006): the writer's role can't read identity_link or repo_admin themselves."""
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM person_admin_repos(%s) ORDER BY lower(repo), github_login", (str(person_id),)).fetchall()
+        return [RepoAdmin(r["repo"], r["github_login"], r["github_user_id"], r["observed_at"]) for r in rows]
+
+    def observed_repo(self, repo):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT repo FROM repo_admin WHERE lower(repo) = lower(%s) ORDER BY repo LIMIT 1", (str(repo),)).fetchone()
+        return row["repo"] if row else None
+
     # ---- requests ----
 
     def create_registration(self, *, person_id, draft, now):
@@ -195,6 +206,22 @@ class PostgresStore:
                       {"state": "pending", "repo": draft["repo"]}, "registration submitted")
             return _request(row)
 
+    def create_binding(self, *, request_id, person_id, final, now, current=None):
+        check_binding(request_id, person_id, final)
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, final, requested_by, created_at, updated_at) "
+                                       "VALUES (%s, 'binding', %s, 'approved', %s, %s, %s, %s, %s) RETURNING *",
+                                       (request_id, final["repo"], Jsonb(dict(final)), Jsonb(dict(final)), person_id, now, now)).fetchone()
+            except errors.UniqueViolation as exc:
+                raise Conflict("request_exists" if exc.diag.constraint_name == "request_pkey" else "open_request_exists") from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("unknown_person") from None
+            self._log(conn, now, "person", person_id, "request.created", "request", row["id"], {"binding": dict(current) if current else None},
+                      {"state": "approved", "repo": final["repo"], "final": dict(final)}, "connection change requested in the portal")
+            return _request(row)
+
     def get_request(self, request_id):
         with self.pool.connection() as conn:
             row = conn.execute("SELECT * FROM request WHERE id = %s", (request_id,)).fetchone()
@@ -204,6 +231,11 @@ class PostgresStore:
         with self.pool.connection() as conn:
             return [_request(r) for r in conn.execute("SELECT * FROM request WHERE requested_by = %s ORDER BY created_at DESC, id DESC",
                                                       (person_id,)).fetchall()]
+
+    def requests_for_repo(self, repo):
+        with self.pool.connection() as conn:
+            return [_request(r) for r in conn.execute("SELECT * FROM request WHERE lower(repo) = lower(%s) ORDER BY created_at DESC, id DESC",
+                                                      (repo,)).fetchall()]
 
     def requests_in(self, states):
         with self.pool.connection() as conn:
@@ -312,7 +344,7 @@ class PostgresStore:
     def claim_approved(self, *, now):
         with self.pool.connection() as conn:
             row = conn.execute("UPDATE request SET state = 'writing', updated_at = %s WHERE id = (SELECT id FROM request WHERE state = 'approved' "
-                               "ORDER BY decided_at, id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *", (now,)).fetchone()
+                               "ORDER BY coalesce(decided_at, created_at), id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *", (now,)).fetchone()
             if row is None:
                 return None
             self._log(conn, now, "writer", None, "request.writing", "request", row["id"], {"state": "approved"}, {"state": "writing"},
