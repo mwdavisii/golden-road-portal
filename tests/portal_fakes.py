@@ -198,6 +198,23 @@ def approved_request(store, people, now, repo="acme/notes"):
     return store.claim_approved(now=now)
 
 
+def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None):
+    """A binding by owner (an admin of acme/notes as seeded): sp-notes, and wh-notes unless databricks is False, built the way the
+    app page builds it, then claimed by the writer (state writing)."""
+    from portal.binding_record import next_binding
+    from portal.ids import new_id
+    rid = new_id("r")
+    doc = next_binding(current=current, repo=repo, org="acme", directory=fake_directory(), person_id=people["owner"].id, request_id=rid,
+                       now=now, principal_id="sp-notes")
+    if databricks:
+        doc = next_binding(current=doc, repo=repo, org="acme", directory=fake_directory(), person_id=people["owner"].id, request_id=rid,
+                           now=now, warehouse_id="wh-notes")
+    store.create_binding(request_id=rid, person_id=people["owner"].id, final=doc, now=now, current=current)
+    claimed = store.claim_approved(now=now)
+    assert claimed.id == rid
+    return claimed
+
+
 def writer_config(**changes):
     from portal.writer.config import WriterConfig
     base = dict(org="acme", role_groups={"admin": frozenset({"golden-road-admins"})}, app_id=424242)
@@ -211,6 +228,29 @@ def make_settings(**changes):
                 role_groups={"admin": frozenset({"golden-road-admins"}), "ops": frozenset({"golden-road-ops"})},
                 github_oauth_client_id="Iv1.testclient", github_oauth_client_secret="gh-secret-for-tests", database_url="postgresql://unused")
     return Settings(**{**base, **changes})
+
+
+# A small directory for the tests (mock-directory/v1): sp-notes is tagged for acme/notes and granted wh-notes; sp-other and
+# wh-other belong to acme/other.
+FAKE_DIRECTORY = {
+    "schema": "mock-directory/v1",
+    "tenant_id": "00000000-0000-4000-8000-00000000a2e0",
+    "principals": [
+        {"id": "sp-notes", "display_name": "sp-notes", "client_id": "11111111-1111-4111-8111-111111111111", "tagged_repo_name": "notes"},
+        {"id": "sp-other", "display_name": "sp-other", "client_id": "33333333-3333-4333-8333-333333333333", "tagged_repo_name": "other"},
+    ],
+    "databricks": [
+        {"id": "wh-notes", "display_name": "Notes", "host": "adb-1111111111111111.1.azuredatabricks.net",
+         "http_path": "/sql/1.0/warehouses/0000notes0000", "catalog": "notes", "schema": "public", "granted_to": ["sp-notes"]},
+        {"id": "wh-other", "display_name": "Other", "host": "adb-2222222222222222.2.azuredatabricks.net",
+         "http_path": "/sql/1.0/warehouses/0000other0000", "granted_to": ["sp-other"]},
+    ],
+}
+
+
+def fake_directory():
+    from portal.directory import parse
+    return parse(FAKE_DIRECTORY)
 
 
 def seed(store, people, now):

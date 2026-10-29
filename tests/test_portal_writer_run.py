@@ -5,11 +5,12 @@ import json
 import httpx
 import pytest
 import yaml
-from portal_fakes import T0, FakeGitHub, approved_request, transport, writer_config
+from portal_fakes import T0, FakeGitHub, approved_request, binding_request, fake_directory, transport, writer_config
 
 from portal.github.client import GitHub
 from portal.store.base import Conflict
-from portal.writer.render import intake_yaml
+from portal.store.base import RepoAdmin
+from portal.writer.render import binding_yaml, intake_yaml
 from portal.writer.run import run_once
 
 R = "/repos/acme/scorecard-factory"
@@ -562,3 +563,221 @@ def test_an_installation_without_actions_read_fails_the_request_with_the_403_wri
     run_once(portal.store, client(gh), writer_config(), T0)
     after = portal.store.get_request(req.id)
     assert after.failure_reason == f"github: 403 GET {R}/actions/runs" and not gh.called("PUT", R + "/pulls/12/merge")
+
+
+# ---- bindings: bindings/<owner>/<repo>.yaml, added the first time and updated in place after that ----
+
+BFILE = R + "/contents/bindings/acme/notes.yaml"
+BPATH = "bindings/acme/notes.yaml"
+OLD_BLOB = "e" * 40
+
+
+def bcfg(**changes):
+    return writer_config(**{"directory": fake_directory(), **changes})
+
+
+def file_answer(raw, sha="f" * 40):
+    return (200, {"sha": sha, "encoding": "base64", "content": base64.b64encode(raw).decode()})
+
+
+def bgh_for_write(existing=None, intake=(200, None)):
+    """GitHub for the writer's first pass on a binding: the repo's intake record is in the factory (unless `intake` says otherwise);
+    no binding file on main yet, or `existing` (bytes) at blob OLD_BLOB."""
+    gh = FakeGitHub()
+    gh.on("GET", R, (200, gh.fixture("repo_factory")))
+    gh.on("GET", R + "/git/ref/heads/main", (200, gh.fixture("ref_main")))
+    gh.on("GET", FILE, file_answer(b"schema: intake/v2\n") if intake == (200, None) else intake)
+    gh.on("GET", BFILE, (404, {"message": "Not Found"}) if existing is None else file_answer(existing, OLD_BLOB))
+    gh.on("POST", R + "/git/refs", (201, {"ref": "refs/heads/portal/request-x"}))
+    gh.on("PUT", BFILE, (201 if existing is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
+    gh.on("GET", R + "/pulls", (200, []))
+    gh.on("POST", R + "/pulls", (201, gh.fixture("pull_created")))
+    return gh
+
+
+def badvancing(req, status="added", files=None, landed_raw=None):
+    """GitHub when the writer comes back to a binding's PR: its one file `status`, the check passed, the merge works."""
+    gh = FakeGitHub()
+    gh.on("GET", R, (200, gh.fixture("repo_factory")))
+    gh.on("GET", R + "/pulls/12", (200, gh.fixture("pull_open")))
+    gh.on("GET", R + "/pulls/12/files", (200, files if files is not None else [{"filename": BPATH, "status": status}]))
+    gh.on("GET", R + f"/commits/{HEAD}", (200, {"sha": HEAD, "parents": [{"sha": BASE}], "files": [{"filename": BPATH, "status": status}]}))
+    gh.on("GET", R + f"/commits/{HEAD}/check-runs", (200, gh.fixture("check_runs_success")))
+    gh.on("PUT", R + "/pulls/12/merge", (200, gh.fixture("merge_ok")))
+    gh.on("GET", R + "/actions/runs", (200, workflow_runs(req)))
+    gh.on("GET", BFILE, file_answer(binding_yaml(req.final, req.id).encode() if landed_raw is None else landed_raw))
+    return gh
+
+
+def test_a_first_binding_adds_its_file_and_merges_once_the_check_passes(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write()
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.pr_number, after.head_sha, after.base_sha) == ("pr_open", 12, HEAD, BASE)
+    put = json.loads(gh.called("PUT", BFILE)[0]["body"])
+    assert "sha" not in put and put["branch"] == f"portal/request-{req.id}"
+    assert base64.b64decode(put["content"]).decode() == binding_yaml(req.final, req.id)
+    pr = json.loads(gh.called("POST", R + "/pulls")[0]["body"])
+    assert pr["title"] == f"Connections for acme/notes (portal request {req.id})" and "`sp-notes`" in pr["body"] and "`wh-notes`" in pr["body"]
+    assert {c["path"] for c in gh.calls} <= {R, R + "/git/ref/heads/main", FILE, BFILE, R + "/git/refs", R + "/pulls"}, "only the binding's file"
+    assert not gh.called("PUT", FILE) and gh.called("GET", FILE)[0]["query"]["ref"] == BASE, "the intake record is only read, at the base"
+    gh = badvancing(req, "added")
+    run_once(portal.store, client(gh), bcfg(), T0)
+    merged = portal.store.get_request(req.id)
+    assert (merged.state, merged.merge_sha) == ("merged", "3" * 40)
+    assert gh.called("GET", BFILE)[-1]["query"]["ref"] == "3" * 40, "confirmed at the merge commit"
+
+
+def test_a_changed_binding_updates_the_file_in_place_with_the_blob_it_replaces(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing=b"# an older binding\nschema: binding/v1\n")
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+    assert gh.called("GET", BFILE)[0]["query"]["ref"] == BASE
+    put = json.loads(gh.called("PUT", BFILE)[0]["body"])
+    assert put["sha"] == OLD_BLOB and base64.b64decode(put["content"]).decode() == binding_yaml(req.final, req.id)
+    run_once(portal.store, client(badvancing(req, "modified")), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged"
+
+
+def test_an_unlink_rewrites_the_file_rather_than_deleting_it(portal):
+    first = binding_request(portal.store, portal.people, T0)
+    portal.store.mark_failed(request_id=first.id, reason="test: make room for the next change", now=T0)
+    from portal.binding_record import next_binding
+    from portal.ids import new_id
+    rid = new_id("r")
+    doc = next_binding(current=first.final, repo="acme/notes", org="acme", directory=fake_directory(), person_id=portal.people["owner"].id,
+                       request_id=rid, now=T0, remove="azure-identity")
+    portal.store.create_binding(request_id=rid, person_id=portal.people["owner"].id, final=doc, now=T0, current=first.final)
+    req = portal.store.claim_approved(now=T0)
+    gh = bgh_for_write(existing=binding_yaml(first.final, first.id).encode())
+    run_once(portal.store, client(gh), bcfg(), T0)
+    put = json.loads(gh.called("PUT", BFILE)[0]["body"])
+    assert put["sha"] == OLD_BLOB and not gh.called("DELETE", BFILE)
+    written = yaml.safe_load(base64.b64decode(put["content"]))
+    assert "azure_identity" not in written and "databricks" not in written and written["request"] == req.id
+    assert "neither (unlinked)" in json.loads(gh.called("POST", R + "/pulls")[0]["body"])["body"]
+    run_once(portal.store, client(badvancing(req, "modified")), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged"
+
+
+@pytest.mark.parametrize("files", [
+    [{"filename": BPATH, "status": "removed"}], [{"filename": BPATH, "status": "renamed"}],
+    [{"filename": BPATH, "status": "modified"}, {"filename": "intake/acme/notes.yaml", "status": "added"}],
+    [{"filename": "bindings/acme/other.yaml", "status": "added"}], [],
+], ids=["removed", "renamed", "second-file", "other-file", "none"])
+def test_a_binding_pr_must_add_or_modify_exactly_its_one_file(portal, files):
+    req = binding_request(portal.store, portal.people, T0)
+    run_once(portal.store, client(bgh_for_write()), bcfg(), T0)
+    gh = badvancing(req, files=files)
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "pr_files_unexpected") and not gh.called("PUT", R + "/pulls/12/merge")
+
+
+def test_a_stale_blob_sha_fails_the_binding_with_github_s_status_and_opens_no_pr(portal):
+    """The file changed on main between the writer's read and its PUT: GitHub answers 409, and the writer neither retries nor opens a PR."""
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing=b"# an older binding\n")
+    gh.routes[("PUT", "api.github.com", BFILE)] = [(409, {"message": "<b>is at abc but expected</b>"})]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", f"github: 409 PUT {BFILE}")
+    assert len(gh.called("PUT", BFILE)) == 1 and not gh.called("POST", R + "/pulls") and not gh.called("GET", R + "/pulls")
+
+
+def test_the_existing_file_is_read_at_the_base_commit_the_branch_is_made_from(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing=b"# an older binding\n")
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert gh.called("GET", BFILE)[0]["query"]["ref"] == BASE, "the blob the PUT replaces is the one at the commit the branch starts from"
+    order = [c["path"] for c in gh.calls]
+    assert order.index(R + "/git/ref/heads/main") < order.index(BFILE)
+
+
+def test_a_binding_for_a_repo_with_no_intake_record_in_the_factory_fails_not_registered_with_no_branch_put_or_pr(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(intake=(404, {"message": "Not Found"}))
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "not_registered")
+    assert gh.called("GET", FILE)[0]["query"]["ref"] == BASE
+    order = [c["path"] for c in gh.calls]
+    assert order.index(R + "/git/ref/heads/main") < order.index(FILE)
+    assert not gh.called("POST", R + "/git/refs") and not gh.called("PUT", BFILE) and not gh.called("GET", BFILE)
+    assert not gh.called("GET", R + "/pulls") and not gh.called("POST", R + "/pulls")
+    assert gh.calls[-1]["path"] == FILE, "no GitHub call after the missing intake record"
+
+
+def test_an_error_reading_the_intake_record_fails_the_binding_with_a_code_written_reason(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(intake=(502, {"message": "<b>bad gateway</b>"}))
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", f"github: 502 GET {FILE}")
+    assert not gh.called("POST", R + "/git/refs") and not gh.called("PUT", BFILE) and not gh.called("POST", R + "/pulls")
+
+
+def test_a_merged_binding_that_reads_otherwise_at_the_merge_commit_is_failed(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    run_once(portal.store, client(bgh_for_write()), bcfg(), T0)
+    run_once(portal.store, client(badvancing(req, landed_raw=binding_yaml(req.final, req.id).encode() + b"# extra\n")), bcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "merged_file_differs"
+
+
+def test_a_binding_whose_requester_is_no_longer_a_repo_admin_is_failed_with_no_github_call(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    portal.store.replace_repo_admins([RepoAdmin("acme/tools", "owner-gh", 1001, T0)], observed_at=T0)
+    gh = FakeGitHub()
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "recheck: requester_not_admin") and gh.calls == []
+
+
+def test_a_binding_the_directory_no_longer_backs_is_failed_with_no_github_call(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = FakeGitHub()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "recheck: no_directory" and gh.calls == []
+
+
+def test_an_interrupted_binding_write_resumes_without_a_second_write_or_pr(portal):
+    """The writer stopped after its PUT and after opening the PR, before recording it: the next pass adopts both."""
+    req = binding_request(portal.store, portal.people, T0)
+    content = binding_yaml(req.final, req.id).encode()
+    gh = bgh_for_write(existing=b"# an older binding\n")
+    gh.routes[("POST", "api.github.com", R + "/git/refs")] = [(422, {"message": "Reference already exists"})]
+    gh.on("GET", branch_ref(req), (200, {"object": {"sha": HEAD}}))
+    gh.on("GET", R + f"/commits/{HEAD}", (200, {"sha": HEAD, "parents": [{"sha": BASE}], "files": [{"filename": BPATH, "status": "modified"}]}))
+    gh.routes[("GET", "api.github.com", BFILE)] = [file_answer(b"# an older binding\n", OLD_BLOB), file_answer(content)]
+    gh.routes[("GET", "api.github.com", R + "/pulls")] = [(200, [FakeGitHub.fixture("pull_open")])]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.pr_number, after.head_sha) == ("pr_open", 12, HEAD)
+    assert not gh.called("PUT", BFILE) and not gh.called("POST", R + "/pulls")
+    assert gh.called("GET", BFILE)[-1]["query"]["ref"] == HEAD, "the branch's commit is read for its content"
+
+
+def test_an_interrupted_binding_branch_with_other_content_is_not_adopted(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing=b"# an older binding\n")
+    gh.routes[("POST", "api.github.com", R + "/git/refs")] = [(422, {"message": "Reference already exists"})]
+    gh.on("GET", branch_ref(req), (200, {"object": {"sha": HEAD}}))
+    gh.on("GET", R + f"/commits/{HEAD}", (200, {"sha": HEAD, "parents": [{"sha": BASE}], "files": [{"filename": BPATH, "status": "modified"}]}))
+    gh.routes[("GET", "api.github.com", BFILE)] = [file_answer(b"# an older binding\n", OLD_BLOB), file_answer(b"schema: binding/v1\n")]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "branch_not_ours" and not gh.called("PUT", BFILE)
+
+
+def test_a_registration_s_commit_that_modifies_its_file_is_still_not_ours(portal):
+    """Only a binding may modify its file: a registration's interrupted branch whose commit modifies the intake file is foreign."""
+    req = approved_request(portal.store, portal.people, T0)
+    content = intake_yaml(req.final, req.id).encode()
+    gh = gh_for_write()
+    gh.routes[("POST", "api.github.com", R + "/git/refs")] = [(422, {"message": "Reference already exists"})]
+    gh.on("GET", branch_ref(req), (200, {"object": {"sha": HEAD}}))
+    gh.on("GET", R + f"/commits/{HEAD}", (200, our_commit(req, files=[{"filename": "intake/acme/notes.yaml", "status": "modified"}])))
+    gh.routes[("GET", "api.github.com", FILE)] = [(404, {}), file_answer(content)]
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "branch_not_ours"

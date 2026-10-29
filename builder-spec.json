@@ -79,6 +79,22 @@
     {
       "name": "PORTAL_DATABASE_URL",
       "secret": true
+    },
+    {
+      "name": "PORTAL_DIRECTORY",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_IDENTITY_PROCESS_URL",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_DATA_PROCESS_URL",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_REPO_ADMINS_STALE_AFTER",
+      "secret": false
     }
   ],
   "health_path": "/healthz",

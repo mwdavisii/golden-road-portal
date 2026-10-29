@@ -119,3 +119,43 @@ def test_a_key_that_is_not_a_private_key_stops_the_writer_without_a_traceback_or
     code, err = run(tmp_path, FakeGitHub(), portal.store, key=key)
     assert code == 2 and "PORTAL_WRITE_APP_KEY_FILE" in err and "Traceback" not in err
     assert "AAAA" not in err and "not a key" not in err
+
+
+def load_with(tmp_path, **env):
+    from portal.writer.__main__ import _load
+    path = tmp_path / "write-app.pem"
+    path.write_bytes(pem(new_rsa_key()))
+    return _load({**ENV, "PORTAL_WRITE_APP_KEY_FILE": str(path), **env})[0]
+
+
+def test_the_writer_loads_the_mock_directory_when_asked(tmp_path):
+    from portal.settings import SettingsError
+    cfg = load_with(tmp_path, PORTAL_DIRECTORY="mock")
+    assert cfg.directory is not None and cfg.directory.name == "mock-directory"
+    assert load_with(tmp_path).directory is None and load_with(tmp_path, PORTAL_DIRECTORY="").directory is None
+    with pytest.raises(SettingsError, match="PORTAL_DIRECTORY"):
+        load_with(tmp_path, PORTAL_DIRECTORY="azure")
+
+
+def test_a_mock_directory_that_does_not_load_stops_the_writer(tmp_path, monkeypatch):
+    from portal import directory
+    from portal.settings import SettingsError
+    monkeypatch.setattr(directory, "MOCK", tmp_path / "missing.json")
+    with pytest.raises(SettingsError, match="PORTAL_DIRECTORY is mock, but the mock directory is not valid"):
+        load_with(tmp_path, PORTAL_DIRECTORY="mock")
+
+
+def test_the_writer_takes_the_portal_s_staleness_limit(tmp_path):
+    import datetime as dt
+    from portal.settings import SettingsError
+    assert load_with(tmp_path).repo_admins_stale_after == dt.timedelta(seconds=600)
+    assert load_with(tmp_path, PORTAL_REPO_ADMINS_STALE_AFTER="").repo_admins_stale_after == dt.timedelta(seconds=600)
+    assert load_with(tmp_path, PORTAL_REPO_ADMINS_STALE_AFTER="900").repo_admins_stale_after == dt.timedelta(seconds=900)
+    for bad in ("59", "x", str(7 * 86400 + 1)):
+        with pytest.raises(SettingsError, match="PORTAL_REPO_ADMINS_STALE_AFTER"):
+            load_with(tmp_path, PORTAL_REPO_ADMINS_STALE_AFTER=bad)
+
+
+def test_a_bad_directory_setting_stops_the_writer_with_its_name(portal, tmp_path):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env={"PORTAL_DIRECTORY": "azure"})
+    assert code == 2 and "PORTAL_DIRECTORY" in err

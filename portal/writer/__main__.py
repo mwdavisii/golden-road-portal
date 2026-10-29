@@ -74,6 +74,20 @@ def _checks(env) -> tuple[str, ...]:
     return names
 
 
+def _directory(env):
+    """PORTAL_DIRECTORY, as the web reads it: unset (bindings are refused), or mock (portal/mock_directory.json)."""
+    value = env.get("PORTAL_DIRECTORY", "")
+    if value == "":
+        return None
+    if value != "mock":
+        raise SettingsError("PORTAL_DIRECTORY must be mock or unset (the only directory there is is the mock)")
+    from ..directory import DirectoryError, load_mock
+    try:
+        return load_mock()
+    except DirectoryError:
+        raise SettingsError("PORTAL_DIRECTORY is mock, but the mock directory is not valid") from None
+
+
 def _load(env):
     host = _need(env, "PORTAL_GITHUB_HOST").lower()
     org = _need(env, "PORTAL_ORG")
@@ -84,7 +98,9 @@ def _load(env):
     interval = _int(env, "PORTAL_WRITER_INTERVAL", 5, 3600, default=30)
     url = _need(env, "PORTAL_DATABASE_URL")
     key = _key(_need(env, "PORTAL_WRITE_APP_KEY_FILE"))
-    cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, required_checks=_checks(env))
+    stale = dt.timedelta(seconds=_int(env, "PORTAL_REPO_ADMINS_STALE_AFTER", 60, 7 * 86400, default=600))  # the web's limit and default
+    cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, required_checks=_checks(env), directory=_directory(env),
+                       repo_admins_stale_after=stale)
     return cfg, key, installation, github_bases(host)[1], url, interval
 
 

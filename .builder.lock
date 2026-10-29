@@ -3,21 +3,21 @@
     "AGENTS.md": "456d1c864d5fa330313d179c41ee8ce602b908217f1fa550bb26c26d1c90fad0",
     "CLAUDE.md": "80335c8c80902767fd3e773e3411f3e25b118b411de6e71de97616c818b5f1b7"
   },
-  "builder_version": "0.3.15",
+  "builder_version": "0.3.16",
   "files": {
     ".dockerignore": "16db3544cb06ccea08c36be035d48d045628f77baf1fc24f23f8472896d68ede",
-    "Dockerfile": "d22d73974352efb35ef380de211b66dc539549c974f3d1d53f9d76c344cfe7c8",
+    "Dockerfile": "c65b151d14b4766901acd412a29e965cfe28dc67494774a9290d39bed963832a",
     "_platform/__init__.py": "44d60d96d8ea7bf72f6d79c09aa40f1a0257b59c788efae75c91796356efed77",
     "_platform/authz-policy.json": "bb368722ab6b01a4dfe6d487194e9bac05442e5765ec728225db2165d3e81188",
     "_platform/authz.py": "8d9b934260887fad674d58e3da6ec7b2f351ad6752140647ad674ea60e90df5e",
     "_platform/entry.py": "e8f40863d33142f513c038762ad6fedfc81d39694fa4e815b62b8e5945e64e06",
     "deploy/base/cilium-egress.yaml": "8f0a668be9827827b5bccd410ff3ff4537945334d6c9a9ac170e5a7e0932282f",
-    "deploy/base/deployment.yaml": "bf65d6a012c24c7a62c9ce074caea719baf3c8c0f24f4a79e33176137257209f",
+    "deploy/base/deployment.yaml": "a8fb068509fe0cfc39b94d2616327009326a4a0563316d99e8bf995c71b28b6e",
     "deploy/base/kustomization.yaml": "02631caa8e959121188c9e01c8b927f4f126a5e4503ef34ed3a2fe790325938f",
     "deploy/base/networkpolicy.yaml": "3e351924532efbdfb3abfdac33097a4459a3f40ff66e667c6ab68b49611bb24c",
     "deploy/base/service.yaml": "7df87b5ae7381229a23da0d8e010b41b21584bf0765c80e1607e972bbf87309c",
     "deploy/base/serviceaccount.yaml": "e6b2adfa6600f9c608c3633253859eb593391eab9d78f366ee9dfde42f764298"
   },
   "platform_config_sha256": "5bf7b47117094779ac40af2fc059f5344b654e69c2f5a7768d31d265fa4fb5c7",
-  "spec_sha256": "6189027d97e7751233423475e52abf4119a6862176457aa45139a1b74519af40"
+  "spec_sha256": "a16cdec396b29a0b493c721d476307a1f2e91cd284d33e7b229efded5b3025ae"
 }

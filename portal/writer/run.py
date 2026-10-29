@@ -5,8 +5,9 @@ number and URL, the default branch) is checked for its shape before it is used o
 
 The merge is pinned. The writer's pull request bypasses the review rule, so what it merges must be exactly what it wrote: it
 stores the commit its contents PUT returned (head_sha) and the base commit it branched from (base_sha), and merges only if the
-PR's head is still that commit, the PR targets the default branch, the PR adds exactly the one allowlisted file, and the commit
-is the single child of the stored base. The merge request names that commit, so a push after the check can't ride along."""
+PR's head is still that commit, the PR targets the default branch, the PR adds exactly the one allowlisted file (a binding may
+instead modify its file in place; an unlink rewrites it, never deletes it), and the commit is the single child of the stored
+base. The merge request names that commit, so a push after the check can't ride along."""
 
 import base64
 import datetime as dt
@@ -15,9 +16,12 @@ import re
 from ..github.client import GitHubError
 from ..github.shapes import BRANCH, SHA
 from ..store.base import Conflict
-from .allowlist import target_for
+from .allowlist import intake_path, target_for
 from .recheck import recheck
-from .render import branch_name, intake_yaml, pr_body, title
+from .render import branch_name, content_for, pr_body, title
+
+# The one file's status a writer PR may show: a registration adds its record; a binding adds its file or updates it in place.
+STATUSES = {"registration": ("added",), "binding": ("added", "modified")}
 
 ACTIONS_APP_ID = 15368  # the GitHub Actions app: the source the factory's ruleset pins its required checks to
 PR_URL = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]{1,300}")
@@ -78,9 +82,9 @@ def _file(gh, repo, path, ref):
     return doc["sha"], raw
 
 
-def _only_the_target(files, path) -> bool:
+def _only_the_target(files, path, statuses=("added",)) -> bool:
     return isinstance(files, list) and len(files) == 1 and isinstance(files[0], dict) \
-        and files[0].get("filename") == path and files[0].get("status") == "added"
+        and files[0].get("filename") == path and files[0].get("status") in statuses
 
 
 def _single_child_of(commit, base_sha) -> bool:
@@ -88,11 +92,11 @@ def _single_child_of(commit, base_sha) -> bool:
     return isinstance(parents, list) and len(parents) == 1 and isinstance(parents[0], dict) and parents[0].get("sha") == base_sha
 
 
-def _is_ours(gh, target, sha, base_sha, content) -> bool:
-    """A commit already on our branch is the writer's own only if it is one commit on the base we branched from that adds exactly
-    the target file with exactly the content we would write."""
+def _is_ours(gh, target, sha, base_sha, content, statuses) -> bool:
+    """A commit already on our branch is the writer's own only if it is one commit on the base we branched from that adds (or, for
+    a binding, modifies) exactly the target file with exactly the content we would write."""
     commit = gh.call("GET", f"/repos/{target.repo}/commits/{sha}").json()
-    if not _single_child_of(commit, base_sha) or not _only_the_target(commit.get("files"), target.path):
+    if not _single_child_of(commit, base_sha) or not _only_the_target(commit.get("files"), target.path, statuses):
         return False
     existing = _file(gh, target.repo, target.path, sha)
     return existing is not None and existing[1] == content
@@ -154,26 +158,33 @@ def _finish(store, gh, cfg, target, req, merge_sha, now, merged_at=None) -> str:
         if merged_at is not None and now - merged_at > cfg.confirm_grace:
             return _fail(store, req, "merged_file_missing", now)
         return pending
-    if found[1] != intake_yaml(req.final, req.id).encode("utf-8"):
+    if found[1] != content_for(req).encode("utf-8"):
         return _fail(store, req, "merged_file_differs", now)
     store.mark_merged(request_id=req.id, merge_sha=merge_sha, now=now)
     return f"{req.id}: merged"
 
 
 def _write(store, gh, cfg, req, now) -> str:
-    problems = recheck(req, cfg, store.evidence_for(req.id, req.submission))
+    evidence = store.evidence_for(req.id, req.submission) if req.kind == "registration" else None
+    problems = recheck(req, cfg, evidence, store, now)
     if problems:
         return _fail(store, req, "recheck: " + ", ".join(problems), now)
     target, branch = target_for(cfg.org, req), branch_name(req.id)
-    content = intake_yaml(req.final, req.id).encode("utf-8")
+    content = content_for(req).encode("utf-8")
     try:
         base = _default_branch(gh, target.repo)
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
         return _fail(store, req, "github: unexpected default branch" if isinstance(exc, ValueError) else _reason(exc), now)
     try:
-        if _file(gh, target.repo, target.path, base) is not None:
-            return _fail(store, req, f"already_registered: {target.path} exists on {base}", now)
         base_sha = _sha(gh.call("GET", f"/repos/{target.repo}/git/ref/heads/{base}").json()["object"]["sha"])
+        # a binding is only for a registered app: its intake record (same owner/repo as the binding's path) must be in the factory
+        # at the commit the branch would start from; if it isn't, nothing more is asked of GitHub
+        if req.kind == "binding" and _file(gh, target.repo, intake_path(req.repo), base_sha) is None:
+            return _fail(store, req, "not_registered", now)
+        # read at the commit the branch starts from, so the blob a binding's PUT replaces is the one on that branch
+        existing = _file(gh, target.repo, target.path, base_sha)
+        if existing is not None and req.kind != "binding":
+            return _fail(store, req, f"already_registered: {target.path} exists on {base}", now)
         try:
             gh.call("POST", f"/repos/{target.repo}/git/refs", json={"ref": f"refs/heads/{branch}", "sha": base_sha}, ok=(201,))
             tip = base_sha
@@ -184,9 +195,11 @@ def _write(store, gh, cfg, req, now) -> str:
             # branched from (nothing written yet) or at the writer's own commit.
             tip = _sha(gh.call("GET", f"/repos/{target.repo}/git/ref/heads/{branch}").json()["object"]["sha"])
         if tip == base_sha:
-            head = _sha(gh.call("PUT", f"/repos/{target.repo}/contents/{target.path}", ok=(200, 201), json={
-                "message": title(req), "content": base64.b64encode(content).decode("ascii"), "branch": branch}).json()["commit"]["sha"])
-        elif _is_ours(gh, target, tip, base_sha, content):
+            body = {"message": title(req), "content": base64.b64encode(content).decode("ascii"), "branch": branch}
+            if existing is not None:
+                body["sha"] = _sha(existing[0])  # a binding updated in place: the contents API needs the blob it replaces
+            head = _sha(gh.call("PUT", f"/repos/{target.repo}/contents/{target.path}", ok=(200, 201), json=body).json()["commit"]["sha"])
+        elif _is_ours(gh, target, tip, base_sha, content, STATUSES[req.kind]):
             head = tip
         else:
             return _fail(store, req, "branch_not_ours", now)
@@ -194,7 +207,8 @@ def _write(store, gh, cfg, req, now) -> str:
         found = gh.call("GET", f"/repos/{target.repo}/pulls", params={"head": f"{owner}:{branch}", "state": "all"}).json()
         pr = found[0] if found else gh.call("POST", f"/repos/{target.repo}/pulls", ok=(201,), json={
             "title": title(req), "head": branch, "base": base, "maintainer_can_modify": False,
-            "body": pr_body(req, store.get_person(req.requested_by), store.get_person(req.decided_by))}).json()
+            "body": pr_body(req, store.get_person(req.requested_by),
+                            store.get_person(req.decided_by) if req.decided_by else None)}).json()
         if not _our_pr(pr, base, head, target.repo):
             return _fail(store, req, "pr_not_ours", now)
         number, url = int(pr["number"]), str(pr["html_url"])
@@ -224,7 +238,7 @@ def _advance(store, gh, cfg, req, now) -> str:
         if (pr.get("base") or {}).get("ref") != default_branch:
             return _fail(store, req, "pr_base_changed", now)
         files = list(gh.paginate(f"/repos/{target.repo}/pulls/{req.pr_number}/files"))
-        if not _only_the_target(files, target.path):
+        if not _only_the_target(files, target.path, STATUSES[req.kind]):
             return _fail(store, req, "pr_files_unexpected", now)
         if not _single_child_of(gh.call("GET", f"/repos/{target.repo}/commits/{req.head_sha}").json(), req.base_sha):
             return _fail(store, req, "pr_commit_not_ours", now)

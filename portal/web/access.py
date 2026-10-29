@@ -4,6 +4,7 @@ identity header) is never read."""
 
 import enum
 import hmac
+import re
 from dataclasses import dataclass
 
 from fastapi import Depends, Request
@@ -13,6 +14,7 @@ from ..store.base import Person, Session
 from .cookies import SESSION_COOKIE
 
 SAFE_METHODS = frozenset({"GET", "HEAD"})
+REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 
 
 class Need(enum.Enum):
@@ -21,6 +23,7 @@ class Need(enum.Enum):
     ADMIN = "an admin"
     REQUESTER = "the requester"
     REQUESTER_OR_ADMIN = "the requester or an admin"
+    APP_ADMIN = "an admin of the app's repository, or a portal admin"
 
 
 class Denied(Exception):
@@ -94,6 +97,20 @@ class Access:
             if not (mine or (self.need is Need.REQUESTER_OR_ADMIN and found is not None and principal.is_admin)):
                 raise Denied(404)
             request.state.found_request = found
+        if self.need is Need.APP_ADMIN:
+            # the repo's admin as the collector saw it recently, or a portal admin; anyone else, a stale observation and a repo the
+            # portal doesn't know are 404 (the page says nothing it can't vouch for). app_repo is the stored name, never the URL's case.
+            owner, name = request.path_params.get("owner", ""), request.path_params.get("repo", "")
+            wanted = f"{owner}/{name}"
+            if not REPO.fullmatch(wanted) or {".", ".."} & {owner, name}:
+                raise Denied(404)
+            from .ownership import app_repo
+            state = request.app.state
+            repo, repo_admin = await run_in_threadpool(app_repo, state.store, principal.person.id, principal.is_admin, wanted, state.clock(),
+                                                       state.settings.repo_admins_stale_after)
+            if repo is None:
+                raise Denied(404)
+            request.state.app_repo, request.state.app_repo_admin = repo, repo_admin
         if request.method not in SAFE_METHODS and not await csrf_ok(request, principal):
             raise Denied(403)
         return principal
@@ -104,3 +121,4 @@ SIGNED_IN = Depends(Access(Need.SIGNED_IN))
 ADMIN = Depends(Access(Need.ADMIN))
 REQUESTER = Depends(Access(Need.REQUESTER))
 REQUESTER_OR_ADMIN = Depends(Access(Need.REQUESTER_OR_ADMIN))
+APP_ADMIN = Depends(Access(Need.APP_ADMIN))

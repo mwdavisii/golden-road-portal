@@ -87,3 +87,44 @@ def test_the_writer_cannot_touch_a_request_the_web_has_not_approved(pg_db):
     finally:
         web.close()
         writer.close()
+
+
+def test_a_binding_is_written_and_merged_by_the_writer_s_own_role(pg_db):
+    """The writer re-checks a binding's requester against identity_link and repo_admin as its own role, then writes and merges."""
+    from portal.binding_record import next_binding
+    from portal.ids import new_id
+    from portal_fakes import fake_directory
+    from test_portal_writer_run import badvancing, bcfg, bgh_for_write
+
+    web, writer, collector = (PostgresStore(pg_db(r)) for r in ("portal_web", "portal_writer", "portal_collector"))
+    try:
+        groups = []
+        owner, _, _ = web.sign_in(issuer=ISSUER, subject="owner", display_name="Owner", email=None, groups=groups, roles=frozenset(),
+                                  now=T0, max_age=dt.timedelta(hours=8))
+        admin, _, _ = web.sign_in(issuer=ISSUER, subject="admin", display_name="Admin", email=None, groups=["golden-road-admins"],
+                                  roles=frozenset({"admin"}), now=T0, max_age=dt.timedelta(hours=8))
+        web.add_link(person_id=owner.id, github_login="owner-gh", github_user_id=1001, source="admin", actor_id=admin.id,
+                     reason="seeded for the flow test", now=T0)
+        collector.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0)], observed_at=T0)
+        rid = new_id("r")
+        doc = next_binding(current=None, repo="acme/notes", org="acme", directory=fake_directory(), person_id=owner.id, request_id=rid,
+                           now=T0, principal_id="sp-notes")
+        web.create_binding(request_id=rid, person_id=owner.id, final=doc, now=T0)
+
+        run_once(writer, client(bgh_for_write()), bcfg(), T0)
+        assert web.get_request(rid).state == "pr_open", web.get_request(rid).failure_reason
+        run_once(writer, client(badvancing(web.get_request(rid))), bcfg(), T0)
+        assert web.get_request(rid).state == "merged"
+
+        # the next change: the collector no longer sees the owner as an admin, so the writer fails it before any GitHub call
+        collector.replace_repo_admins([], observed_at=T0)
+        rid2 = new_id("r")
+        doc2 = next_binding(current=doc, repo="acme/notes", org="acme", directory=fake_directory(), person_id=owner.id, request_id=rid2,
+                            now=T0, warehouse_id="wh-notes")
+        web.create_binding(request_id=rid2, person_id=owner.id, final=doc2, now=T0, current=doc)
+        gh = FakeGitHub()
+        run_once(writer, client(gh), bcfg(), T0)
+        assert (web.get_request(rid2).state, web.get_request(rid2).failure_reason) == ("failed", "recheck: requester_not_admin") and gh.calls == []
+    finally:
+        for s in (web, writer, collector):
+            s.close()

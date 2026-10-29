@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% set active = "directory" %}
+{% block title %}Directory - golden road{% endblock %}
+{% block main %}
+<span class="eyebrow">Admin</span>
+<h1>Directory</h1>
+{% if directory %}
+<p>This is the mock directory: it stands in for what security's and analytics' processes produce. An app's page offers only the principals tagged for it and the warehouses granted to its principal.</p>
+<p>Tenant <span class="mono">{{ directory.tenant_id }}</span>, recorded in a binding as verified by <span class="mono">{{ directory.name }}</span>.</p>
+<section>
+<h2>Service principals</h2>
+{% if directory.principals %}
+<div class="table-wrap"><table>
+<tr><th>ID</th><th>Display name</th><th>Client ID</th><th>Tagged for</th></tr>
+{% for p in directory.principals %}<tr><td class="mono">{{ p.id }}</td><td>{{ p.display_name }}</td><td class="mono">{{ p.client_id }}</td><td class="mono">{{ org }}/{{ p.tagged_repo_name }}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p>None.</p>{% endif %}
+</section>
+<section>
+<h2>SQL warehouses</h2>
+{% if directory.warehouses %}
+<div class="table-wrap"><table>
+<tr><th>ID</th><th>Display name</th><th>Host</th><th>HTTP path</th><th>Catalog</th><th>Schema</th><th>Granted to</th></tr>
+{% for w in directory.warehouses %}<tr><td class="mono">{{ w.id }}</td><td>{{ w.display_name }}</td><td class="mono">{{ w.host }}</td><td class="mono">{{ w.http_path }}</td><td class="mono">{{ w.catalog or "" }}</td><td class="mono">{{ w.schema or "" }}</td><td class="mono">{{ w.granted_to|join(", ") }}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p>None.</p>{% endif %}
+</section>
+{% else %}
+<div class="empty"><p>The directory is off on this portal: PORTAL_DIRECTORY is not set, so apps have no connections to pick.</p></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,17 @@
+{
+  "schema": "mock-directory/v1",
+  "tenant_id": "00000000-0000-4000-8000-00000000a2e0",
+  "principals": [
+    {"id": "sp-hello-app", "display_name": "sp-hello-app (notes API)", "client_id": "11111111-1111-4111-8111-111111111111", "tagged_repo_name": "hello-app"},
+    {"id": "sp-golden-road-portal", "display_name": "sp-golden-road-portal", "client_id": "22222222-2222-4222-8222-222222222222", "tagged_repo_name": "golden-road-portal"},
+    {"id": "sp-finance-reports", "display_name": "sp-finance-reports", "client_id": "33333333-3333-4333-8333-333333333333", "tagged_repo_name": "finance-reports"}
+  ],
+  "databricks": [
+    {"id": "wh-notes-readonly", "display_name": "Notes (read-only)", "host": "adb-1111111111111111.1.azuredatabricks.net",
+     "http_path": "/sql/1.0/warehouses/0000notes0000", "catalog": "notes", "schema": "public", "granted_to": ["sp-hello-app"]},
+    {"id": "wh-platform-metrics", "display_name": "Platform metrics", "host": "adb-1111111111111111.1.azuredatabricks.net",
+     "http_path": "/sql/1.0/warehouses/0000metrics00", "catalog": "platform", "schema": "metrics", "granted_to": ["sp-golden-road-portal", "sp-hello-app"]},
+    {"id": "wh-finance", "display_name": "Finance", "host": "adb-2222222222222222.2.azuredatabricks.net",
+     "http_path": "/sql/1.0/warehouses/0000finance00", "catalog": "finance", "schema": "ledger", "granted_to": ["sp-finance-reports"]}
+  ]
+}

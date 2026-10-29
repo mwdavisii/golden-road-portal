@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}{{ repo }} - golden road{% endblock %}
+{% block main %}
+<span class="eyebrow">App</span>
+<h1 class="mono">{{ repo }}</h1>
+{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
+<section>
+<h2>Registration</h2>
+{% if registration %}
+<dl class="facts">
+<div><dt>Tier</dt><dd>{{ registration.final.get("tier") }}</dd></div>
+<div><dt>Data classification</dt><dd>{{ registration.final.get("data_classification") }}</dd></div>
+<div><dt>Review by</dt><dd>{{ registration.final.get("review_by") }}</dd></div>
+</dl>
+<pre class="prose">{{ registration.final.get("purpose", "") }}</pre>
+{% else %}
+<p>No portal registration; the writer checks the factory's intake record before it records a change.</p>
+{% endif %}
+</section>
+{% if directory %}
+<section>
+<h2>Connections</h2>
+{% if open_request %}<p class="callout info">A change is <strong class="badge state-{{ open_request.state }}">pending</strong> ({{ open_request.state }}): the writer is recording it in the factory.</p>{% endif %}
+{% if failed %}<p class="error">The last change could not be recorded: {{ failed.failure_reason }}.</p>{% endif %}
+{% if not can_change %}<p class="callout info">Only an admin of the repository, as the portal last saw it, can change its connections.</p>{% endif %}
+{% set identity = (current or {}).get("azure_identity") %}
+{% set data = (current or {}).get("databricks") %}
+<div class="form-card">
+<h3>Associate Azure Identity</h3>
+<p>Security's process creates the service principal{% if settings.identity_process_url %} (<a href="{{ settings.identity_process_url }}" rel="noopener noreferrer">how to ask for one</a>){% endif %}. Link one made for this repository.</p>
+{% if identity %}<p>Linked: <span class="mono">{{ identity.directory_id }}</span> (client ID <span class="mono">{{ identity.client_id }}</span>, not verified with Azure: checked against the {{ identity.verified_by }}).</p>{% endif %}
+{% if can_change %}
+{% if principals %}
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/azure-identity">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p><label>Service principal
+<select name="principal_id">{% for p in principals %}<option value="{{ p.id }}"{% if identity and identity.directory_id == p.id %} selected{% endif %}>{{ p.display_name }}</option>{% endfor %}</select></label></p>
+<p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>{% if identity %}Change{% else %}Associate{% endif %}</button></p>
+</form>
+{% else %}<p>No service principal is tagged for this repository yet.</p>{% endif %}
+{% if identity %}
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/remove">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="what" value="azure-identity">
+<p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>Remove{% if data %} (also removes the Databricks connection){% endif %}</button></p>
+</form>
+{% endif %}
+{% endif %}
+</div>
+<div class="form-card">
+<h3>Enable Databricks Connection</h3>
+{% if not identity %}
+<p>Link an Azure identity first: the Databricks connection signs in as that identity.</p>
+{% else %}
+<p>Analytics' process grants the identity access to a SQL warehouse{% if settings.data_process_url %} (<a href="{{ settings.data_process_url }}" rel="noopener noreferrer">how to ask</a>){% endif %}.</p>
+{% if data %}<p>Linked: <span class="mono">{{ data.directory_id }}</span> on <span class="mono">{{ data.host }}</span>.</p>{% endif %}
+{% if can_change %}
+{% if warehouses %}
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/databricks">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p><label>SQL warehouse
+<select name="warehouse_id">{% for w in warehouses %}<option value="{{ w.id }}"{% if data and data.directory_id == w.id %} selected{% endif %}>{{ w.display_name }}</option>{% endfor %}</select></label></p>
+<p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>{% if data %}Change{% else %}Enable{% endif %}</button></p>
+</form>
+{% else %}<p>No warehouse is granted to <span class="mono">{{ identity.directory_id }}</span> yet.</p>{% endif %}
+{% if data %}
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/remove">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="what" value="databricks">
+<p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>Remove</button></p>
+</form>
+{% endif %}
+{% endif %}
+{% endif %}
+</div>
+<h3>What the container gets</h3>
+{% if open_request %}<p>Shown as it will be once the pending change is recorded.</p>{% endif %}
+{% if effects.env %}
+<div class="table-wrap"><table>
+<tr><th>Environment variable</th><th>Value</th></tr>
+{% for env_name, value in effects.env %}<tr><td class="mono">{{ env_name }}</td><td class="mono">{{ value }}</td></tr>{% endfor %}
+</table></div>
+<p>Egress on 443 to: {% for host in effects.egress %}<span class="mono">{{ host }}</span>{% if not loop.last %}, {% endif %}{% endfor %}. The service account carries the Azure workload identity (client ID <span class="mono">{{ effects.client_id }}</span>); nothing here is a secret.</p>
+{% else %}<p>Nothing yet.</p>{% endif %}
+</section>
+{% else %}
+<p>Connections are not available on this portal.</p>
+{% endif %}
+{% endblock %}

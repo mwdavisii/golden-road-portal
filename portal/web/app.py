@@ -14,13 +14,13 @@ from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from starlette.routing import Mount
 
-from . import routes_admin, routes_auth, routes_me, routes_public, routes_register
+from . import routes_admin, routes_apps, routes_auth, routes_me, routes_public, routes_register
 from .access import SAFE_METHODS, Access, Denied, Need, Principal
 from .headers import SecurityHeaders
 from .render import page
 
 STATIC = Path(__file__).resolve().parents[1] / "static"
-ROUTERS = [routes_public.router, routes_auth.router, routes_me.router, routes_admin.router, routes_register.router]  # later tasks append theirs
+ROUTERS = [routes_public.router, routes_auth.router, routes_me.router, routes_admin.router, routes_register.router, routes_apps.router]  # later tasks append theirs
 DENIED = {401: "Sign in first.", 403: "You don't have access to this.", 404: "Not found."}
 
 

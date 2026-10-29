@@ -10,7 +10,8 @@ from ..registration import CLASSIFICATIONS, NO_EVIDENCE, TIERS, add_months, inta
 from ..store.base import Conflict
 from .access import ADMIN
 from .render import page
-from .routes_register import evidence_context, fresh_admin_repos, stale_message
+from .ownership import fresh_admin_repos, stale_message
+from .routes_register import evidence_context
 
 router = APIRouter()
 
@@ -127,6 +128,8 @@ def approve(request: Request, request_id: str, tier: str = Form(""), data_classi
         return approvals_page(request, principal, 403, ["You requested this, so another admin must decide it."])
     if found is None:
         return approvals_page(request, principal, 404, ["No such request."])
+    if found.kind != "registration":  # a binding has no decision: it is never made into an intake record
+        return approvals_page(request, principal, 409, ["Only a registration is approved here."])
     if not (submission.isascii() and submission.isdigit() and int(submission) >= 1):
         return approvals_page(request, principal, 400, ["Reload the page: the form didn't say which submission it was loaded for."])
     if int(submission) != found.submission:  # sent back and submitted again since the page loaded: what the admin judged is gone

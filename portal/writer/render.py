@@ -13,11 +13,26 @@ def intake_yaml(final: dict, request_id: str) -> str:
     return HEADER.format(id=request_id) + yaml.safe_dump(final, sort_keys=False, allow_unicode=True, width=1000)
 
 
+BINDING_HEADER = ("# Written by the golden road portal (request {id}). This app's Azure identity and Databricks connection.\n"
+                  "# Change it on the app's page in the portal.\n")
+
+
+def binding_yaml(final: dict, request_id: str) -> str:
+    return BINDING_HEADER.format(id=request_id) + yaml.safe_dump(final, sort_keys=False, allow_unicode=True, width=1000)
+
+
+def content_for(request) -> str:
+    """The file a request writes: its binding, or its intake record."""
+    return binding_yaml(request.final, request.id) if request.kind == "binding" else intake_yaml(request.final, request.id)
+
+
 def branch_name(request_id: str) -> str:
     return f"portal/request-{request_id}"
 
 
 def title(request) -> str:
+    if request.kind == "binding":
+        return f"Connections for {request.repo} (portal request {request.id})"
     return f"Register {request.repo} (portal request {request.id})"
 
 
@@ -44,7 +59,24 @@ def _override_lines(f, approver) -> list[str]:
     return [f"- Approved below the floor by {_name(approver)} (`{override['by']}`):", fenced(override["reason"]), ""]
 
 
+def _binding_body(request, requester) -> str:
+    """Nobody approves a binding: the body names who changed it, what is linked now, and that only the directory was consulted."""
+    f = request.final
+    linked = [f"Azure identity `{f['azure_identity']['directory_id']}`"] if f.get("azure_identity") else []
+    linked += [f"Databricks connection `{f['databricks']['directory_id']}`"] if f.get("databricks") else []
+    verified_by = (f.get("azure_identity") or {}).get("verified_by", "mock-directory")
+    return "\n".join([
+        f"Portal request `{request.id}`: the connections of `{request.repo}`.", "",
+        f"- Changed by {_name(requester)} (`{request.requested_by}`), an admin of the repository, at {f['linked_at']}",
+        f"- Now linked: {', '.join(linked) if linked else 'neither (unlinked)'}",
+        f"- Checked against the portal's directory (`{verified_by}`); nothing was verified with Azure or Databricks.", "",
+        "Written by the golden road portal's writer. It merges once the required checks pass. Change it on the app's page in the portal.",
+    ])
+
+
 def pr_body(request, requester, approver) -> str:
+    if request.kind == "binding":
+        return _binding_body(request, requester)
     f = request.final
     return "\n".join([
         f"Portal request `{request.id}`: register `{request.repo}`.", "",

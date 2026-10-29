@@ -60,9 +60,53 @@ def test_the_repo_admin_observation_goes_stale_after_two_collector_intervals_by_
     s = Settings.from_env(ENV)
     assert s.repo_admins_stale_after == dt.timedelta(minutes=10)
     assert Settings.from_env({**ENV, "PORTAL_REPO_ADMINS_STALE_AFTER": "1800"}).repo_admins_stale_after == dt.timedelta(minutes=30)
+    # empty (the kit's config map leaves it so) is the default, as the writer reads it: the two can't differ
+    assert Settings.from_env({**ENV, "PORTAL_REPO_ADMINS_STALE_AFTER": ""}).repo_admins_stale_after == dt.timedelta(minutes=10)
 
 
 @pytest.mark.parametrize("value", ["59", "0", "-5", "soon", "700000"])
 def test_a_bad_staleness_limit_stops_startup(value):
     with pytest.raises(SettingsError):
         Settings.from_env({**ENV, "PORTAL_REPO_ADMINS_STALE_AFTER": value})
+
+
+# ---- the app bindings' directory and process links (spec 2026-10-29 app bindings) ----
+
+def test_the_directory_is_off_unless_set():
+    s, problems = Settings.check(ENV)
+    assert problems == {} and s.directory is None and (s.identity_process_url, s.data_process_url) == ("", "")
+
+
+def test_portal_directory_mock_loads_the_shipped_directory():
+    s, problems = Settings.check({**ENV, "PORTAL_DIRECTORY": "mock"})
+    assert problems == {} and s.directory is not None and s.directory.name == "mock-directory"
+
+
+def test_an_unknown_directory_is_refused():
+    assert "PORTAL_DIRECTORY" in Settings.check({**ENV, "PORTAL_DIRECTORY": "azure"})[1]
+
+
+def test_a_bad_mock_directory_file_stops_startup(tmp_path, monkeypatch):
+    import portal.directory
+    (tmp_path / "mock.json").write_text('{"schema": "mock-directory/v1"}')
+    monkeypatch.setattr(portal.directory, "MOCK", tmp_path / "mock.json")
+    s, problems = Settings.check({**ENV, "PORTAL_DIRECTORY": "mock"})
+    assert s is None and set(problems) == {"PORTAL_DIRECTORY"}
+    monkeypatch.setattr(portal.directory, "MOCK", tmp_path / "missing.json")
+    with pytest.raises(SettingsError):
+        Settings.from_env({**ENV, "PORTAL_DIRECTORY": "mock"})
+
+
+@pytest.mark.parametrize("name", ["PORTAL_IDENTITY_PROCESS_URL", "PORTAL_DATA_PROCESS_URL"])
+def test_process_links_must_be_https(name):
+    assert name in Settings.check({**ENV, name: "http://example.test/x"})[1]
+    s, problems = Settings.check({**ENV, name: "https://wiki.example.test/identity"})
+    assert problems == {} and "https://wiki.example.test/identity" in (s.identity_process_url, s.data_process_url)
+
+
+@pytest.mark.parametrize("name", ["PORTAL_IDENTITY_PROCESS_URL", "PORTAL_DATA_PROCESS_URL"])
+def test_process_links_may_carry_a_query_but_not_a_fragment(name):
+    s, problems = Settings.check({**ENV, name: "https://wiki.example.test/page?id=42"})
+    assert problems == {} and "https://wiki.example.test/page?id=42" in (s.identity_process_url, s.data_process_url)
+    assert name in Settings.check({**ENV, name: "https://wiki.example.test/page#identity"})[1]
+    assert name in Settings.check({**ENV, name: "https://user@wiki.example.test/page"})[1]
