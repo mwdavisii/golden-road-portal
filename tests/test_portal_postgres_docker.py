@@ -25,6 +25,7 @@ def test_a_changed_applied_migration_stops_the_runner(pg_db):
 
 from psycopg import errors, sql  # noqa: E402
 
+NOBODY = "p_00000000000000000000000000000000"  # a well-formed person id that names no one
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, action, subject_kind, subject_id, reason) "
          "VALUES (now(), 'system', 'test', 'person', 'p_x', 'a reason')")
 
@@ -54,9 +55,9 @@ def test_the_writer_role_reads_people_and_moves_requests_only(pg_db):
     with as_role(pg_db, "portal_writer") as conn:
         conn.execute("SELECT * FROM person")
         conn.execute(AUDIT)
-        conn.execute("SELECT * FROM person_admin_repos('p_" + "0" * 32 + "')")  # one person's admin repos, for a binding's re-check
+        conn.execute("SELECT * FROM person_admin_repos(%s)", (NOBODY,))  # one person's admin repos, for a binding's re-check
         for statement in ("INSERT INTO person (id, issuer, subject, display_name, created_at, last_sign_in_at) "
-                          "VALUES ('p_" + "0" * 32 + "', 'i', 's', 'n', now(), now())",
+                          "VALUES ('p_00000000000000000000000000000000', 'i', 's', 'n', now(), now())",
                           "SELECT * FROM session", "SELECT * FROM identity_link", "INSERT INTO repo_admin VALUES ('a/b', 'x', 1, 's', now())",
                           "DELETE FROM request"):
             with pytest.raises(errors.InsufficientPrivilege):
@@ -67,7 +68,7 @@ def test_only_the_writer_may_call_person_admin_repos(pg_db):
     for role in ("portal_web", "portal_collector"):
         with as_role(pg_db, role) as conn:
             with pytest.raises(errors.InsufficientPrivilege):
-                conn.execute("SELECT * FROM person_admin_repos('p_" + "0" * 32 + "')")
+                conn.execute("SELECT * FROM person_admin_repos(%s)", (NOBODY,))
 
 
 def test_the_collector_role_sees_repo_admins_and_nothing_else(pg_db):
