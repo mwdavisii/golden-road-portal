@@ -278,8 +278,9 @@ def test_an_admin_link_is_never_made_by_the_person_it_names(pg_db):
 
 # ---- migration 0006: a binding request starts approved with no decision; a registration still starts pending ----
 
-def _doc(rid, person, repo="acme/x"):
-    return {"schema": "binding/v1", "repo": repo, "linked_by": person, "linked_at": "2026-10-23T12:00:00Z", "request": rid}
+def _doc(rid, person, repo="acme/x", environment="test"):
+    return {"schema": "binding/v2", "repo": repo, "environment": environment, "secrets": [], "linked_by": person,
+            "linked_at": "2026-10-23T12:00:00Z", "request": rid}
 
 
 def insert_binding(pg_db, rid, requester, *, kind="binding", state="approved", final=None, draft=None, decided_by=None, repo="acme/x"):
@@ -314,3 +315,87 @@ def test_only_a_binding_starts_approved_and_only_without_a_decision(pg_db):
     update(pg_db, "portal_writer", "UPDATE request SET state = 'writing' WHERE id = %s", rid)
     with pytest.raises(errors.InsufficientPrivilege):   # nor can the writer rewrite the record it writes
         update(pg_db, "portal_writer", "UPDATE request SET final = '{}'::jsonb WHERE id = %s", rid)
+
+
+
+# ---- migration 0007: bindings are per environment; one open request per kind, repo and environment; binding/v2 only ----
+
+def test_the_insert_guard_takes_binding_v2_for_test_or_prod_only(pg_db):
+    ids = seed_requests(pg_db)
+    owner = ids["owner"]
+    rid = "r_" + "5" * 32
+    v1 = {k: v for k, v in _doc(rid, owner).items() if k not in ("environment", "secrets")}
+    bad = [dict(final={**v1, "schema": "binding/v1"}),
+           dict(final={**_doc(rid, owner), "environment": "staging"}),
+           dict(final={k: v for k, v in _doc(rid, owner).items() if k != "environment"})]
+    for change in bad:
+        with pytest.raises(errors.RaiseException, match="a binding request starts approved"):
+            insert_binding(pg_db, rid, owner, **change)
+    insert_binding(pg_db, rid, owner, final=_doc(rid, owner, environment="prod"))
+
+
+def test_one_open_binding_per_repo_and_environment_in_the_database(pg_db):
+    ids = seed_requests(pg_db)
+    owner = ids["owner"]
+    test, prod, again = "r_" + "6" * 32, "r_" + "7" * 32, "r_" + "8" * 32
+    insert_binding(pg_db, test, owner, final=_doc(test, owner, environment="test"))
+    insert_binding(pg_db, prod, owner, final=_doc(prod, owner, repo="ACME/x", environment="prod"), repo="ACME/x")
+    with pytest.raises(errors.UniqueViolation):
+        insert_binding(pg_db, again, owner, final=_doc(again, owner, repo="Acme/X", environment="test"), repo="Acme/X")
+
+
+def test_a_registration_draft_with_an_injected_environment_cannot_open_a_second_registration(pg_db):
+    ids = seed_requests(pg_db)   # an open registration of acme/pending
+    insert = ("INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at) "
+              "VALUES (%s, 'registration', 'acme/pending', 'pending', %s, %s, now(), now())")
+    for env in ("prod", "test", ""):
+        with pytest.raises(errors.UniqueViolation):
+            update(pg_db, "portal_web", insert, "r_" + "9" * 32, Jsonb({**DRAFT, "repo": "acme/pending", "environment": env}), ids["owner"])
+
+
+def test_0007_applies_to_a_database_migrated_through_0006_that_has_binding_rows(pg_server, monkeypatch):
+    """Forward only and safe on existing rows: 0006's binding/v1 requests stay as they were, and an open one counts as test's."""
+    import uuid
+    from portal import migrate
+    from portal.store.postgres import PostgresStore
+    every = migrate.migrations()
+    assert every[-1].stem == "0007_binding_environment"
+    name = f"portal_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
+        conn.execute(sql.Composed([sql.SQL("CREATE DATABASE "), sql.Identifier(name), sql.SQL(" OWNER portal_owner")]))
+    dsn = lambda role="portal_owner": pg_server.dsn(role, name)  # noqa: E731
+    try:
+        monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0006"])
+        assert migrate.apply(dsn())[-1] == "0006_binding_requests"
+        store = PostgresStore(dsn())
+        try:
+            owner, _, _ = store.sign_in(issuer="i", subject="o", display_name="O", email=None, groups=[], roles=[], now=NOW,
+                                        max_age=_dt.timedelta(hours=8))
+            merged, still_open = "r_" + "1" * 32, "r_" + "2" * 32
+            for rid, repo in ((merged, "acme/merged"), (still_open, "acme/open")):
+                doc = {"schema": "binding/v1", "repo": repo, "linked_by": owner.id, "linked_at": "2026-10-23T12:00:00Z", "request": rid}
+                update(lambda role="portal_owner": dsn(role), "portal_web",
+                       "INSERT INTO request (id, kind, repo, state, draft, final, requested_by, created_at, updated_at) "
+                       "VALUES (%s, 'binding', %s, 'approved', %s, %s, %s, now(), now())", rid, repo, Jsonb(doc), Jsonb(doc), owner.id)
+            assert store.claim_approved(now=NOW).id == merged
+            store.mark_pr_open(request_id=merged, branch="portal/request-" + merged, pr_number=1, pr_url="https://github.example/acme/x/pull/1",
+                               head_sha="a" * 40, base_sha="b" * 40, now=NOW)
+            store.mark_merged(request_id=merged, merge_sha="c" * 40, now=NOW)
+            monkeypatch.setattr(migrate, "migrations", lambda: every)
+            assert migrate.apply(dsn()) == ["0007_binding_environment"] and migrate.apply(dsn()) == []
+            assert (store.get_request(merged).state, store.get_request(merged).final["schema"]) == ("merged", "binding/v1")
+            assert store.get_request(still_open).state == "approved"
+            test, prod = "r_" + "3" * 32, "r_" + "4" * 32
+            with pytest.raises(Conflict) as exc:   # the open v1 request is test's
+                store.create_binding(request_id=test, person_id=owner.id, final=_doc(test, owner.id, repo="acme/open"), now=NOW)
+            assert exc.value.code == "open_request_exists"
+            store.create_binding(request_id=prod, person_id=owner.id, final=_doc(prod, owner.id, repo="acme/open", environment="prod"), now=NOW)
+            store.create_binding(request_id=test, person_id=owner.id, final=_doc(test, owner.id, repo="acme/merged"), now=NOW)
+        finally:
+            store.close()
+    finally:
+        with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
+            conn.execute(sql.Composed([sql.SQL("DROP DATABASE "), sql.Identifier(name), sql.SQL(" WITH (FORCE)")]))
+
+
+from portal.store.base import Conflict  # noqa: E402

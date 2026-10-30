@@ -198,17 +198,28 @@ def approved_request(store, people, now, repo="acme/notes"):
     return store.claim_approved(now=now)
 
 
-def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None):
-    """A binding by owner (an admin of acme/notes as seeded): sp-notes, and wh-notes unless databricks is False, built the way the
-    app page builds it, then claimed by the writer (state writing)."""
+def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None, environment="test", identity=True,
+                    secrets=()):
+    """A binding by owner (an admin of acme/notes as seeded) for one environment: sp-notes unless identity is False, wh-notes unless
+    databricks (or identity) is False, and each of `secrets` ((secret id, field slug, env) picked by the mock user mwdavisii in the
+    mock Secret Server), built the way the app page builds it, then claimed by the writer (state writing)."""
     from portal.binding_record import next_binding
     from portal.ids import new_id
     rid = new_id("r")
-    doc = next_binding(current=current, repo=repo, org="acme", directory=fake_directory(), person_id=people["owner"].id, request_id=rid,
-                       now=now, principal_id="sp-notes")
-    if databricks:
+    doc = current
+    common = dict(repo=repo, org="acme", directory=fake_directory(), person_id=people["owner"].id, request_id=rid, now=now,
+                  environment=environment)
+    if secrets:
+        from portal.secretserver_mock import load_mock
+        server = load_mock()
+        for secret_id, slug, env in secrets:
+            doc = next_binding(current=doc, **common, add_secret={"secret_id": secret_id, "field_slug": slug, "env": env},
+                               secret_server=server, secret_user="mwdavisii")
+    if identity:
+        doc = next_binding(current=doc, **common, principal_id="sp-notes")
+    if identity and databricks:
         doc = next_binding(current=doc, repo=repo, org="acme", directory=fake_directory(), person_id=people["owner"].id, request_id=rid,
-                           now=now, warehouse_id="wh-notes")
+                           now=now, environment=environment, warehouse_id="wh-notes")
     store.create_binding(request_id=rid, person_id=people["owner"].id, final=doc, now=now, current=current)
     claimed = store.claim_approved(now=now)
     assert claimed.id == rid

@@ -426,8 +426,8 @@ def test_requests_with_a_waiting_reason_do_not_starve_new_ones(store):
 from portal.ids import new_id  # noqa: E402
 
 
-def binding_final(repo, person_id, request_id):
-    return {"schema": "binding/v1", "repo": repo, "linked_by": person_id, "linked_at": "2026-10-23T12:00:00Z", "request": request_id,
+def binding_final(repo, person_id, request_id, environment="test"):
+    return {"schema": "binding/v2", "repo": repo, "environment": environment, "secrets": [], "linked_by": person_id, "linked_at": "2026-10-23T12:00:00Z", "request": request_id,
             "azure_identity": {"directory_id": "sp-notes", "tenant_id": "00000000-0000-4000-8000-00000000a2e0",
                                "client_id": "11111111-1111-4111-8111-111111111111", "verified_by": "mock-directory"}}
 
@@ -536,7 +536,7 @@ def test_a_binding_request_id_has_the_portal_s_format(store, request_id):
 
 @pytest.mark.parametrize("change", [{"token": "x"}, {"linked_at": "yesterday"}, {"repo": "notes"},
                                     {"databricks": {"directory_id": "wh-notes", "host": "evil.example.com", "http_path": "/x", "verified_by": "mock-directory"}}])
-def test_a_binding_record_must_be_a_valid_binding_v1(store, change):
+def test_a_binding_record_must_be_a_valid_binding_v2(store, change):
     person, _, _ = sign_in(store)
     rid = new_id("r")
     with pytest.raises(ValueError):
@@ -549,3 +549,52 @@ def test_a_binding_by_an_unknown_person_is_refused_cleanly(store):
     with pytest.raises(Conflict) as exc:
         store.create_binding(request_id=rid, person_id=nobody, final=binding_final("acme/notes", nobody, rid), now=T0)
     assert exc.value.code == "unknown_person" and store.get_request(rid) is None and store.audit_entries() == []
+
+
+# ---- per environment (spec 2026-10-29 GitOps deploy repo, G3; migration 0007) ----
+
+def test_a_test_and_a_prod_binding_for_one_repo_may_both_be_open(store):
+    person, _, _ = sign_in(store)
+    test, prod = new_id("r"), new_id("r")
+    store.create_binding(request_id=test, person_id=person.id, final=binding_final("acme/notes", person.id, test, "test"), now=T0)
+    store.create_binding(request_id=prod, person_id=person.id, final=binding_final("ACME/Notes", person.id, prod, "prod"), now=T0)
+    assert {store.get_request(test).state, store.get_request(prod).state} == {"approved"}
+
+
+@pytest.mark.parametrize("environment", ["test", "prod"])
+def test_two_open_bindings_for_one_repo_and_environment_may_not(store, environment):
+    person, _, _ = sign_in(store)
+    first, second = new_id("r"), new_id("r")
+    store.create_binding(request_id=first, person_id=person.id, final=binding_final("acme/notes", person.id, first, environment), now=T0)
+    with pytest.raises(Conflict) as exc:
+        store.create_binding(request_id=second, person_id=person.id, final=binding_final("Acme/notes", person.id, second, environment), now=T0)
+    assert exc.value.code == "open_request_exists" and store.get_request(second) is None
+
+
+def test_a_binding_v1_record_is_refused(store):
+    person, _, _ = sign_in(store)
+    rid = new_id("r")
+    v1 = {k: v for k, v in binding_final("acme/notes", person.id, rid).items() if k not in ("environment", "secrets")}
+    with pytest.raises(ValueError):
+        store.create_binding(request_id=rid, person_id=person.id, final={**v1, "schema": "binding/v1"}, now=T0)
+    assert store.get_request(rid) is None and [e.action for e in store.audit_entries()] == ["person.created"]
+
+
+@pytest.mark.parametrize("environment", ["staging", "", "Test", None])
+def test_a_binding_for_an_environment_other_than_test_or_prod_is_refused(store, environment):
+    person, _, _ = sign_in(store)
+    rid = new_id("r")
+    final = binding_final("acme/notes", person.id, rid, environment)
+    if environment is None:
+        del final["environment"]
+    with pytest.raises(ValueError):
+        store.create_binding(request_id=rid, person_id=person.id, final=final, now=T0)
+    assert store.get_request(rid) is None
+
+
+def test_an_environment_key_in_a_registration_draft_does_not_open_a_second_registration(store):
+    person, _, _ = sign_in(store)
+    store.create_registration(person_id=person.id, draft={**DRAFT, "repo": "acme/notes"}, now=T0)
+    with pytest.raises(Conflict) as exc:
+        store.create_registration(person_id=person.id, draft={**DRAFT, "repo": "acme/notes", "environment": "prod"}, now=T0)
+    assert exc.value.code == "open_request_exists"

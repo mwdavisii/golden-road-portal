@@ -68,7 +68,10 @@ def _enforces(ruleset, check) -> bool:
 
 
 def _ruleset_problems(gh, repo, cfg) -> list[str]:
-    problems, enforced = [], {name: False for name in cfg.required_checks}
+    checks = cfg.required_checks.get(repo) or ()
+    if not checks:  # every target has a required check the write App can't bypass; none named is a problem, not a pass
+        return [f"no required check is named for {_repo_label(repo)}"]
+    problems, enforced = [], {name: False for name in checks}
     try:
         listing = gh.call("GET", f"/repos/{repo}/rulesets", params={"includes_parents": "true"}).json()
         ids = [r["id"] for r in listing if isinstance(r, dict) and type(r.get("id")) is int]

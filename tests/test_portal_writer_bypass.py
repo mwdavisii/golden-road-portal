@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from portal_fakes import FakeGitHub, transport, writer_config
@@ -6,18 +8,30 @@ from portal.github.client import GitHub
 from portal.writer.bypass import check_bypass
 
 R = "/repos/acme/scorecard-factory"
+D = "/repos/acme/golden-road-deploy"
 
 
-def recorded(edit=None):
+def as_deploy(doc):
+    """A factory ruleset as golden-road-deploy has it: the same shape, requiring deploy-check."""
+    return json.loads(json.dumps(doc).replace("factory-check", "deploy-check").replace("scorecard-factory", "golden-road-deploy"))
+
+
+def recorded(edit=None, deploy_edit=None):
+    """Both targets' recorded rulesets. `edit` changes both repos' (the deploy repo's are the factory's, requiring deploy-check);
+    `deploy_edit` changes only the deploy repo's."""
     gh = FakeGitHub()
     docs = {name: gh.fixture(name) for name in ("installation", "installation_repositories", "rulesets_list", "ruleset_checks", "ruleset_review")}
     if edit:
         edit(docs)
+    deploy = {name: as_deploy(docs[name]) for name in ("rulesets_list", "ruleset_checks", "ruleset_review")}
+    if deploy_edit:
+        deploy_edit(deploy)
     gh.on("GET", "/app/installations/777", (200, docs["installation"]))
     gh.on("GET", "/installation/repositories", (200, docs["installation_repositories"]))
-    gh.on("GET", R + "/rulesets", (200, docs["rulesets_list"]))
-    gh.on("GET", R + "/rulesets/101", (200, docs["ruleset_checks"]))
-    gh.on("GET", R + "/rulesets/102", (200, docs["ruleset_review"]))
+    for repo, d in ((R, docs), (D, deploy)):
+        gh.on("GET", repo + "/rulesets", (200, d["rulesets_list"]))
+        gh.on("GET", repo + "/rulesets/101", (200, d["ruleset_checks"]))
+        gh.on("GET", repo + "/rulesets/102", (200, d["ruleset_review"]))
     return gh
 
 
@@ -176,3 +190,36 @@ def test_a_pull_request_bypass_github_reports_still_needs_the_review_ruleset_s_s
         as_the_app_sees_it("never", "pull_requests_only")(d)
         d["ruleset_review"]["conditions"]["ref_name"]["include"] = ["~ALL"]
     assert any("only the default branch" in p for p in run(recorded(edit)))
+
+
+
+# ---- golden-road-deploy (spec 2026-10-29 GitOps deploy repo, G9): the writer's second target, guarded by deploy-check ----
+
+def test_both_targets_are_checked():
+    gh = recorded()
+    assert run(gh) == []
+    assert gh.called("GET", D + "/rulesets") and gh.called("GET", D + "/rulesets/101")
+
+
+@pytest.mark.parametrize("deploy_edit, needle", [
+    (lambda d: d["ruleset_checks"]["rules"].pop(), "acme/golden-road-deploy has no active default-branch ruleset"),
+    (lambda d: d["ruleset_checks"]["rules"][2]["parameters"]["required_status_checks"][0].update(context="factory-check"), "requires deploy-check"),
+    (lambda d: d["ruleset_review"]["bypass_actors"][0].update(bypass_mode="always"), "bypass_mode"),
+    (lambda d: d["ruleset_checks"]["bypass_actors"].append({"actor_id": 424242, "actor_type": "Integration", "bypass_mode": "pull_request"}),
+     "status checks"),
+])
+def test_the_deploy_repo_must_require_deploy_check_and_bypass_only_its_review_ruleset(deploy_edit, needle):
+    problems = run(recorded(deploy_edit=deploy_edit))
+    assert any(needle in p for p in problems), problems
+    assert all("scorecard-factory" not in p for p in problems), "the factory's rulesets are unchanged"
+
+
+def test_an_installation_that_does_not_cover_the_deploy_repo_is_a_problem():
+    problems = run(recorded(lambda d: d["installation_repositories"].update(repositories=[{"full_name": "acme/scorecard-factory"}])))
+    assert problems == ["the write installation does not cover acme/golden-road-deploy"]
+
+
+def test_a_target_with_no_required_check_named_is_a_problem_not_a_pass():
+    c = GitHub("https://api.github.com", httpx.Client(transport=transport(recorded())), lambda: "token")
+    problems = check_bypass(c, c, 777, writer_config(deploy_checks=()))
+    assert "no required check is named for acme/golden-road-deploy" in problems

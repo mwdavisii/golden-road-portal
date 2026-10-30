@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from ..github.appauth import InstallationToken, app_jwt
 from ..github.client import GitHub
-from ..settings import ORG, SettingsError, github_bases, parse_role_groups
+from ..settings import ORG, SettingsError, github_bases, no_secret_server_url, parse_role_groups
 from .bypass import check_bypass
 from .config import WriterConfig
 from .run import run_once
@@ -66,12 +66,22 @@ def _key(path: str) -> bytes:
     return raw
 
 
-def _checks(env) -> tuple[str, ...]:
-    """The checks that must pass before a merge. The default is the factory's one, and more can be added but factory-check stays."""
-    names = tuple(c.strip() for c in env.get("PORTAL_WRITER_REQUIRED_CHECKS", "factory-check").split(",") if c.strip()) or ("factory-check",)
-    if "factory-check" not in names or not all(CHECK_NAME.fullmatch(n) for n in names):
-        raise SettingsError("PORTAL_WRITER_REQUIRED_CHECKS must be a comma-separated list of check names that includes factory-check")
+def _check_list(env, name, required) -> tuple[str, ...]:
+    """A target's checks that must pass before a merge: `required` always, and more may be added."""
+    names = tuple(c.strip() for c in env.get(name, required).split(",") if c.strip()) or (required,)
+    if required not in names or not all(CHECK_NAME.fullmatch(n) for n in names):
+        raise SettingsError(f"{name} must be a comma-separated list of check names that includes {required}")
     return names
+
+
+def _checks(env) -> tuple[str, ...]:
+    """The factory's checks (PORTAL_WRITER_REQUIRED_CHECKS): factory-check stays."""
+    return _check_list(env, "PORTAL_WRITER_REQUIRED_CHECKS", "factory-check")
+
+
+def _deploy_checks(env) -> tuple[str, ...]:
+    """golden-road-deploy's checks (PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS): deploy-check stays."""
+    return _check_list(env, "PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS", "deploy-check")
 
 
 def _directory(env):
@@ -88,6 +98,22 @@ def _directory(env):
         raise SettingsError("PORTAL_DIRECTORY is mock, but the mock directory is not valid") from None
 
 
+def _secret_server(env):
+    """PORTAL_SECRET_SERVER, as the web reads it: unset, or mock (portal/mock_secret_server.json). PORTAL_SECRET_SERVER_URL must
+    stay unset: there is no real Secret Server."""
+    no_secret_server_url(env.get("PORTAL_SECRET_SERVER_URL", ""))
+    value = env.get("PORTAL_SECRET_SERVER", "")
+    if value == "":
+        return None
+    if value != "mock":
+        raise SettingsError("PORTAL_SECRET_SERVER must be mock or unset (the only Secret Server there is is the mock)")
+    from ..secretserver_mock import MockSecretServerError, load_mock
+    try:
+        return load_mock()
+    except MockSecretServerError:
+        raise SettingsError("PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid") from None
+
+
 def _load(env):
     host = _need(env, "PORTAL_GITHUB_HOST").lower()
     org = _need(env, "PORTAL_ORG")
@@ -99,7 +125,8 @@ def _load(env):
     url = _need(env, "PORTAL_DATABASE_URL")
     key = _key(_need(env, "PORTAL_WRITE_APP_KEY_FILE"))
     stale = dt.timedelta(seconds=_int(env, "PORTAL_REPO_ADMINS_STALE_AFTER", 60, 7 * 86400, default=600))  # the web's limit and default
-    cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, required_checks=_checks(env), directory=_directory(env),
+    cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, factory_checks=_checks(env), deploy_checks=_deploy_checks(env),
+                       directory=_directory(env), secret_server=_secret_server(env),
                        repo_admins_stale_after=stale)
     return cfg, key, installation, github_bases(host)[1], url, interval
 

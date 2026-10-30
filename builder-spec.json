@@ -93,6 +93,14 @@
       "secret": false
     },
     {
+      "name": "PORTAL_SECRET_SERVER",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_SECRET_PROCESS_URL",
+      "secret": false
+    },
+    {
       "name": "PORTAL_REPO_ADMINS_STALE_AFTER",
       "secret": false
     }

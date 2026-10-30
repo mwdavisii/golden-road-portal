@@ -110,3 +110,54 @@ def test_process_links_may_carry_a_query_but_not_a_fragment(name):
     assert problems == {} and "https://wiki.example.test/page?id=42" in (s.identity_process_url, s.data_process_url)
     assert name in Settings.check({**ENV, name: "https://wiki.example.test/page#identity"})[1]
     assert name in Settings.check({**ENV, name: "https://user@wiki.example.test/page"})[1]
+
+
+# ---- Delinea Secret Server (spec 2026-10-29 Delinea secrets): mock or unset, and security's process link ----
+
+def test_secret_server_is_off_unless_set():
+    s, problems = Settings.check(ENV)
+    assert problems == {} and s.secret_server is None and s.secret_process_url == ""
+    s, problems = Settings.check({**ENV, "PORTAL_SECRET_SERVER": "", "PORTAL_SECRET_PROCESS_URL": ""})
+    assert problems == {} and s.secret_server is None and s.secret_process_url == ""
+
+
+def test_portal_secret_server_mock_loads_the_shipped_mock():
+    from portal.secretserver_mock import MockSecretServer
+    s, problems = Settings.check({**ENV, "PORTAL_SECRET_SERVER": "mock"})
+    assert problems == {} and isinstance(s.secret_server, MockSecretServer) and s.secret_server.platform_user == "golden-road-eso"
+
+
+@pytest.mark.parametrize("value", ["delinea", "Mock", "mock\n", "real", "https://ss.example.test/SecretServer"])
+def test_an_unknown_secret_server_is_refused(value):
+    s, problems = Settings.check({**ENV, "PORTAL_SECRET_SERVER": value})
+    assert s is None and set(problems) == {"PORTAL_SECRET_SERVER"} and value not in problems["PORTAL_SECRET_SERVER"]
+    with pytest.raises(SettingsError, match="PORTAL_SECRET_SERVER"):
+        Settings.from_env({**ENV, "PORTAL_SECRET_SERVER": value})
+
+
+def test_a_bad_mock_secret_server_file_stops_startup(tmp_path, monkeypatch):
+    import portal.secretserver_mock
+    (tmp_path / "mock.json").write_text('{"schema": "mock-secret-server/v1"}')
+    monkeypatch.setattr(portal.secretserver_mock, "MOCK", tmp_path / "mock.json")
+    s, problems = Settings.check({**ENV, "PORTAL_SECRET_SERVER": "mock"})
+    assert s is None and set(problems) == {"PORTAL_SECRET_SERVER"}
+    monkeypatch.setattr(portal.secretserver_mock, "MOCK", tmp_path / "missing.json")
+    with pytest.raises(SettingsError, match="PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid"):
+        Settings.from_env({**ENV, "PORTAL_SECRET_SERVER": "mock"})
+
+
+@pytest.mark.parametrize("server", ["", "mock"])
+def test_a_secret_server_url_is_refused_while_only_the_mock_exists(server):
+    """The spec's PORTAL_SECRET_SERVER_URL is for a real instance, which there is none of: set, it would look like one is used."""
+    s, problems = Settings.check({**ENV, "PORTAL_SECRET_SERVER": server, "PORTAL_SECRET_SERVER_URL": "https://ss.example.test/SecretServer"})
+    assert s is None and set(problems) == {"PORTAL_SECRET_SERVER_URL"} and "ss.example.test" not in problems["PORTAL_SECRET_SERVER_URL"]
+    assert Settings.check({**ENV, "PORTAL_SECRET_SERVER_URL": ""})[1] == {}
+
+
+def test_the_secret_process_link_must_be_https():
+    name = "PORTAL_SECRET_PROCESS_URL"
+    assert name in Settings.check({**ENV, name: "http://wiki.example.test/secrets"})[1]
+    assert name in Settings.check({**ENV, name: "https://wiki.example.test/page#secrets"})[1]
+    assert name in Settings.check({**ENV, name: "https://user@wiki.example.test/page"})[1]
+    s, problems = Settings.check({**ENV, name: "https://wiki.example.test/page?id=7"})
+    assert problems == {} and s.secret_process_url == "https://wiki.example.test/page?id=7"

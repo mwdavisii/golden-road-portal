@@ -1,0 +1,159 @@
+# Rendered by golden-road from deploy/base, image pinned to ghcr.io/acme/notes@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notes-api
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/managed-by: golden-road-builder
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-api
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/managed-by: golden-road-builder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notes-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notes-api
+        app.kubernetes.io/managed-by: golden-road-builder
+        platform/data-classification: internal
+    spec:
+      serviceAccountName: notes-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: app
+        image: ghcr.io/acme/notes@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: PORT
+          value: '8080'
+        - name: NOTES_DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: notes-api-secrets
+              key: NOTES_DB_URL
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notes-api
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/managed-by: golden-road-builder
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: notes-api
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notes-api-baseline
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/managed-by: golden-road-builder
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: notes-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: cloudflared
+      podSelector:
+        matchLabels:
+          app: cloudflared
+    ports:
+    - protocol: TCP
+      port: http
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: notes-api-egress
+  labels:
+    app.kubernetes.io/name: notes-api
+    app.kubernetes.io/managed-by: golden-road-builder
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: notes-api
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - port: '53'
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: '*'
+  - toFQDNs:
+    - matchName: litellm.internal
+    toPorts:
+    - ports:
+      - port: '443'
+        protocol: TCP

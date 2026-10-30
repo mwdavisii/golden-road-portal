@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/binding.v2.json",
+  "title": "binding/v2",
+  "description": "apps/<owner>/<repo>/<env>/bindings.yaml in golden-road-deploy, as the portal's writer records it: one environment's Azure identity (a service principal security's process created) and its Databricks connection (a SQL warehouse analytics' process granted to that principal) and its Delinea Secret Server references (a secret id and field, never a value). golden-road compose applies it to the release's signed manifests to make that environment's composed.yaml; no value is a secret. A binding with neither is an unlink: who unlinked and when stay on record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "environment", "linked_by", "linked_at", "request"],
+  "dependentRequired": {"databricks": ["azure_identity"]},
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "guid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "directory_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "identifier": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "verified_by": {"enum": ["mock-directory"]},
+    "secret_verified_by": {"enum": ["mock-secret-server"]},
+    "env_name": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "secret_ref": {
+      "type": "object", "additionalProperties": false,
+      "required": ["env", "secret_id", "secret_name", "folder_id", "field_slug", "verified_by"],
+      "properties": {
+        "env": {"$ref": "#/$defs/env_name"},
+        "secret_id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "secret_name": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9 ._-]{0,126}[A-Za-z0-9._-])?$", "allOf": [{"$ref": "#/$defs/single_line"}],
+                        "description": "Shown to reviewers only; the portal fills it from Secret Server's own record of secret_id, never from the person's text."},
+        "folder_id": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "field_slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "verified_by": {"$ref": "#/$defs/secret_verified_by"}
+      }
+    }
+  },
+  "properties": {
+    "schema": {"const": "binding/v2"},
+    "environment": {"enum": ["test", "prod"]},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "azure_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["directory_id", "tenant_id", "client_id", "verified_by"],
+      "properties": {
+        "directory_id": {"$ref": "#/$defs/directory_id"},
+        "tenant_id": {"$ref": "#/$defs/guid"},
+        "client_id": {"$ref": "#/$defs/guid"},
+        "verified_by": {"$ref": "#/$defs/verified_by"}
+      }
+    },
+    "databricks": {
+      "type": "object", "additionalProperties": false,
+      "required": ["directory_id", "host", "http_path", "verified_by"],
+      "properties": {
+        "directory_id": {"$ref": "#/$defs/directory_id"},
+        "host": {"type": "string", "pattern": "^adb-[0-9]{1,20}\\.[0-9]{1,4}\\.azuredatabricks\\.net$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "http_path": {"type": "string", "pattern": "^/sql/1\\.0/warehouses/[A-Za-z0-9]{1,64}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "catalog": {"$ref": "#/$defs/identifier"},
+        "schema": {"$ref": "#/$defs/identifier"},
+        "verified_by": {"$ref": "#/$defs/verified_by"}
+      }
+    },
+    "secrets": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/secret_ref"},
+                "description": "Delinea Secret Server references, at most 20, env names unique: compose turns them into one ExternalSecret and secretKeyRef env entries. Never a value."},
+    "linked_by": {"type": "string", "pattern": "^p_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "linked_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "request": {"type": "string", "pattern": "^r_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  }
+}

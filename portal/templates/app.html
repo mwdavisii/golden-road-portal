@@ -18,14 +18,17 @@
 <p>No portal registration; the writer checks the factory's intake record before it records a change.</p>
 {% endif %}
 </section>
-{% if directory %}
+{% if directory or settings.secret_server %}
 <section>
 <h2>Connections</h2>
-{% if open_request %}<p class="callout info">A change is <strong class="badge state-{{ open_request.state }}">pending</strong> ({{ open_request.state }}): the writer is recording it in the factory.</p>{% endif %}
+<nav class="tabs" aria-label="Environment">{% for env in environments %}<a href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ env }}"{% if env == environment %} aria-current="page"{% endif %}>{{ env }}</a>{% if not loop.last %} {% endif %}{% endfor %}</nav>
+<p>Each environment has its own connections. These are <strong>{{ environment }}</strong>'s, recorded in <span class="mono">golden-road-deploy</span>.</p>
+{% if open_request %}<p class="callout info">A change is <strong class="badge state-{{ open_request.state }}">pending</strong> ({{ open_request.state }}): the writer is recording it in golden-road-deploy.</p>{% endif %}
 {% if failed %}<p class="error">The last change could not be recorded: {{ failed.failure_reason }}.</p>{% endif %}
 {% if not can_change %}<p class="callout info">Only an admin of the repository, as the portal last saw it, can change its connections.</p>{% endif %}
 {% set identity = (current or {}).get("azure_identity") %}
 {% set data = (current or {}).get("databricks") %}
+{% if directory %}
 <div class="form-card">
 <h3>Associate Azure Identity</h3>
 <p>Security's process creates the service principal{% if settings.identity_process_url %} (<a href="{{ settings.identity_process_url }}" rel="noopener noreferrer">how to ask for one</a>){% endif %}. Link one made for this repository.</p>
@@ -33,7 +36,7 @@
 {% if can_change %}
 {% if principals %}
 <form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/azure-identity">
-<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
 <p><label>Service principal
 <select name="principal_id">{% for p in principals %}<option value="{{ p.id }}"{% if identity and identity.directory_id == p.id %} selected{% endif %}>{{ p.display_name }}</option>{% endfor %}</select></label></p>
 <p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>{% if identity %}Change{% else %}Associate{% endif %}</button></p>
@@ -41,7 +44,7 @@
 {% else %}<p>No service principal is tagged for this repository yet.</p>{% endif %}
 {% if identity %}
 <form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/remove">
-<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="what" value="azure-identity">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="what" value="azure-identity">
 <p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>Remove{% if data %} (also removes the Databricks connection){% endif %}</button></p>
 </form>
 {% endif %}
@@ -57,7 +60,7 @@
 {% if can_change %}
 {% if warehouses %}
 <form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/databricks">
-<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
 <p><label>SQL warehouse
 <select name="warehouse_id">{% for w in warehouses %}<option value="{{ w.id }}"{% if data and data.directory_id == w.id %} selected{% endif %}>{{ w.display_name }}</option>{% endfor %}</select></label></p>
 <p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>{% if data %}Change{% else %}Enable{% endif %}</button></p>
@@ -65,21 +68,63 @@
 {% else %}<p>No warehouse is granted to <span class="mono">{{ identity.directory_id }}</span> yet.</p>{% endif %}
 {% if data %}
 <form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/remove">
-<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="what" value="databricks">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="what" value="databricks">
 <p class="actions"><button type="submit"{% if open_request %} disabled{% endif %}>Remove</button></p>
 </form>
 {% endif %}
 {% endif %}
 {% endif %}
 </div>
+{% endif %}
+{% if settings.secret_server %}
+<div class="form-card">
+<h3>Secrets (Delinea Secret Server)</h3>
+<p>Pick a secret you can see in Secret Server, one of its fields, and the environment variable it arrives in. Only a reference is recorded (the secret's id and field); the value never passes through the portal. A secret must be shared with <span class="mono">{{ settings.secret_server.platform_user }}</span>, the platform's reader account{% if settings.secret_process_url %} (<a href="{{ settings.secret_process_url }}" rel="noopener noreferrer">security's process</a>){% endif %}.</p>
+{% if current_secrets %}
+<div class="table-wrap"><table>
+<tr><th>Env</th><th>Secret</th><th>Field</th><th></th></tr>
+{% for s in current_secrets %}<tr><td class="mono">{{ s.env }}</td><td class="mono">{{ s.secret_name }}</td><td class="mono">{{ s.field_slug }}</td><td>{% if can_change %}<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/secrets/remove">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="env" value="{{ s.env }}">
+<button type="submit"{% if open_request %} disabled{% endif %}>Remove</button></form>{% endif %}</td></tr>
+{% endfor %}</table></div>
+{% else %}<p>No secrets in {{ environment }}.</p>{% endif %}
+{% if can_change %}
+{% if secret_note %}<p class="callout info">{{ secret_note }}</p>{% else %}
+<form method="get" action="/apps/{{ owner_name }}/{{ repo_name }}">
+<input type="hidden" name="environment" value="{{ environment }}">
+<p><label>Search <input type="search" name="q" value="{{ search_text }}" maxlength="100"></label>
+<label>Folder <select name="folder"><option value="">Any folder</option>{% for fid, fname in folders.items() %}<option value="{{ fid }}"{% if search_folder == fid %} selected{% endif %}>{{ fname }}</option>{% endfor %}</select></label>
+<button type="submit">Search</button></p>
+</form>
+{% if secret_results %}
+<div class="table-wrap"><table>
+<tr><th>Secret</th><th>Folder</th><th>Template</th><th></th></tr>
+{% for r in secret_results %}<tr><td class="mono">{{ r.name }}</td><td class="mono">{{ r.folder }}</td><td>{{ r.template_name }}</td><td>
+{% if not r.shared %}<button type="button" disabled>Not available</button> Ask security to share it with <span class="mono">{{ settings.secret_server.platform_user }}</span>{% if settings.secret_process_url %} (<a href="{{ settings.secret_process_url }}" rel="noopener noreferrer">security's process</a>){% endif %}.
+{% elif not r.fields %}No field of this secret can be delivered (file fields never are).
+{% else %}<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/secrets">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="secret_id" value="{{ r.id }}">
+<label>Field <select name="field_slug">{% for f in r.fields %}<option value="{{ f.slug }}">{{ f.display_name }}</option>{% endfor %}</select></label>
+<label>Env name <input type="text" name="env" required pattern="[A-Z_][A-Z0-9_]*" maxlength="128" class="mono"></label>
+<button type="submit"{% if open_request %} disabled{% endif %}>Add</button></form>{% endif %}
+</td></tr>
+{% endfor %}</table></div>
+{% if secrets_truncated %}<p>Only the first {{ shown_max }} are shown: narrow the search.</p>{% endif %}
+{% elif searched %}<p>No secret you can see matches.</p>{% else %}<p>Search to list the secrets you can see.</p>{% endif %}
+{% endif %}
+{% endif %}
+</div>
+{% endif %}
 <h3>What the container gets</h3>
 {% if open_request %}<p>Shown as it will be once the pending change is recorded.</p>{% endif %}
-{% if effects.env %}
+{% if effects.env or shown_secrets %}
 <div class="table-wrap"><table>
 <tr><th>Environment variable</th><th>Value</th></tr>
 {% for env_name, value in effects.env %}<tr><td class="mono">{{ env_name }}</td><td class="mono">{{ value }}</td></tr>{% endfor %}
+{% for s in shown_secrets %}<tr><td class="mono">{{ s.env }}</td><td>from Delinea Secret Server: {{ s.secret_name }} / {{ s.field_slug }}</td></tr>{% endfor %}
 </table></div>
-<p>Egress on 443 to: {% for host in effects.egress %}<span class="mono">{{ host }}</span>{% if not loop.last %}, {% endif %}{% endfor %}. The service account carries the Azure workload identity (client ID <span class="mono">{{ effects.client_id }}</span>); nothing here is a secret.</p>
+{% if effects.client_id %}<p>Egress on 443 to: {% for host in effects.egress %}<span class="mono">{{ host }}</span>{% if not loop.last %}, {% endif %}{% endfor %}. The service account carries the Azure workload identity (client ID <span class="mono">{{ effects.client_id }}</span>); none of the identity's values is a secret.</p>{% endif %}
+{% if shown_secrets %}<p>Each secret arrives through the External Secrets Operator, read by <span class="mono">golden-road-eso</span> from Secret Server; the portal never sees a value.</p>{% endif %}
 {% else %}<p>Nothing yet.</p>{% endif %}
 </section>
 {% else %}

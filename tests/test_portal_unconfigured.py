@@ -176,3 +176,11 @@ def test_a_bad_mock_directory_leaves_the_portal_unconfigured(tmp_path, monkeypat
     monkeypatch.setattr(portal.directory, "MOCK", tmp_path / "mock.json")
     response = client({**ENV, "PORTAL_DIRECTORY": "mock"}).get("/healthz")
     assert response.status_code == 200 and NOT_CONFIGURED in response.content and "PORTAL_DIRECTORY" in response.text
+
+
+def test_a_bad_mock_secret_server_leaves_the_portal_unconfigured(tmp_path, monkeypatch):
+    import portal.secretserver_mock
+    (tmp_path / "mock.json").write_text("{}")
+    monkeypatch.setattr(portal.secretserver_mock, "MOCK", tmp_path / "mock.json")
+    response = client({**ENV, "PORTAL_SECRET_SERVER": "mock"}).get("/healthz")
+    assert response.status_code == 200 and NOT_CONFIGURED in response.content and "PORTAL_SECRET_SERVER" in response.text
