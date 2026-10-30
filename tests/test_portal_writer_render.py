@@ -4,7 +4,13 @@ import yaml
 from portal_fakes import T0, approved_request, binding_request
 
 from portal.contracts import validate
-from portal.writer.render import binding_yaml, branch_name, content_for, fenced, intake_yaml, pr_body, title
+from portal.writer.allowlist import target_for
+from portal.writer.render import binding_yaml, branch_name, content_for, fenced, intake_yaml, pr_body as _pr_body, title
+
+
+def pr_body(request, requester, approver, platform_user=None):
+    """The body the writer opens for this request: who merges comes from its target."""
+    return _pr_body(request, requester, approver, target_for("acme", request), platform_user=platform_user)
 
 
 def test_the_file_is_the_approved_record_with_a_header(portal):
@@ -85,3 +91,24 @@ def test_a_binding_s_pr_names_its_secrets_by_reference_only(portal):
     assert "<mock>" not in body and "mock-golden-road-eso" not in body and "portal's directory" not in body
     plain = binding_request(portal.store, portal.people, T0, environment="prod")
     assert "Secret Server" not in pr_body(plain, portal.people["owner"], None)
+
+
+def test_a_prod_binding_s_pr_says_the_writer_never_merges_it_and_a_code_owner_reviews_it(portal):
+    """P5: who merges is in the body, from the request's target (its stored draft), never from the PR."""
+    prod = binding_request(portal.store, portal.people, T0, environment="prod")
+    body = pr_body(prod, portal.people["owner"], None)
+    last = body.split("\n\n")[-1]
+    assert last.startswith("Written by the golden road portal's writer. The writer never merges a prod binding: it needs a code owner's "
+                           "review of `bindings.yaml`, and a person merges it.")
+    for needle in ("Don't update the branch", "If `main` moves before the merge, the request fails, the writer closes this PR",
+                   "link it again on the app's page"):
+        assert needle in last, needle
+    assert "It merges once the required checks pass." not in body
+    test = pr_body(binding_request(portal.store, portal.people, T0), portal.people["owner"], None)
+    assert "It merges once the required checks pass." in test and "never merges" not in test
+
+
+def test_pr_body_has_no_default_for_who_merges(portal):
+    import inspect
+    assert "writer_merges" not in inspect.signature(_pr_body).parameters
+    assert inspect.signature(_pr_body).parameters["target"].default is inspect.Parameter.empty

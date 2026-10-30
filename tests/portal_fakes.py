@@ -127,6 +127,8 @@ PERMISSION_RULES = (
     ("POST", rf"{REPO_PATH}/git/refs", "contents", "write"),
     ("GET", rf"{REPO_PATH}/(pulls|pulls/\d+|pulls/\d+/files)", "pull_requests", "read"),
     ("POST", rf"{REPO_PATH}/pulls", "pull_requests", "write"),
+    ("PATCH", rf"{REPO_PATH}/pulls/\d+", "pull_requests", "write"),  # a failed request's PR closed, an adopted PR's body updated
+    ("POST", rf"{REPO_PATH}/issues/\d+/comments", "pull_requests", "write"),  # on a pull request, pull_requests write is enough
     ("PUT", rf"{REPO_PATH}/pulls/\d+/merge", "contents", "write"),
     ("GET", rf"{REPO_PATH}/commits/[0-9a-f]{{40}}/check-runs", "checks", "read"),
     ("GET", rf"{REPO_PATH}/actions/runs", "actions", "read"),

@@ -93,11 +93,15 @@ The writer's GitHub surface is exactly these calls (the write installation needs
 As the write installation: `GET /installation/repositories`, `GET /repos/{r}`, `GET /repos/{r}/git/ref/heads/{branch}`, `POST /repos/{r}/git/refs`,
 `GET` and `PUT /repos/{r}/contents/{path}` (`GET` at a branch, at a commit, and at the merge commit after a merge), `GET /repos/{r}/commits/{sha}`,
 `GET /repos/{r}/pulls?head=...`, `POST /repos/{r}/pulls`, `GET /repos/{r}/pulls/{n}`, `GET /repos/{r}/pulls/{n}/files`,
+`PATCH /repos/{r}/pulls/{n}` (an adopted PR's body, and closing a failed request's PR) and `POST /repos/{r}/issues/{n}/comments`
+(the failure reason on that PR; both best effort),
 `GET /repos/{r}/commits/{sha}/check-runs`, `GET /repos/{r}/actions/runs?check_suite_id=...` (to trace a check run to its workflow run),
 `PUT /repos/{r}/pulls/{n}/merge`, and `GET /repos/{r}/rulesets` and `/rulesets/{id}` (with `includes_parents=true`).
 Both target repos' `main` rulesets require a pull request to be up to date with the default branch, and the writer never updates
 its branch. So when the default branch has moved past the commit the writer branched from (or GitHub reports the PR `behind`),
-the request fails at once with `base_moved`: the repo changed while the change was waiting; make the change again.
+the request fails at once with `base_moved`: the repo changed while the change was waiting; make the change again. Any failed
+request's open PR gets the reason as a comment and is closed: the writer never merges it. The writer never merges a prod binding
+at all: it opens and checks the PR, a person merges it after `main-review`, and the writer records the merge, with no timeout.
 The check that lets a merge through must be a `pull_request` workflow run for the writer's branch and commit, from the target repo,
 that lists only the writer's PR into the default branch. If another PR shares the head, the REST API doesn't say which of them
 triggered a run, so the writer doesn't decide: it waits, and fails the request at `merge_timeout`. After a merge it reads the file at

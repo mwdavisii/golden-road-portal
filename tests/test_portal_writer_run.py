@@ -1,4 +1,5 @@
 import base64
+import dataclasses as dc
 import datetime as dt
 import json
 
@@ -31,6 +32,7 @@ def gh_for_write():
     gh.on("PUT", FILE, (201, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
     gh.on("GET", R + "/pulls", (200, []))
     gh.on("POST", R + "/pulls", (201, gh.fixture("pull_created")))
+    gh.on("PATCH", R + "/pulls/12", (200, {}))  # an adopted PR gets the current body
     return gh
 
 
@@ -637,6 +639,7 @@ def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), rel
     gh.on("PUT", CFILE, (201 if existing_composed is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
     gh.on("GET", D + "/pulls", (200, []))
     gh.on("POST", D + "/pulls", (201, as_deploy(gh.fixture("pull_created"))))
+    gh.on("PATCH", D + "/pulls/12", (200, {}))  # an adopted PR gets the current body
     return gh
 
 
@@ -644,25 +647,28 @@ def commit(sha, parent, path, status="added"):
     return (200, {"sha": sha, "parents": [{"sha": parent}], "files": [{"filename": path, "status": status}]})
 
 
-def badvancing(req, status="added", files=None, landed=None, chain=None, head_composed=None, main=BASE):
-    """GitHub when the writer comes back to a binding's PR: both files `status`, written as MID (bindings.yaml) then HEAD
-    (composed.yaml) on BASE, the check passed, the merge works, and both files land as written."""
+def badvancing(req, status="added", files=None, landed=None, chain=None, head_composed=None, main=BASE, pull=None, checks="check_runs_success"):
+    """GitHub when the writer comes back to a binding's PR: both files `status` (in the request's environment), written as MID
+    (bindings.yaml) then HEAD (composed.yaml) on BASE, the check passed, the merge works, and both files land as written."""
+    bpath, cpath = (path.replace("/test/", f"/{req.final['environment']}/") for path in (BPATH, CPATH))
     gh = FakeGitHub()
     gh.on("GET", D, (200, as_deploy(gh.fixture("repo_factory"))))
     gh.on("GET", D + "/git/ref/heads/main", (200, {"object": {"sha": main}}))
-    gh.on("GET", D + "/pulls/12", (200, as_deploy(gh.fixture("pull_open"))))
-    gh.on("GET", D + "/pulls/12/files", (200, files if files is not None else [{"filename": BPATH, "status": status},
-                                                                               {"filename": CPATH, "status": status}]))
-    for sha, answer in (chain or {HEAD: commit(HEAD, MID, CPATH, status), MID: commit(MID, BASE, BPATH, status)}).items():
+    gh.on("GET", D + "/pulls/12", (200, pull or as_deploy(gh.fixture("pull_open"))))
+    gh.on("GET", D + "/pulls/12/files", (200, files if files is not None else [{"filename": bpath, "status": status},
+                                                                               {"filename": cpath, "status": status}]))
+    for sha, answer in (chain or {HEAD: commit(HEAD, MID, cpath, status), MID: commit(MID, BASE, bpath, status)}).items():
         gh.on("GET", D + f"/commits/{sha}", answer)
-    gh.on("GET", D + f"/commits/{HEAD}/check-runs", (200, as_deploy(gh.fixture("check_runs_success"))))
+    gh.on("GET", D + f"/commits/{HEAD}/check-runs", (200, as_deploy(gh.fixture(checks))))
     gh.on("PUT", D + "/pulls/12/merge", (200, gh.fixture("merge_ok")))
+    gh.on("POST", D + "/issues/12/comments", (201, {"id": 1}))  # a failed request's PR: the reason, then closed
+    gh.on("PATCH", D + "/pulls/12", (200, {"state": "closed"}))
     gh.on("GET", D + "/actions/runs", (200, as_deploy(workflow_runs(req))))
     landed = landed or {}
     want_composed = composed(req) if head_composed is None else head_composed
-    gh.on("GET", BFILE, landed.get(BPATH, file_answer(binding_yaml(req.final, req.id).encode())))
-    gh.on("GET", CFILE, lambda request: httpx.Response(200, json=file_answer(
-        landed.get(CPATH, want_composed) if request.url.params.get("ref") == "3" * 40 else want_composed)[1]))
+    gh.on("GET", f"{D}/contents/{bpath}", landed.get(bpath, file_answer(binding_yaml(req.final, req.id).encode())))
+    gh.on("GET", f"{D}/contents/{cpath}", lambda request: httpx.Response(200, json=file_answer(
+        landed.get(cpath, want_composed) if request.url.params.get("ref") == "3" * 40 else want_composed)[1]))
     return gh
 
 
@@ -699,18 +705,26 @@ def test_a_first_binding_writes_bindings_then_composed_in_the_deploy_repo_and_me
         assert gh.called("GET", path)[-1]["query"]["ref"] == "3" * 40, f"{path} is confirmed at the merge commit"
 
 
+PROD = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "REL": RELFILE, "MAN": MANFILE}.items()}
+PROD_RELEASE = release_doc(environment="prod", namespace="notes-prod", release="prod-20261029130000-abcdef1")
+
+
+def pgh_for_write():
+    """bgh_for_write for a prod binding: prod has a release pinned, and no bindings.yaml or composed.yaml yet."""
+    gh = bgh_for_write()
+    gh.on("GET", PROD["REL"], file_answer(yaml.safe_dump(PROD_RELEASE, sort_keys=False).encode()))
+    gh.on("GET", PROD["MAN"], file_answer(MANIFESTS))
+    gh.on("GET", PROD["B"], NOT_FOUND)
+    gh.on("GET", PROD["C"], NOT_FOUND)
+    gh.on("PUT", PROD["B"], (201, {"commit": {"sha": MID}}))
+    gh.on("PUT", PROD["C"], (201, {"commit": {"sha": HEAD}}))
+    return gh
+
+
 def test_a_prod_binding_writes_prod_s_files_only(portal):
     req = binding_request(portal.store, portal.people, T0, environment="prod")
-    p = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "REL": RELFILE, "MAN": MANFILE}.items()}
-    gh = bgh_for_write()
-    prod = release_doc(environment="prod", namespace="notes-prod", release="prod-20261029130000-abcdef1")
-    rel_yaml = yaml.safe_dump(prod, sort_keys=False).encode()
-    gh.on("GET", p["REL"], file_answer(rel_yaml))
-    gh.on("GET", p["MAN"], file_answer(MANIFESTS))
-    gh.on("GET", p["B"], NOT_FOUND)
-    gh.on("GET", p["C"], NOT_FOUND)
-    gh.on("PUT", p["B"], (201, {"commit": {"sha": MID}}))
-    gh.on("PUT", p["C"], (201, {"commit": {"sha": HEAD}}))
+    p, prod = PROD, PROD_RELEASE
+    gh = pgh_for_write()
     run_once(portal.store, client(gh), bcfg(), T0)
     assert portal.store.get_request(req.id).state == "pr_open"
     assert [path for path, _ in puts(gh)] == [p["B"], p["C"]]
@@ -1059,3 +1073,240 @@ def test_a_binding_whose_secret_was_unshared_fails_its_recheck_before_github_is_
     run_once(portal.store, client(gh), bcfg(secret_server=parse(doc)), T0)
     after = portal.store.get_request(req.id)
     assert (after.state, after.failure_reason) == ("failed", "recheck: secret_not_shared") and gh.calls == []
+
+
+# ---- prod bindings (spec 2026-10-30, P1-P6): the writer opens and checks the PR as for test, but never merges it. A person merges
+# it through main-review (code-owner review of bindings.yaml), and the writer's next pass records the merge ----
+
+def open_prod_binding(portal):
+    req = binding_request(portal.store, portal.people, T0, environment="prod")
+    gh = pgh_for_write()
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+    return req, gh
+
+
+def test_a_prod_binding_s_pr_says_a_code_owner_reviews_it_and_the_writer_never_merges_it(portal):
+    req, gh = open_prod_binding(portal)
+    body = json.loads(gh.called("POST", D + "/pulls")[0]["body"])["body"]
+    assert "The writer never merges a prod binding" in body and "code owner" in body
+    assert "It merges once the required checks pass." not in body
+
+
+def test_a_prod_binding_with_passing_checks_is_never_merged_and_waits_for_review_without_a_timeout(portal):
+    req, _ = open_prod_binding(portal)
+    gh = badvancing(req)
+    for later in (dt.timedelta(0), dt.timedelta(minutes=31), dt.timedelta(days=30)):  # long past merge_timeout: no timeout once checks pass
+        assert run_once(portal.store, client(gh), bcfg(), T0 + later) == [f"{req.id}: waiting for review"]
+        after = portal.store.get_request(req.id)
+        assert (after.state, after.failure_reason, after.merge_sha) == ("pr_open", None, None)
+    assert not gh.called("PUT", D + "/pulls/12/merge"), "the writer never calls the merge API for prod"
+    assert gh.called("GET", D + f"/commits/{HEAD}/check-runs"), "the checks are still read on every pass"
+
+
+def test_a_prod_binding_a_person_merged_is_recorded_with_its_merge_commit(portal):
+    req, _ = open_prod_binding(portal)
+    gh = badvancing(req, pull=as_deploy(merged_pull()))
+    run_once(portal.store, client(gh), bcfg(), T0 + dt.timedelta(days=3))
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.merge_sha) == ("merged", "3" * 40) and not gh.called("PUT", D + "/pulls/12/merge")
+    for path in (PROD["B"], PROD["C"]):
+        assert gh.called("GET", path)[-1]["query"]["ref"] == "3" * 40, f"{path} is confirmed at the merge commit"
+
+
+@pytest.mark.parametrize("edit, reason", [
+    (lambda p: p["head"].update(sha=FOREIGN), "pr_head_changed"),  # a reviewer updated the branch: the person links again
+    (lambda p: p.update(state="closed"), "pr_closed"),
+    (lambda p: p.update(mergeable_state="behind"), "base_moved"),
+], ids=["head-changed", "closed", "base-moved"])
+def test_a_prod_binding_waiting_for_review_still_fails_as_any_pr_does(portal, edit, reason):
+    req, _ = open_prod_binding(portal)
+    assert run_once(portal.store, client(badvancing(req)), bcfg(), T0) == [f"{req.id}: waiting for review"]
+    pull = as_deploy(FakeGitHub.fixture("pull_open"))
+    edit(pull)
+    gh = badvancing(req, pull=pull)
+    run_once(portal.store, client(gh), bcfg(), T0 + dt.timedelta(days=2))
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", reason) and not gh.called("PUT", D + "/pulls/12/merge")
+
+
+def test_a_prod_binding_whose_check_failed_or_whose_files_changed_fails(portal):
+    req, _ = open_prod_binding(portal)
+    run_once(portal.store, client(badvancing(req, checks="check_runs_failure")), bcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "check_failed: deploy-check"
+    req, _ = open_prod_binding(portal)
+    extra = [{"filename": PROD["B"].split("/contents/")[1], "status": "added"}, {"filename": PROD["C"].split("/contents/")[1], "status": "added"},
+             {"filename": "apps/acme/notes/prod/release.yaml", "status": "modified"}]
+    run_once(portal.store, client(badvancing(req, files=extra)), bcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "pr_files_unexpected"
+
+
+def test_a_prod_binding_waits_on_pending_checks_past_merge_timeout_too(portal):
+    """A re-run of deploy-check on a prod PR waiting for review leaves no completed run for a while; a person merges a prod PR, so
+    it never times out, pending checks included. A test binding keeps merge_timeout for checks that never finish."""
+    req, _ = open_prod_binding(portal)
+    gh = badvancing(req)
+    gh.routes[("GET", "api.github.com", D + f"/commits/{HEAD}/check-runs")] = [(200, {"total_count": 0, "check_runs": []})]
+    for later in (dt.timedelta(minutes=31), dt.timedelta(days=30)):
+        assert run_once(portal.store, client(gh), bcfg(), T0 + later) == [f"{req.id}: waiting for checks"]
+        assert (portal.store.get_request(req.id).state, portal.store.get_request(req.id).failure_reason) == ("pr_open", None)
+
+
+def test_a_test_binding_whose_checks_never_finish_still_times_out(portal):
+    test = binding_request(portal.store, portal.people, T0)
+    run_once(portal.store, client(bgh_for_write()), bcfg(), T0)
+    gh = badvancing(test)
+    gh.routes[("GET", "api.github.com", D + f"/commits/{HEAD}/check-runs")] = [(200, {"total_count": 0, "check_runs": []})]
+    run_once(portal.store, client(gh), bcfg(), T0 + dt.timedelta(minutes=31))
+    assert portal.store.get_request(test.id).failure_reason == "checks_timeout"
+
+
+@pytest.mark.parametrize("case", [("prod", "test", False), ("test", "prod", True)], ids=["draft-prod", "draft-test"])
+def test_the_environment_that_waits_for_review_is_the_stored_draft_s_not_the_pr_s(portal, case):
+    """P6: whether the writer merges comes from target_for (the stored draft, checked against ENVIRONMENTS), never from the record's
+    final or the PR. A draft that says prod waits even when the final, the PR title and the PR body say test; one that says test
+    merges even when the PR title and body say prod."""
+    from portal.writer.allowlist import target_for
+    from portal.writer.run import _advance
+    for stored_env, shown_env, merges in [case]:
+        req = binding_request(portal.store, portal.people, T0, environment=stored_env)
+        run_once(portal.store, client(pgh_for_write() if stored_env == "prod" else bgh_for_write()), bcfg(), T0)
+        stored = portal.store.get_request(req.id)
+        assert stored.state == "pr_open" and target_for("acme", stored).environment == stored_env
+        shown = dc.replace(stored, final={**stored.final, "environment": shown_env})
+        assert target_for("acme", shown).environment == stored_env
+        if merges:  # merged, the files are confirmed against the record as written: only the PR says prod
+            shown = stored
+        pull = as_deploy(FakeGitHub.fixture("pull_open")) | {
+            "title": f"Connections for acme/notes ({shown_env}) (portal request {req.id})",
+            "body": f"Portal request `{req.id}`: the connections of `acme/notes` in `{shown_env}`."}
+        gh = badvancing(dc.replace(stored, final={**stored.final, "environment": stored_env}), pull=pull)
+        line = _advance(portal.store, client(gh), bcfg(), shown, T0)
+        assert bool(gh.called("PUT", D + "/pulls/12/merge")) is merges, line
+        assert line == (f"{req.id}: merged" if merges else f"{req.id}: waiting for review")
+    staging = dc.replace(stored, draft={**stored.draft, "environment": "staging"})
+    assert target_for("acme", staging) is None
+
+
+def test_a_request_with_no_target_fails_bad_target_and_the_pass_goes_on(portal):
+    from portal.writer.run import _advance
+    req, _ = open_prod_binding(portal)
+    stored = portal.store.get_request(req.id)
+    gh = badvancing(stored)
+    line = _advance(portal.store, client(gh), bcfg(), dc.replace(stored, draft={**stored.draft, "environment": "staging"}), T0)
+    after = portal.store.get_request(req.id)
+    assert line == f"{req.id}: failed (bad_target)" and (after.state, after.failure_reason) == ("failed", "bad_target") and gh.calls == []
+
+
+def test_writer_merges_fails_closed():
+    from portal.writer.allowlist import Target, writer_merges
+    assert writer_merges(Target("acme/scorecard-factory", "intake/acme/notes.yaml", "intake.v2"))
+    assert writer_merges(Target("acme/golden-road-deploy", "b", "binding.v2", also="c", environment="test"))
+    for environment in ("prod", None, "staging", "TEST"):
+        assert not writer_merges(Target("acme/golden-road-deploy", "b", "binding.v2", also="c", environment=environment)), environment
+    assert not writer_merges(Target("acme/golden-road-deploy", "b", "composed", environment="test"))
+    assert not writer_merges(Target("acme/scorecard-factory", "intake/acme/notes.yaml", "intake.v2", environment="prod"))
+
+
+# ---- a failed request's PR: the writer never merges it, so it says why on the PR and closes it, best effort ----
+
+def comments(gh, repo=D):
+    return [json.loads(c["body"])["body"] for c in gh.calls if c["method"] == "POST" and c["path"] == f"{repo}/issues/12/comments"]
+
+
+@pytest.mark.parametrize("environment", ["test", "prod"])
+def test_a_failed_binding_s_pr_gets_the_reason_and_is_closed(portal, environment):
+    req = binding_request(portal.store, portal.people, T0, environment=environment)
+    run_once(portal.store, client(pgh_for_write() if environment == "prod" else bgh_for_write()), bcfg(), T0)
+    gh = badvancing(req, main="8" * 40)
+    assert run_once(portal.store, client(gh), bcfg(), T0) == [f"{req.id}: failed (base_moved)"]
+    assert portal.store.get_request(req.id).failure_reason == "base_moved"
+    [comment] = comments(gh)
+    assert "`base_moved`" in comment and "never merges" in comment and "closes" in comment
+    assert [json.loads(c["body"]) for c in gh.called("PATCH", D + "/pulls/12")] == [{"state": "closed"}]
+    assert not gh.called("PUT", D + "/pulls/12/merge")
+
+
+def test_a_failed_registration_s_pr_is_closed_too(portal):
+    req = open_pr(portal)
+    pull = FakeGitHub.fixture("pull_open")
+    pull["head"]["sha"] = FOREIGN
+    gh = advancing(pull=pull)
+    gh.on("POST", R + "/issues/12/comments", (201, {"id": 1}))
+    gh.on("PATCH", R + "/pulls/12", (200, {"state": "closed"}))
+    failed_with(portal, req, gh, "pr_head_changed")
+    assert "`pr_head_changed`" in comments(gh, R)[0] and json.loads(gh.called("PATCH", R + "/pulls/12")[0]["body"]) == {"state": "closed"}
+
+
+@pytest.mark.parametrize("answers", [
+    {"POST": (500, {}), "PATCH": (500, {})}, {"POST": (403, {"message": "x"}), "PATCH": (200, {})}, {"POST": (201, {}), "PATCH": (422, {})}, {},
+], ids=["both-500", "comment-403", "close-422", "no-answer"])
+def test_a_comment_or_close_that_fails_never_changes_the_reason_or_stops_the_pass(portal, answers):
+    req, _ = open_prod_binding(portal)
+    other = binding_request(portal.store, portal.people, T0)  # claimed after: written on the same pass
+    gh = badvancing(req, main="8" * 40)
+    for method, path in (("POST", D + "/issues/12/comments"), ("PATCH", D + "/pulls/12")):
+        gh.routes.pop((method, "api.github.com", path))
+        if method in answers:
+            gh.on(method, path, answers[method])
+    for route, answer in bgh_for_write().routes.items():
+        gh.routes.setdefault(route, list(answer))
+    lines = run_once(portal.store, client(gh), bcfg(), T0)
+    assert f"{req.id}: failed (base_moved)" in lines and portal.store.get_request(req.id).failure_reason == "base_moved"
+    assert portal.store.get_request(other.id).state == "pr_open", "the pass went on"
+
+
+def test_a_merged_pr_whose_confirmation_fails_is_not_closed(portal):
+    req = open_pr(portal)
+    gh = advancing(pull=merged_pull(), req=req, on_default=landed(req, b"owner: evil\n"))
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "merged_file_differs"
+    assert not gh.called("PATCH", R + "/pulls/12") and not gh.called("POST", R + "/issues/12/comments")
+
+
+# ---- an adopted PR (an interrupted run) gets the current body, so a pre-0.4.2 prod PR stops saying the writer merges it ----
+
+def test_an_adopted_pr_whose_body_differs_is_updated_to_the_current_body(portal):
+    req = binding_request(portal.store, portal.people, T0, environment="prod")
+    gh = pgh_for_write()
+    old = as_deploy(gh.fixture("pull_created")) | {"body": "Written by the golden road portal's writer. It merges once the required checks pass."}
+    gh.routes[("GET", "api.github.com", D + "/pulls")] = [(200, [old])]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open" and not gh.called("POST", D + "/pulls")
+    [patch] = [json.loads(c["body"]) for c in gh.called("PATCH", D + "/pulls/12")]
+    assert list(patch) == ["body"] and "The writer never merges a prod binding" in patch["body"]
+
+
+def test_an_adopted_pr_with_the_current_body_is_left_alone(portal):
+    from portal.writer.render import pr_body
+    from portal.writer.allowlist import target_for
+    req = binding_request(portal.store, portal.people, T0, environment="prod")
+    gh = pgh_for_write()
+    body = pr_body(req, portal.store.get_person(req.requested_by), None, target_for("acme", req))
+    gh.routes[("GET", "api.github.com", D + "/pulls")] = [(200, [as_deploy(gh.fixture("pull_created")) | {"body": body}])]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open" and not gh.called("PATCH", D + "/pulls/12")
+
+
+def test_an_adopted_pr_whose_body_update_fails_is_still_taken(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write()
+    gh.routes[("GET", "api.github.com", D + "/pulls")] = [(200, [as_deploy(gh.fixture("pull_created")) | {"body": "old"}])]
+    gh.routes[("PATCH", "api.github.com", D + "/pulls/12")] = [(500, {})]
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+
+
+def test_test_bindings_and_registrations_still_merge_once_the_checks_pass(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write()
+    run_once(portal.store, client(gh), bcfg(), T0)
+    body = json.loads(gh.called("POST", D + "/pulls")[0]["body"])["body"]
+    assert "It merges once the required checks pass." in body and "never merges" not in body
+    gh = badvancing(req)
+    run_once(portal.store, client(gh), bcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged" and len(gh.called("PUT", D + "/pulls/12/merge")) == 1
+    reg = open_pr(portal)
+    gh = advancing(req=reg)
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(reg.id).state == "merged" and gh.called("PUT", R + "/pulls/12/merge")

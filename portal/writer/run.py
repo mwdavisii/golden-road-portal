@@ -1,5 +1,6 @@
 """The writer's loop (P17, P18). It acts only on requests the store hands it in state writing (claimed from approved), re-checks
-each, writes only allowlisted paths, and merges only after the required checks pass. Any mismatch or GitHub error fails the
+each, writes only allowlisted paths, and merges only after the required checks pass (never a prod binding: a person merges that
+one through the review rule, and the writer records the merge, spec 2026-10-30). Any mismatch or GitHub error fails the
 request with a reason written here, never GitHub's text. Every value taken from a GitHub answer (commit IDs, pull request
 number and URL, the default branch) is checked for its shape before it is used or stored.
 
@@ -25,7 +26,7 @@ from ..contracts import validate
 from ..github.client import GitHubError
 from ..github.shapes import BRANCH, SHA
 from ..store.base import Conflict
-from .allowlist import factory, intake_path, target_for
+from .allowlist import factory, intake_path, target_for, writer_merges
 from .recheck import recheck
 from .render import branch_name, content_for, pr_body, title
 
@@ -61,6 +62,21 @@ def run_once(store, gh, cfg, now) -> list[str]:
 def _fail(store, req, reason, now) -> str:
     store.mark_failed(request_id=req.id, reason=reason, now=now)
     return f"{req.id}: failed ({reason})"
+
+
+def _fail_and_close(store, gh, target, req, reason, now) -> str:
+    """_fail for a request whose PR is open: the writer will never merge it, so it says why on the PR and closes it. Best effort,
+    after the failure is recorded: nothing the comment or the close raises may change the reason or stop the pass."""
+    done = _fail(store, req, reason, now)
+    note = (f"The golden road portal's writer failed this request: `{reason}`. It never merges a failed request, so it closes this "
+            "pull request. Make the change again in the portal.")
+    for method, path, body in (("POST", f"/repos/{target.repo}/issues/{req.pr_number}/comments", {"body": note}),
+                               ("PATCH", f"/repos/{target.repo}/pulls/{req.pr_number}", {"state": "closed"})):
+        try:
+            gh.call(method, path, ok=(200, 201), json=body)
+        except Exception:  # noqa: BLE001 - best effort: the request is already failed with its own reason
+            pass
+    return done
 
 
 def _reason(exc) -> str:
@@ -337,16 +353,22 @@ def _write(store, gh, cfg, req, now) -> str:
             head = _sha(gh.call("PUT", f"/repos/{target.repo}/contents/{path}", ok=(200, 201), json=body).json()["commit"]["sha"])
         owner = target.repo.split("/")[0]
         found = gh.call("GET", f"/repos/{target.repo}/pulls", params={"head": f"{owner}:{branch}", "state": "all"}).json()
+        body = pr_body(req, store.get_person(req.requested_by), store.get_person(req.decided_by) if req.decided_by else None, target,
+                       platform_user=getattr(cfg.secret_server, "platform_user", None))
         pr = found[0] if found else gh.call("POST", f"/repos/{target.repo}/pulls", ok=(201,), json={
-            "title": title(req), "head": branch, "base": base, "maintainer_can_modify": False,
-            "body": pr_body(req, store.get_person(req.requested_by),
-                            store.get_person(req.decided_by) if req.decided_by else None,
-                            platform_user=getattr(cfg.secret_server, "platform_user", None))}).json()
+            "title": title(req), "head": branch, "base": base, "maintainer_can_modify": False, "body": body}).json()
         if not _our_pr(pr, base, head, target.repo):
             return _fail(store, req, "pr_not_ours", now)
         number, url = int(pr["number"]), str(pr["html_url"])
         if number < 1 or not PR_URL.fullmatch(url):
             raise ValueError("unexpected pull request")
+        # An adopted PR (an interrupted run) may carry an older body, one that says the writer merges a prod binding: bring it up to
+        # date, best effort (the body is what the person and the reviewer read, not what the merge rests on).
+        if found and pr.get("body") != body:
+            try:
+                gh.call("PATCH", f"/repos/{target.repo}/pulls/{number}", json={"body": body})
+            except GitHubError:
+                pass
         store.mark_pr_open(request_id=req.id, branch=branch, pr_number=number, pr_url=url, head_sha=head, base_sha=base_sha, now=now)
         return f"{req.id}: pull request #{number} opened"
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
@@ -359,36 +381,42 @@ def _order(target):
 
 def _advance(store, gh, cfg, req, now) -> str:
     target = target_for(cfg.org, req)
+    if target is None:
+        return _fail(store, req, "bad_target", now)
+
+    def fail(reason):
+        return _fail_and_close(store, gh, target, req, reason, now) if req.pr_number else _fail(store, req, reason, now)
+
     try:
         if not (req.head_sha and req.base_sha):
-            return _fail(store, req, "no_pinned_commit", now)
+            return fail("no_pinned_commit")
         pr = gh.call("GET", f"/repos/{target.repo}/pulls/{req.pr_number}").json()
         if (pr.get("head") or {}).get("sha") != req.head_sha:
-            return _fail(store, req, "pr_head_changed", now)  # a push after the writer opened it: never merged
+            return fail("pr_head_changed")  # a push after the writer opened it: never merged
         if not _from_the_target_repo(pr, target.repo):
-            return _fail(store, req, "pr_not_ours", now)
+            return fail("pr_not_ours")
         if pr.get("merged"):
             return _finish(store, gh, cfg, target, req, _sha(pr["merge_commit_sha"]), now, _merged_at(pr))
         if pr.get("state") != "open":
-            return _fail(store, req, "pr_closed", now)
+            return fail("pr_closed")
         default_branch = _default_branch(gh, target.repo)
         if (pr.get("base") or {}).get("ref") != default_branch:
-            return _fail(store, req, "pr_base_changed", now)
+            return fail("pr_base_changed")
         # Both target repos' rulesets require the PR to be up to date with the default branch, and the writer never updates its
         # branch: once the default branch has moved past the base it branched from, the PR can't merge. Fail now, not at
         # merge_timeout; the person makes the change again, on the new base.
         current = _sha(gh.call("GET", f"/repos/{target.repo}/git/ref/heads/{default_branch}").json()["object"]["sha"])
         if current != req.base_sha or pr.get("mergeable_state") == "behind" or (pr.get("base") or {}).get("sha") not in (None, current):
-            return _fail(store, req, "base_moved", now)
+            return fail("base_moved")
         order, statuses = _order(target), STATUSES[req.kind]
         # the commits from the base to head are ours, one per file (for a binding, composed.yaml is left out when unchanged) ...
         written = _chain_writes(_chain(gh, target.repo, req.head_sha, req.base_sha, len(order)), order, statuses)
         if written is None:
-            return _fail(store, req, "pr_commit_not_ours", now)
+            return fail("pr_commit_not_ours")
         # ... and the PR shows exactly the files they wrote, nothing else
         files = list(gh.paginate(f"/repos/{target.repo}/pulls/{req.pr_number}/files"))
         if not _only_these(files, {p: statuses for p in order[:written]}):
-            return _fail(store, req, "pr_files_unexpected", now)
+            return fail("pr_files_unexpected")
         conclusions = {}
         for name in cfg.required_checks[target.repo]:
             runs = gh.call("GET", f"/repos/{target.repo}/commits/{req.head_sha}/check-runs", params={"check_name": name}).json()["check_runs"]
@@ -396,12 +424,20 @@ def _advance(store, gh, cfg, req, now) -> str:
                     and _run_is_ours(gh, target, req, default_branch, r)]
             conclusions[name] = next((r.get("conclusion") for r in ours if r.get("status") == "completed"), None)
         if not conclusions:
-            return _fail(store, req, "no_required_checks", now)
+            return fail("no_required_checks")
         failed = [n for n, c in conclusions.items() if c not in (None, "success")]
         if failed:
-            return _fail(store, req, f"check_failed: {failed[0]}", now)
+            return fail(f"check_failed: {failed[0]}")
+        # merge_timeout is for the writer's own merges. A PR a person merges (prod) has no timeout at all: a re-run of a check
+        # leaves no completed run for a while, and it waits for that as long as for the review.
         if any(c is None for c in conclusions.values()):
-            return _fail(store, req, "checks_timeout", now) if now - req.updated_at > cfg.merge_timeout else f"{req.id}: waiting for checks"
+            if writer_merges(target) and now - req.updated_at > cfg.merge_timeout:
+                return fail("checks_timeout")
+            return f"{req.id}: waiting for checks"
+        # A prod binding is merged by a person, through main-review; the next pass finds it merged and finishes it. It waits as long
+        # as the review takes, and every check above still runs on each pass.
+        if not writer_merges(target):
+            return f"{req.id}: waiting for review"
         try:
             merged = gh.call("PUT", f"/repos/{target.repo}/pulls/{req.pr_number}/merge",
                              json={"merge_method": cfg.merge_method, "sha": req.head_sha}).json()
@@ -411,4 +447,4 @@ def _advance(store, gh, cfg, req, now) -> str:
             raise
         return _finish(store, gh, cfg, target, req, _sha(merged["sha"]), now)
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
-        return _fail(store, req, _reason(exc), now)
+        return fail(_reason(exc))
