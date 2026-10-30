@@ -5,6 +5,8 @@ import re
 
 import yaml
 
+from .allowlist import writer_merges
+
 HEADER = ("# Written by the golden road portal (request {id}). The only trusted source of this app's tier and purpose.\n"
           "# Change it through the portal.\n")
 
@@ -59,9 +61,16 @@ def _override_lines(f, approver) -> list[str]:
     return [f"- Approved below the floor by {_name(approver)} (`{override['by']}`):", fenced(override["reason"]), ""]
 
 
-def _binding_body(request, requester, platform_user) -> str:
-    """Nobody approves a binding: the body names who changed it, what is linked now, and that only the directory (and, for secrets,
-    Secret Server as its platform account) was consulted."""
+WRITER_MERGES = "Written by the golden road portal's writer. It merges once the required checks pass."
+PERSON_MERGES = ("Written by the golden road portal's writer. The writer never merges a prod binding: it needs a code owner's review "
+                 "of `bindings.yaml`, and a person merges it. Don't update the branch: the writer takes only the commits it wrote. "
+                 "If `main` moves before the merge, the request fails, the writer closes this PR, and the person must link it again "
+                 "on the app's page.")
+
+
+def _binding_body(request, requester, platform_user, writer_merges) -> str:
+    """Nobody approves a binding: the body names who changed it, what is linked now, that only the directory (and, for secrets,
+    Secret Server as its platform account) was consulted, and who merges it."""
     f = request.final
     linked = [f"Azure identity `{f['azure_identity']['directory_id']}`"] if f.get("azure_identity") else []
     linked += [f"Databricks connection `{f['databricks']['directory_id']}`"] if f.get("databricks") else []
@@ -85,14 +94,15 @@ def _binding_body(request, requester, platform_user) -> str:
           if linked or not secrets else []), "",
         f"- `apps/{request.repo}/{f['environment']}/composed.yaml` is what golden-road compose makes from the environment's pinned "
         "release and this binding; deploy-check composes it again and fails on any difference.", "",
-        "Written by the golden road portal's writer. It merges once the required checks pass. Change it on the app's page in the portal.",
+        f"{WRITER_MERGES if writer_merges else PERSON_MERGES} Change it on the app's page in the portal.",
     ])
 
 
-def pr_body(request, requester, approver, platform_user=None) -> str:
-    """platform_user: Secret Server's platform account (the writer's secret_server.platform_user), named for a binding's secrets."""
+def pr_body(request, requester, approver, target, platform_user=None) -> str:
+    """target: the request's allowlist.target_for, which says who merges (allowlist.writer_merges). platform_user: Secret Server's
+    platform account (the writer's secret_server.platform_user), named for a binding's secrets."""
     if request.kind == "binding":
-        return _binding_body(request, requester, platform_user)
+        return _binding_body(request, requester, platform_user, writer_merges(target))
     f = request.final
     return "\n".join([
         f"Portal request `{request.id}`: register `{request.repo}`.", "",
@@ -102,5 +112,5 @@ def pr_body(request, requester, approver, platform_user=None) -> str:
         *_evidence_lines(f), "",
         "Justification:", fenced(f["approval_justification"]), "",
         *_override_lines(f, approver),
-        "Written by the golden road portal's writer. It merges once the required checks pass. Change this record through the portal.",
+        f"{WRITER_MERGES} Change this record through the portal.",
     ])

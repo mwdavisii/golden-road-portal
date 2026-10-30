@@ -11,6 +11,9 @@ DEPLOY_BINDING = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|pro
 COMPOSED = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/composed\.yaml")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ENVIRONMENTS = ("test", "prod")
+# A binding for one of these is opened and checked by the writer but merged by a person, through main-review (code-owner review of
+# bindings.yaml): GitHub can't limit the write App's bypass to a path, so the writer limits itself (spec 2026-10-30, P1).
+REVIEWED = ("prod",)
 FACTORY, DEPLOY = "scorecard-factory", "golden-road-deploy"
 ALLOWED_PATHS = ("intake/<owner>/<repo>.yaml in <org>/scorecard-factory",
                  "apps/<owner>/<repo>/<test|prod>/bindings.yaml in <org>/golden-road-deploy",
@@ -25,6 +28,14 @@ class Target:
     path: str
     schema: str
     also: str | None = None  # a binding's second file, its environment's composed.yaml
+    environment: str | None = None  # a binding's environment, from its stored draft
+
+
+def writer_merges(target: Target) -> bool:
+    """True only for a registration (its intake record) and a test binding. Anything else, prod included, waits for a person."""
+    if target.schema == "intake.v2":
+        return target.environment is None
+    return target.schema == "binding.v2" and target.environment == "test" and target.environment not in REVIEWED
 
 
 def _clean(match) -> bool:
@@ -73,4 +84,4 @@ def target_for(org: str, request) -> Target | None:
     if not isinstance(environment, str) or environment not in ENVIRONMENTS:
         return None
     d = environment_dir(request.repo, environment)
-    return Target(f"{org}/{DEPLOY}", f"{d}/bindings.yaml", "binding.v2", also=f"{d}/composed.yaml")
+    return Target(f"{org}/{DEPLOY}", f"{d}/bindings.yaml", "binding.v2", also=f"{d}/composed.yaml", environment=environment)
