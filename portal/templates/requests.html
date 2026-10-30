@@ -16,7 +16,7 @@
 <div class="table-wrap">
 <table>
 <tr><th>Repository</th><th>Kind</th><th>State</th><th>Submitted</th></tr>
-{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections{% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ r.state }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}?environment={{ environment_of(r) }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections ({{ environment_of(r) }}){% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ r.state }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
 {% endfor %}
 </table>
 </div>

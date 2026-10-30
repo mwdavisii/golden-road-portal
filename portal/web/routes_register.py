@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import RedirectResponse
 
+from ..binding_record import environment_of
 from ..floor import below_floor, effective
 from ..registration import CLASSIFICATIONS, TIERS, form_draft
 from ..store.base import Conflict
@@ -69,14 +70,15 @@ def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data
 
 @router.get("/requests")
 def my_requests(request: Request, principal=SIGNED_IN):
-    return page(request, "requests.html", requests=request.app.state.store.requests_by(principal.person.id), apps=admin_repos(request, principal))
+    return page(request, "requests.html", requests=request.app.state.store.requests_by(principal.person.id), apps=admin_repos(request, principal),
+                environment_of=lambda r: environment_of(r) or "test")
 
 
 @router.get("/requests/{request_id}")
 def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     found = request.state.found_request
     if found.kind == "binding":  # request.html is for registrations: a connection change is shown on its app's page
-        return RedirectResponse(f"/apps/{found.repo}", status_code=303)
+        return RedirectResponse(f"/apps/{found.repo}?environment={environment_of(found) or 'test'}", status_code=303)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],
                 classifications=CLASSIFICATIONS, tiers=TIERS, **evidence_context(request.app.state.store, found))
 

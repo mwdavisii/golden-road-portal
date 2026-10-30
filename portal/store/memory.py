@@ -5,7 +5,7 @@ import secrets
 import threading
 
 from ..ids import new_id
-from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, check_binding, token_hash
+from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, check_binding, open_key, token_hash
 
 
 class MemoryStore:
@@ -151,7 +151,8 @@ class MemoryStore:
     def create_registration(self, *, person_id, draft, now):
         repo = draft["repo"]
         with self._lock:
-            if any(r.kind == "registration" and r.repo.lower() == repo.lower() and r.state in OPEN_STATES for r in self._requests.values()):
+            key = open_key("registration", repo, draft)
+            if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
                 raise Conflict("open_request_exists")
             req = Request(new_id("r"), "registration", repo, "pending", dict(draft), person_id, now, now)
             self._requests[req.id] = req
@@ -167,7 +168,8 @@ class MemoryStore:
                 raise Conflict("unknown_person")
             if request_id in self._requests:
                 raise Conflict("request_exists")
-            if any(r.kind == "binding" and r.repo.lower() == repo.lower() and r.state in OPEN_STATES for r in self._requests.values()):
+            key = open_key("binding", repo, final)  # one open request per kind, repo and environment (0007)
+            if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
                 raise Conflict("open_request_exists")
             req = Request(request_id, "binding", repo, "approved", dict(final), person_id, now, now, final=dict(final))
             self._requests[req.id] = req

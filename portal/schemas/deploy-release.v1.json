@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/deploy-release.v1.json",
+  "title": "deploy-release/v1",
+  "description": "apps/<owner>/<repo>/<env>/release.yaml in golden-road-deploy: the one signed release an environment runs, pinned by its image digest and the sha256 of the release's manifests.yaml and gate-record.json assets. bump.yml writes it; golden-road compose and deploy-check read it. A prod environment pins only a promoted (prod-) release in a namespace ending -prod, a test environment only a test- release in one ending -test.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "environment", "namespace", "release", "image", "manifests_sha256", "gate_record_sha256"],
+  "$defs": {
+    "single_line": {"not": {"pattern": "[\\r\\n]"}},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  },
+  "properties": {
+    "schema": {"const": "deploy-release/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "environment": {"enum": ["test", "prod"]},
+    "namespace": {"type": "string", "description": "This environment's own Kubernetes namespace, a DNS-1123 label: <repo>-<env> (the repo name lowercased, with . and _ turned into -), so no two environments, not even one app's test and prod, share one. deploy-check refuses two environments with the same namespace.", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "release": {"type": "string", "pattern": "^(test|prod)-[0-9]{14}-[0-9a-f]{7}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "image": {"type": "string", "pattern": "^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "manifests_sha256": {"$ref": "#/$defs/sha256"},
+    "gate_record_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "allOf": [
+    {"if": {"properties": {"environment": {"const": "prod"}}, "required": ["environment"]}, "then": {"properties": {"release": {"pattern": "^prod-"}, "namespace": {"pattern": "-prod$"}}}},
+    {"if": {"properties": {"environment": {"const": "test"}}, "required": ["environment"]}, "then": {"properties": {"release": {"pattern": "^test-"}, "namespace": {"pattern": "-test$"}}}}
+  ]
+}

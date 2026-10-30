@@ -112,6 +112,18 @@ spec:
               name: golden-road-portal-config
               key: PORTAL_DATA_PROCESS_URL
               optional: true
+        - name: PORTAL_SECRET_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_SECRET_SERVER
+              optional: true
+        - name: PORTAL_SECRET_PROCESS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_SECRET_PROCESS_URL
+              optional: true
         - name: PORTAL_REPO_ADMINS_STALE_AFTER
           valueFrom:
             configMapKeyRef:

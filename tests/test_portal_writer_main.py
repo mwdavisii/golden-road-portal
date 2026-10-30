@@ -51,7 +51,9 @@ def test_a_missing_setting_stops_the_writer_with_its_name():
                                        ({"PORTAL_WRITE_APP_ID": "x"}, "PORTAL_WRITE_APP_ID"), ({"PORTAL_WRITER_INTERVAL": "1"}, "PORTAL_WRITER_INTERVAL"),
                                        ({"PORTAL_WRITER_INTERVAL": "99999"}, "PORTAL_WRITER_INTERVAL"),
                                        ({"PORTAL_WRITER_REQUIRED_CHECKS": "other-check"}, "PORTAL_WRITER_REQUIRED_CHECKS"),
-                                       ({"PORTAL_WRITER_REQUIRED_CHECKS": "factory-check,<b>x</b>"}, "PORTAL_WRITER_REQUIRED_CHECKS")])
+                                       ({"PORTAL_WRITER_REQUIRED_CHECKS": "factory-check,<b>x</b>"}, "PORTAL_WRITER_REQUIRED_CHECKS"),
+                                       ({"PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS": "factory-check"}, "PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS"),
+                                       ({"PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS": "deploy-check,<b>x</b>"}, "PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS")])
 def test_a_bad_setting_stops_the_writer(portal, tmp_path, env, name):
     code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
     assert code == 2 and name in err
@@ -159,3 +161,43 @@ def test_the_writer_takes_the_portal_s_staleness_limit(tmp_path):
 def test_a_bad_directory_setting_stops_the_writer_with_its_name(portal, tmp_path):
     code, err = run(tmp_path, FakeGitHub(), portal.store, env={"PORTAL_DIRECTORY": "azure"})
     assert code == 2 and "PORTAL_DIRECTORY" in err
+
+
+
+def test_more_deploy_required_checks_may_be_added_but_deploy_check_stays(portal, tmp_path):
+    from portal.writer.__main__ import _load
+    key = tmp_path / "k.pem"
+    key.write_bytes(pem(new_rsa_key()))
+    base = {**ENV, "PORTAL_WRITE_APP_KEY_FILE": str(key)}
+    assert _load(base)[0].required_checks["acme/golden-road-deploy"] == ("deploy-check",)
+    cfg = _load({**base, "PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS": "deploy-check, kustomize-build"})[0]
+    assert cfg.required_checks == {"acme/scorecard-factory": ("factory-check",), "acme/golden-road-deploy": ("deploy-check", "kustomize-build")}
+    code, err = run(tmp_path, good_github(), portal.store, env={"PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS": "deploy-check, kustomize-build"})
+    assert code == 3 and "golden-road-deploy" in err and "kustomize-build" in err  # the startup check wants it enforced too
+
+
+# ---- Delinea Secret Server: the writer reads PORTAL_SECRET_SERVER as the web does ----
+
+def test_the_writer_loads_the_mock_secret_server_when_asked(tmp_path):
+    from portal.secretserver_mock import MockSecretServer
+    from portal.settings import SettingsError
+    assert isinstance(load_with(tmp_path, PORTAL_SECRET_SERVER="mock").secret_server, MockSecretServer)
+    assert load_with(tmp_path).secret_server is None and load_with(tmp_path, PORTAL_SECRET_SERVER="").secret_server is None
+    for bad in ("delinea", "Mock", "real"):
+        with pytest.raises(SettingsError, match="PORTAL_SECRET_SERVER"):
+            load_with(tmp_path, PORTAL_SECRET_SERVER=bad)
+    with pytest.raises(SettingsError, match="PORTAL_SECRET_SERVER_URL"):
+        load_with(tmp_path, PORTAL_SECRET_SERVER="mock", PORTAL_SECRET_SERVER_URL="https://ss.example.test/SecretServer")
+
+
+def test_a_mock_secret_server_that_does_not_load_stops_the_writer(tmp_path, monkeypatch):
+    from portal import secretserver_mock
+    from portal.settings import SettingsError
+    monkeypatch.setattr(secretserver_mock, "MOCK", tmp_path / "missing.json")
+    with pytest.raises(SettingsError, match="PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid"):
+        load_with(tmp_path, PORTAL_SECRET_SERVER="mock")
+
+
+def test_a_bad_secret_server_setting_stops_the_writer_with_its_name(portal, tmp_path):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env={"PORTAL_SECRET_SERVER": "delinea"})
+    assert code == 2 and "PORTAL_SECRET_SERVER" in err and "delinea" not in err

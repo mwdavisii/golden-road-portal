@@ -13,12 +13,12 @@ def intake_yaml(final: dict, request_id: str) -> str:
     return HEADER.format(id=request_id) + yaml.safe_dump(final, sort_keys=False, allow_unicode=True, width=1000)
 
 
-BINDING_HEADER = ("# Written by the golden road portal (request {id}). This app's Azure identity and Databricks connection.\n"
+BINDING_HEADER = ("# Written by the golden road portal (request {id}). The {env} environment's Azure identity and Databricks connection.\n"
                   "# Change it on the app's page in the portal.\n")
 
 
 def binding_yaml(final: dict, request_id: str) -> str:
-    return BINDING_HEADER.format(id=request_id) + yaml.safe_dump(final, sort_keys=False, allow_unicode=True, width=1000)
+    return BINDING_HEADER.format(id=request_id, env=final.get("environment")) + yaml.safe_dump(final, sort_keys=False, allow_unicode=True, width=1000)
 
 
 def content_for(request) -> str:
@@ -32,7 +32,7 @@ def branch_name(request_id: str) -> str:
 
 def title(request) -> str:
     if request.kind == "binding":
-        return f"Connections for {request.repo} (portal request {request.id})"
+        return f"Connections for {request.repo} ({request.final.get('environment')}) (portal request {request.id})"
     return f"Register {request.repo} (portal request {request.id})"
 
 
@@ -59,24 +59,40 @@ def _override_lines(f, approver) -> list[str]:
     return [f"- Approved below the floor by {_name(approver)} (`{override['by']}`):", fenced(override["reason"]), ""]
 
 
-def _binding_body(request, requester) -> str:
-    """Nobody approves a binding: the body names who changed it, what is linked now, and that only the directory was consulted."""
+def _binding_body(request, requester, platform_user) -> str:
+    """Nobody approves a binding: the body names who changed it, what is linked now, and that only the directory (and, for secrets,
+    Secret Server as its platform account) was consulted."""
     f = request.final
     linked = [f"Azure identity `{f['azure_identity']['directory_id']}`"] if f.get("azure_identity") else []
     linked += [f"Databricks connection `{f['databricks']['directory_id']}`"] if f.get("databricks") else []
     verified_by = (f.get("azure_identity") or {}).get("verified_by", "mock-directory")
+    secrets = f.get("secrets") or []
+    if secrets:  # references only (env, id, field: pattern-checked by binding/v2), never a value
+        now_linked = ", ".join(linked) if linked else "no Azure identity or Databricks connection"
+        secret_lines = ["- Secrets from Delinea Secret Server: " + ", ".join(
+            f"`{s['env']}` (secret `{int(s['secret_id'])}`, field `{s['field_slug']}`)" for s in secrets),
+            f"- Each secret checked against `{secrets[0]['verified_by']}` as its platform account"
+            + (f" `{platform_user}`" if platform_user else "") + ": still shared with it, the field still its template's; the value "
+            "never passes through the portal."]
+    else:
+        now_linked, secret_lines = ", ".join(linked) if linked else "neither (unlinked)", []
     return "\n".join([
-        f"Portal request `{request.id}`: the connections of `{request.repo}`.", "",
+        f"Portal request `{request.id}`: the connections of `{request.repo}` in `{f['environment']}`.", "",
         f"- Changed by {_name(requester)} (`{request.requested_by}`), an admin of the repository, at {f['linked_at']}",
-        f"- Now linked: {', '.join(linked) if linked else 'neither (unlinked)'}",
-        f"- Checked against the portal's directory (`{verified_by}`); nothing was verified with Azure or Databricks.", "",
+        f"- Now linked: {now_linked}",
+        *secret_lines,
+        *([f"- Checked against the portal's directory (`{verified_by}`); nothing was verified with Azure or Databricks."]
+          if linked or not secrets else []), "",
+        f"- `apps/{request.repo}/{f['environment']}/composed.yaml` is what golden-road compose makes from the environment's pinned "
+        "release and this binding; deploy-check composes it again and fails on any difference.", "",
         "Written by the golden road portal's writer. It merges once the required checks pass. Change it on the app's page in the portal.",
     ])
 
 
-def pr_body(request, requester, approver) -> str:
+def pr_body(request, requester, approver, platform_user=None) -> str:
+    """platform_user: Secret Server's platform account (the writer's secret_server.platform_user), named for a binding's secrets."""
     if request.kind == "binding":
-        return _binding_body(request, requester)
+        return _binding_body(request, requester, platform_user)
     f = request.final
     return "\n".join([
         f"Portal request `{request.id}`: register `{request.repo}`.", "",

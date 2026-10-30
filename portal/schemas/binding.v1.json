@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://platform.internal/schemas/binding.v1.json",
   "title": "binding/v1",
-  "description": "The factory's bindings/<owner>/<repo>.yaml as the portal's writer records it: the app's Azure identity (a service principal security's process created) and its Databricks connection (a SQL warehouse analytics' process granted to that principal). The release renders it into the signed manifests; no value is a secret. A binding with neither is an unlink: who unlinked and when stay on record.",
+  "description": "Retired from builder 0.4.0: binding/v2 (golden-road-deploy's per-environment bindings.yaml) replaces it, the release no longer renders a binding, and check-factory refuses the factory's bindings/<owner>/<repo>.yaml files. Kept so older records and requests still validate. It was the factory's bindings/<owner>/<repo>.yaml: an app's Azure identity and its Databricks connection; no value is a secret. A binding with neither is an unlink.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "repo", "linked_by", "linked_at", "request"],

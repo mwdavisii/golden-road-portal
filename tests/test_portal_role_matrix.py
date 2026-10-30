@@ -53,6 +53,8 @@ ROUTES = {
     ("POST", "/apps/{owner}/{repo}/azure-identity"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/databricks"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/secrets"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/secrets/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
 }
 
 
@@ -87,3 +89,30 @@ IDENTITY_HEADER = json.loads(POLICY.read_text())["identity_header"] if POLICY.ex
 def test_a_forged_roles_header_changes_nothing(portal, route, who):
     forged = {"X-Platform-Roles": "admin,ops,portal", IDENTITY_HEADER: "admin,ops,portal"}
     assert call(portal, who, *route, headers=forged).status_code == ROUTES[route][who]
+
+
+
+# the app page's environment selector: ?environment=prod (GET) or environment=prod (POST) gets what the plain route gets, and a
+# bad environment is a 400 for whoever passes the route's Access requirement (that requirement is checked first)
+APP_ROUTES = sorted(r for r in ROUTES if r[1].startswith("/apps/"))
+
+
+@pytest.mark.parametrize("who", PRINCIPALS)
+@pytest.mark.parametrize("route", APP_ROUTES)
+def test_each_caller_gets_the_same_for_prod(portal, route, who):
+    method, path = route
+    client, url = portal.client(who), fill(path, portal.seeds)
+    data = {"csrf_token": portal.csrfs[who]} if who in portal.csrfs else {}
+    response = client.get(url, params={"environment": "prod"}) if method == "GET" else client.post(url, data={**data, "environment": "prod"})
+    assert response.status_code == ROUTES[route][who]
+
+
+@pytest.mark.parametrize("who", PRINCIPALS)
+@pytest.mark.parametrize("route", APP_ROUTES)
+def test_a_bad_environment_is_a_400_once_access_is_granted(portal, route, who):
+    method, path = route
+    client, url = portal.client(who), fill(path, portal.seeds)
+    data = {"csrf_token": portal.csrfs[who]} if who in portal.csrfs else {}
+    response = client.get(url, params={"environment": "staging"}) if method == "GET" else client.post(url, data={**data, "environment": "staging"})
+    want = ROUTES[route][who]
+    assert response.status_code == (400 if want in (200, 400, 403) else want)

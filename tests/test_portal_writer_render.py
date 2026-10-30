@@ -50,8 +50,9 @@ def test_a_binding_file_is_the_binding_with_a_header(portal):
     req = binding_request(portal.store, portal.people, T0)
     text = binding_yaml(req.final, req.id)
     assert text.startswith(f"# Written by the golden road portal (request {req.id}).")
+    assert "test environment" in text.split("schema:")[0]
     assert "# Change it on the app's page in the portal.\n" in text.split("schema:")[0]
-    assert yaml.safe_load(text) == req.final and validate("binding.v1", yaml.safe_load(text)) == []
+    assert yaml.safe_load(text) == req.final and validate("binding.v2", yaml.safe_load(text)) == []
     assert list(yaml.safe_load(text)) == list(req.final), "the binding's own key order"
     assert content_for(req) == text
     reg = approved_request(portal.store, portal.people, T0)
@@ -60,7 +61,10 @@ def test_a_binding_file_is_the_binding_with_a_header(portal):
 
 def test_a_binding_pr_names_the_person_the_directory_entries_and_the_time(portal):
     req = binding_request(portal.store, portal.people, T0)
-    assert title(req) == f"Connections for acme/notes (portal request {req.id})"
+    assert title(req) == f"Connections for acme/notes (test) (portal request {req.id})"
+    prod = binding_request(portal.store, portal.people, T0, environment="prod")
+    assert title(prod) == f"Connections for acme/notes (prod) (portal request {prod.id})"
+    assert "`prod`" in pr_body(prod, portal.people["owner"], None) and "composed.yaml" in pr_body(prod, portal.people["owner"], None)
     body = pr_body(req, portal.people["owner"], None)
     for needle in (f"`{req.id}`", "`acme/notes`", "`Owner`", f"(`{req.requested_by}`)", req.final["linked_at"],
                    "Azure identity `sp-notes`", "Databricks connection `wh-notes`", "`mock-directory`"):
@@ -69,3 +73,15 @@ def test_a_binding_pr_names_the_person_the_directory_entries_and_the_time(portal
     assert "Now linked: neither (unlinked)" in pr_body(dc.replace(req, final=final), portal.people["owner"], None)
     sneaky = dc.replace(portal.people["owner"], display_name="`@everyone` <b>")
     assert "`'@everyone' <b>`" in pr_body(req, sneaky, None)
+
+
+def test_a_binding_s_pr_names_its_secrets_by_reference_only(portal):
+    """A secret is named by its env, id and field (what the binding records): never a value, never a credential."""
+    req = binding_request(portal.store, portal.people, T0, identity=False, secrets=[(1042, "password", "NOTES_DB_PASSWORD")])
+    body = pr_body(req, portal.people["owner"], None, platform_user="golden-road-eso")
+    assert "Secrets from Delinea Secret Server: `NOTES_DB_PASSWORD` (secret `1042`, field `password`)" in body
+    assert "Each secret checked against `mock-secret-server` as its platform account `golden-road-eso`: still shared" in body
+    assert "Now linked: neither" not in body and "no Azure identity or Databricks connection" in body
+    assert "<mock>" not in body and "mock-golden-road-eso" not in body and "portal's directory" not in body
+    plain = binding_request(portal.store, portal.people, T0, environment="prod")
+    assert "Secret Server" not in pr_body(plain, portal.people["owner"], None)

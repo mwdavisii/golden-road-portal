@@ -46,22 +46,36 @@ def check_approval(evidence, final, floor_override, actor_id):
         raise Conflict("below_floor")
 
 
+ENVIRONMENTS = ("test", "prod")
 REQUEST_ID = re.compile(r"r_[0-9a-f]{32}")  # portal.ids.new_id("r"), as migration 0001's request_id_check
 
 
 def check_binding(request_id, person_id, final):
-    """A binding request's id has the portal's format, and its record is a valid binding/v1 that names the request, its repo and
-    the person. Every Store checks this before it writes anything; the database checks the naming again (0006). Who may change
-    the app's connections is the web's check and the writer's recheck (the requester is still an admin of the repo); not the store's."""
+    """A binding request's id has the portal's format, and its record is a valid binding/v2 for test or prod that names the
+    request, its repo and the person. Every Store checks this before it writes anything; the database checks the naming, the
+    schema and the environment again (0006, 0007). Who may change the app's connections is the web's check and the writer's
+    recheck (the requester is still an admin of the repo); not the store's."""
     from ..contracts import validate
     if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
         raise ValueError("a binding request's id is not a portal request id")
-    if not isinstance(final, dict) or final.get("schema") != "binding/v1" or final.get("request") != request_id \
+    if not isinstance(final, dict) or final.get("schema") != "binding/v2" or final.get("request") != request_id \
             or final.get("linked_by") != person_id or not isinstance(final.get("repo"), str) or not final["repo"]:
-        raise ValueError("a binding request's record must name its request, its repo and its person")
-    problems = validate("binding.v1", final)
+        raise ValueError("a binding request's record must be a binding/v2 that names its request, its repo and its person")
+    if final.get("environment") not in ENVIRONMENTS:
+        raise ValueError("a binding request's record must name its environment, test or prod")
+    problems = validate("binding.v2", final)
     if problems:
-        raise ValueError(f"a binding request's record is not a valid binding/v1: {problems[0]}")
+        raise ValueError(f"a binding request's record is not a valid binding/v2: {problems[0]}")
+
+
+def open_key(kind, repo, draft):
+    """What one open request is unique by, exactly migration 0007's request_one_open: its kind, its repo case-insensitively, and
+    for a binding its draft's environment (test for one recorded before bindings were per environment); '' for any other kind,
+    whatever its draft says."""
+    if kind != "binding":
+        return kind, repo.lower(), ""
+    env = draft.get("environment") if isinstance(draft, dict) else None
+    return kind, repo.lower(), "test" if env is None else env
 
 
 def token_hash(token: str) -> bytes:

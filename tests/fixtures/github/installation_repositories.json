@@ -1,8 +1,11 @@
 {
-  "total_count": 1,
+  "total_count": 2,
   "repositories": [
     {
       "full_name": "acme/scorecard-factory"
+    },
+    {
+      "full_name": "acme/golden-road-deploy"
     }
   ]
 }

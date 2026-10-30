@@ -44,6 +44,14 @@ def _https(name: str, value: str, *, root_only: bool = False, query: bool = Fals
     return value
 
 
+def no_secret_server_url(value: str) -> None:
+    """PORTAL_SECRET_SERVER_URL is the spec's setting for a real Secret Server. There is only the mock, so it must stay unset: set,
+    it would look as if a real instance were in use. Shared by the web and the writer."""
+    if value:
+        raise SettingsError("PORTAL_SECRET_SERVER_URL is for a real Secret Server, which this portal does not have yet; leave it "
+                            "unset (PORTAL_SECRET_SERVER=mock needs no URL)")
+
+
 def parse_role_groups(text: str) -> dict:
     try:
         doc = json.loads(text)
@@ -81,6 +89,8 @@ class Settings:
     directory: object = None  # portal.directory.Directory when PORTAL_DIRECTORY is set; None hides the app's connections
     identity_process_url: str = ""  # where security's process for service principals is described (link text on the app page)
     data_process_url: str = ""  # where analytics' process for warehouse grants is described
+    secret_server: object = None  # portal.secretserver_mock.MockSecretServer when PORTAL_SECRET_SERVER=mock; None hides app secrets
+    secret_process_url: str = ""  # where security's process for sharing a secret with golden-road-eso is described
 
     @property
     def origin(self) -> str:
@@ -173,6 +183,17 @@ class Settings:
             except DirectoryError as exc:
                 raise SettingsError("PORTAL_DIRECTORY is mock, but the mock directory is not valid") from exc
 
+        def secret_server_ok(value):
+            if value == "":
+                return None
+            if value != "mock":
+                raise SettingsError("PORTAL_SECRET_SERVER must be mock or unset (the only Secret Server there is is the mock)")
+            from .secretserver_mock import MockSecretServerError, load_mock as load_secret_server
+            try:
+                return load_secret_server()
+            except MockSecretServerError as exc:
+                raise SettingsError("PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid") from exc
+
         def link_ok(name):
             return lambda value: _https(name, value, query=True) if value else ""  # a wiki page link may need its query
 
@@ -190,7 +211,10 @@ class Settings:
             review_months=get("PORTAL_REVIEW_MONTHS", months_ok, "12"),
             directory=get("PORTAL_DIRECTORY", directory_ok, ""),
             identity_process_url=get("PORTAL_IDENTITY_PROCESS_URL", link_ok("PORTAL_IDENTITY_PROCESS_URL"), ""),
-            data_process_url=get("PORTAL_DATA_PROCESS_URL", link_ok("PORTAL_DATA_PROCESS_URL"), ""))
+            data_process_url=get("PORTAL_DATA_PROCESS_URL", link_ok("PORTAL_DATA_PROCESS_URL"), ""),
+            secret_server=get("PORTAL_SECRET_SERVER", secret_server_ok, ""),
+            secret_process_url=get("PORTAL_SECRET_PROCESS_URL", link_ok("PORTAL_SECRET_PROCESS_URL"), ""))
+        get("PORTAL_SECRET_SERVER_URL", no_secret_server_url, "")
         stale = get("PORTAL_REPO_ADMINS_STALE_AFTER", stale_ok, "600")
         if problems:
             return None, problems

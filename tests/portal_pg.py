@@ -12,7 +12,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
-PG_IMAGE = "docker.io/library/postgres@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb"
+PG_IMAGE = "docker.io/library/postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb"
 ROLES = ("portal_owner", "portal_web", "portal_writer", "portal_collector")
 
 
@@ -27,7 +27,7 @@ class Server:
 
 @pytest.fixture(scope="session")
 def pg_server():
-    assert re.fullmatch(r"docker\.io/library/postgres@sha256:[0-9a-f]{64}", PG_IMAGE), "pin PG_IMAGE by digest"
+    assert re.fullmatch(r"docker\.io/library/postgres:17-alpine@sha256:[0-9a-f]{64}", PG_IMAGE), "pin PG_IMAGE to the 17 line by tag and digest"
     if shutil.which("docker") is None:
         pytest.skip("docker not installed")
     name = f"portal-pg-{uuid.uuid4().hex[:10]}"

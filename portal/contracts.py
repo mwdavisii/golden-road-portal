@@ -19,7 +19,8 @@ def _validator(name: str) -> Draft202012Validator:
 
 # `format: date-time` is checked only when an optional package is installed, so these fields are parsed here as well: the
 # schema's pattern fixes the shape, this proves the instant exists (no month 99, no February 30).
-DATE_TIME_FIELDS = {"intake.v2": ("approved_at", "floor_override.at"), "identity-link.v1": ("created_at",), "binding.v1": ("linked_at",)}
+DATE_TIME_FIELDS = {"intake.v2": ("approved_at", "floor_override.at"), "identity-link.v1": ("created_at",), "binding.v1": ("linked_at",),
+                   "binding.v2": ("linked_at",)}
 
 
 def _at(document, dotted):
@@ -40,6 +41,20 @@ def _bad_instants(name: str, document) -> list[str]:
     return errors
 
 
+# JSON Schema can't say "unique by one key", so these are checked here: each name is a list of objects whose key must not repeat.
+UNIQUE_KEYS = {"binding.v2": (("secrets", "env", "secrets: env names must be unique"),)}
+
+
+def _repeats(name: str, document) -> list[str]:
+    errors = []
+    for field, key, message in UNIQUE_KEYS.get(name, ()):
+        items = document.get(field) if isinstance(document, dict) else None
+        keys = [i.get(key) for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+        if len(keys) != len(set(map(repr, keys))):
+            errors.append(message)
+    return errors
+
+
 def validate(name: str, document) -> list[str]:
     errors = sorted(_validator(name).iter_errors(document), key=lambda e: [str(p) for p in e.absolute_path])
-    return [f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors] + _bad_instants(name, document)
+    return [f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors] + _bad_instants(name, document) + _repeats(name, document)

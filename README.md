@@ -47,6 +47,9 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; seconds after which the collector's observation of a person's admin repos is too old to register or approve on (60 to 604800, default 600: two collector intervals) |
 | `PORTAL_DIRECTORY` | Optional; `mock` turns on each app's connections (an Azure identity and a Databricks connection, picked from `portal/mock_directory.json`); unset, the app page shows none. The writer must get the same value |
 | `PORTAL_IDENTITY_PROCESS_URL`, `PORTAL_DATA_PROCESS_URL` | Optional; `https://` pages that say how to ask for a service principal and for a warehouse grant (linked on the app page) |
+| `PORTAL_SECRET_SERVER` | Optional; `mock` turns on each app's secrets from Delinea Secret Server (`portal/mock_secret_server.json`, served through `portal/secretserver.py`'s client, which never reads a value); unset, the app page shows none. The writer must get the same value |
+| `PORTAL_SECRET_PROCESS_URL` | Optional; an `https://` page that says how to ask security to share a secret with the platform account `golden-road-eso` (linked on the app page) |
+| `PORTAL_SECRET_SERVER_URL` | Must stay unset: it is for a real Secret Server, which there is none of yet. Set, the portal stops (web and writer) |
 
 Anything missing or malformed stops the process at startup.
 
@@ -59,16 +62,32 @@ Anything missing or malformed stops the process at startup.
 | `PORTAL_GITHUB_HOST`, `PORTAL_ORG`, `PORTAL_ROLE_GROUPS`, `PORTAL_DATABASE_URL` | As for the web; the database URL is the `portal_writer` role's |
 | `PORTAL_WRITE_APP_ID`, `PORTAL_WRITE_INSTALLATION_ID`, `PORTAL_WRITE_APP_KEY_FILE` | The write App installation and its RSA private key (a PEM file, never printed) |
 | `PORTAL_WRITER_INTERVAL` | Optional; seconds between passes (5 to 3600, default 30) |
-| `PORTAL_WRITER_REQUIRED_CHECKS` | Optional; comma-separated checks that must pass before a merge. `factory-check` is always required; others can be added |
+| `PORTAL_WRITER_REQUIRED_CHECKS` | Optional; comma-separated checks that must pass before a merge in the factory. `factory-check` is always required; others can be added. In `golden-road-deploy` the checks are `PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS` |
+| `PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS` | Optional; the same for `golden-road-deploy`: `deploy-check` is always required; others can be added |
 | `PORTAL_DIRECTORY` | Optional; as for the web (`mock` or unset). Every binding is re-checked against it before it is written; unset, bindings fail with `no_directory` |
+| `PORTAL_SECRET_SERVER` | Optional; as for the web (`mock` or unset; `PORTAL_SECRET_SERVER_URL` must stay unset). A binding's secrets are re-checked against it before they are written |
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; the web's setting, and it must be the same value (the homelab kit passes both processes the one config map key; empty is the default, 600). A binding's requester must have been seen as the repo's admin within it, or it fails with `requester_not_admin` |
 
 It checks the write App's bypass before the first pass and again before every pass, and writes nothing in a pass whose check finds a
 problem. Exit codes: 2 for a missing or bad setting or key, 3 when the bypass check refuses to start it.
-It merges only the commit it opened the pull request with (migration 0003 stores it), and only while the pull request still adds
-exactly the one allowlisted file on the default branch (`intake/<owner>/<repo>.yaml` for a registration; for a binding,
-`bindings/<owner>/<repo>.yaml`, which it may also modify in place: the contents `PUT` then names the blob it replaces, and an
-unlink rewrites the file, never deletes it).
+It merges only the commit it opened the pull request with (migration 0003 stores it), and only while the pull request still changes
+exactly the allowlisted files on the default branch, each written by one of its own commits on the base it branched from. A
+registration adds `intake/<owner>/<repo>.yaml` in `<org>/scorecard-factory`. A binding (one environment's, `test` or `prod`)
+writes `apps/<owner>/<repo>/<env>/bindings.yaml` and then `apps/<owner>/<repo>/<env>/composed.yaml` in `<org>/golden-road-deploy`,
+two contents `PUT`s, each naming the blob it replaces when the file exists (an unlink rewrites `bindings.yaml`, never deletes it).
+`composed.yaml` is computed with `portal/compose.py`, a byte-identical copy of `golden_road/compose.py`, from the environment's
+`release.yaml` and `base/manifests.yaml` at the base commit, so `deploy-check`'s drift check passes; it is not written when it would
+not change. The writer never writes `release.yaml`, `kustomization.yaml`, `base/` or the adapters under `clusters/` (those come
+from the deploy repo's `bump.yml`, and none of them depends on a binding). A binding fails with `not_registered` when the
+factory has no intake record for the repo at its default branch, `not_deployed` when the environment has no `release.yaml` or
+`base/manifests.yaml` yet (no release is pinned there), and `compose_refused` when `release.yaml` is not a valid
+`deploy-release/v1` for that repo and environment, the manifests are not its `manifests_sha256`, or compose refuses them.
+A binding's Delinea secrets are re-checked as the platform account `golden-road-eso` before anything is written: it fails with
+`secret_not_shared` (the account can't see the secret now), `secret_field_gone` (the field is not a non-file field of the secret's
+template now), `secret_env_reserved` (the env name is the platform's), `no_secret_server` (`PORTAL_SECRET_SERVER` is unset or not the mock), `secret_verified_elsewhere` (the reference was checked
+by another Secret Server than the writer's) or `secret_server_unavailable`. An env name the app's own `builder-spec.json`
+sets is `compose_refused`. The person's own visibility is checked by the web on submit, not here: the writer has no token of theirs.
+Mock only: the only Secret Server is the mock; no Secret Server, External Secrets Operator or cluster is ever called.
 
 The writer's GitHub surface is exactly these calls (the write installation needs `contents` and `pull_requests` write, and `metadata`, `checks`, `administration` and `actions` read: `actions: read` is for the workflow-run call, which a private repo refuses without it). As the App (a short JWT): `POST /app/installations/{id}/access_tokens`, `GET /app/installations/{id}`.
 As the write installation: `GET /installation/repositories`, `GET /repos/{r}`, `GET /repos/{r}/git/ref/heads/{branch}`, `POST /repos/{r}/git/refs`,
@@ -76,18 +95,25 @@ As the write installation: `GET /installation/repositories`, `GET /repos/{r}`, `
 `GET /repos/{r}/pulls?head=...`, `POST /repos/{r}/pulls`, `GET /repos/{r}/pulls/{n}`, `GET /repos/{r}/pulls/{n}/files`,
 `GET /repos/{r}/commits/{sha}/check-runs`, `GET /repos/{r}/actions/runs?check_suite_id=...` (to trace a check run to its workflow run),
 `PUT /repos/{r}/pulls/{n}/merge`, and `GET /repos/{r}/rulesets` and `/rulesets/{id}` (with `includes_parents=true`).
+Both target repos' `main` rulesets require a pull request to be up to date with the default branch, and the writer never updates
+its branch. So when the default branch has moved past the commit the writer branched from (or GitHub reports the PR `behind`),
+the request fails at once with `base_moved`: the repo changed while the change was waiting; make the change again.
 The check that lets a merge through must be a `pull_request` workflow run for the writer's branch and commit, from the target repo,
 that lists only the writer's PR into the default branch. If another PR shares the head, the REST API doesn't say which of them
 triggered a run, so the writer doesn't decide: it waits, and fails the request at `merge_timeout`. After a merge it reads the file at
-the merge commit; if GitHub can't say yet (an error, or a 404 within 30 minutes of the merge) it keeps the request open as "merge confirmation pending" and tries again next pass. Once a PR is merged the writer never fails the request for want of an answer: it fails only on other content, or on a definite 404 after that grace period.
+the merge commit (a binding's two files: `bindings.yaml` as written, and `composed.yaml` as it reads at the commit the pull request
+was opened with); if GitHub can't say yet (an error, or a 404 within 30 minutes of the merge) it keeps the request open as "merge confirmation pending" and tries again next pass. Once a PR is merged the writer never fails the request for want of an answer: it fails only on other content, or on a definite 404 after that grace period.
 
 Migrations: `0001` the tables and grants, `0002` the database's own rules (the request state machine, no self-approval, the audit
 log's id and time), `0003` the pinned commits and no admin link to one's own person, `0004` the platform's registration evidence and
-`0005` the approval rule that uses it, `0006` binding requests (the one kind that starts approved, with no decision).
+`0005` the approval rule that uses it, `0006` binding requests (the one kind that starts approved, with no decision), `0007`
+bindings per environment (one open request per kind, repo and environment; the insert guard takes `binding/v2` for `test` or
+`prod` only; a binding request recorded before it, a `binding/v1` with no environment, counts as `test`'s and is left as it is).
 
 Migrations are forward-only: there are no down migrations. After `0006` an older image still handles registrations, but its
 writer fails every binding request it claims (it knows only registrations). Don't roll the image back once bindings exist; if you
-must, expect open binding requests to fail, and link them again after rolling forward.
+must, expect open binding requests to fail, and link them again after rolling forward. After `0007` an open `binding/v1` request
+fails the writer's recheck (`schema_invalid`: the writer writes `binding/v2` only); link it again on the app page's test tab.
 
 Registration evidence: the collector inserts into and reads `registration_evidence` (one evidence row per submission, and the reasons a
 request waits), and reads only the id, kind, repo, state and submission of `request`, never the draft. Nobody updates or deletes
