@@ -1,11 +1,19 @@
 """MemoryStore: the Store in one process, for tests and local runs. A lock makes each method atomic, like a transaction."""
 
+import collections
 import dataclasses as dc
 import secrets
 import threading
 
 from ..ids import new_id
-from .base import LINK_SOURCES, OPEN_STATES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, Person, RepoAdmin, Request, Session, check_approval, check_binding, open_key, token_hash
+from .base import (DATE_REASONS, LINK_SOURCES, OPEN_STATES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, Conflict, Evidence, ItemEvent,
+                   FailedRun, Link, Person, RepoAdmin, Request, RereviewItem, RereviewStatus, Session, check_approval, check_binding,
+                   check_failed_run, check_item,
+                   check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row, item_event, open_key,
+                   token_hash, PendingEvent, Watermark)
+
+
+REGISTERED = ("approved", "writing", "pr_open", "merged")  # a registration an admin approved
 
 
 class MemoryStore:
@@ -16,6 +24,16 @@ class MemoryStore:
         self._links, self._admins, self._requests = {}, [], {}
         self._audit: list[AuditEntry] = []
         self._evidence, self._problems = {}, []  # (request_id, submission) -> Evidence; (request_id, submission, problem, at)
+        self._intake = {}  # lower(repo) -> IntakeObserved
+        self._runs = {}  # (lower(repo), run_id) -> outcome
+        self._events = {}  # (source, lower(repo), head_sha) -> RereviewEvent
+        self._items = {}  # id -> RereviewItem (without events)
+        self._item_events = []  # (item_id, source, head_sha, matched, added_at)
+        self._pending = {}  # (lower(run_repo), run_id) -> PendingEvent
+        self._status = {}  # source -> RereviewStatus
+        self._watermarks = {}  # lower(repo) -> Watermark
+        self._failed = {}  # (lower(repo), run id) -> FailedRun
+        self._stuck = {}  # (lower(repo), run id) -> passes GitHub couldn't answer for it
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -23,6 +41,10 @@ class MemoryStore:
     def audit_entries(self, limit=200):
         with self._lock:
             return list(reversed(self._audit))[:limit]
+
+    def audit_for(self, subject_kind, subject_id):
+        with self._lock:
+            return [e for e in self._audit if e.subject_kind == subject_kind and e.subject_id == subject_id]
 
     # ---- people and sessions ----
 
@@ -249,14 +271,17 @@ class MemoryStore:
             raise Conflict("not_awaiting")
         return req
 
-    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now):
+    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now,
+                     record_sha=None, record=None):
+        check_record(record_sha, record)
         with self._lock:
             req = self._awaiting(request_id, submission)
             if (request_id, submission) in self._evidence:
                 raise Conflict("evidence_exists")
             if evidence.get("repo") != req.repo or evidence.get("commit") != commit:
                 raise Conflict("not_awaiting")  # the evidence must name its request's repo and its own commit
-            row = Evidence(request_id, submission, commit, dict(evidence), floor_tier, floor_classification, rules_commit, now)
+            row = Evidence(request_id, submission, commit, dict(evidence), floor_tier, floor_classification, rules_commit, now,
+                           record_sha, dict(record) if record is not None else None)
             self._evidence[(request_id, submission)] = row
             return row
 
@@ -304,3 +329,207 @@ class MemoryStore:
     def mark_failed(self, *, request_id, reason, now):
         with self._lock:
             return self._move(request_id, ("writing", "pr_open"), "failed", now, reason, failure_reason=reason)
+
+    # ---- observed: the factory's intake records (the collector replaces them all in one go) ----
+
+    def replace_intake_observed(self, rows, *, observed_at):
+        check_observed(rows)
+        with self._lock:
+            self._intake = {r.repo.lower(): dc.replace(r, observed_at=observed_at) for r in rows}
+
+    def intake_observed(self, repo=None):
+        with self._lock:
+            rows = sorted(self._intake.values(), key=lambda r: r.repo.lower())
+        return rows if repo is None else [r for r in rows if r.repo.lower() == str(repo).lower()]
+
+    # ---- observed: scorecard runs and their events (insert-only) ----
+
+    def rereview_runs_seen(self, repo, run_ids):
+        with self._lock:
+            return {i for i in run_ids if (repo.lower(), i) in self._runs}
+
+    def record_rereview_run(self, *, repo, run_id, outcome, now):
+        if not REPO_NAME.fullmatch(repo or "") or outcome not in RUN_OUTCOMES or type(run_id) is not int or run_id < 1:
+            raise ValueError("a run names its repo and has a positive id and a known outcome")
+        with self._lock:
+            if (repo.lower(), run_id) in self._runs:
+                raise Conflict("run_seen")
+            self._runs[(repo.lower(), run_id)] = outcome
+
+    def rereview_run_counts(self):
+        with self._lock:
+            return dict(collections.Counter(self._runs.values()))
+
+    def add_rereview_event(self, *, doc, run_repo, run_id, now, source="central"):
+        event = event_row(doc, run_repo, run_id, now, source)
+        with self._lock:
+            key = (event.source, event.repo.lower(), event.head_sha)
+            if key in self._events:
+                return None
+            self._events[key] = event
+            return event
+
+    # ---- the re-review list (authoritative) ----
+
+    def _with_events(self, item):
+        rows = [r for r in self._item_events if r[0] == item.id]
+        return dc.replace(item, events=tuple(ItemEvent(self._events[(source, item.repo.lower(), sha)], matched, at)
+                                             for _, source, sha, matched, at in rows))
+
+    def _item(self, item_id):
+        item = self._items.get(item_id)
+        if item is None:
+            raise Conflict("not_found")
+        return item
+
+    def rereview_items(self, *, open_only=True):
+        with self._lock:
+            found = [self._with_events(i) for i in self._items.values() if not open_only or i.closed_at is None]
+        return sorted(found, key=lambda i: (i.opened_at, i.id))
+
+    def open_rereview_item(self, *, repo, reason, key, now, event=None):
+        check_item(repo, reason, key, event)
+        with self._lock:
+            same = [i for i in self._items.values() if i.repo.lower() == repo.lower() and i.reason == reason]
+            if any(i.key == key for i in same):
+                raise Conflict("item_exists")
+            if any(i.closed_at is None for i in same):
+                raise Conflict("item_open")
+            head, matched, source = item_event(event) if event is not None else (None, None, None)
+            if event is not None and (source, repo.lower(), head) not in self._events:
+                raise Conflict("no_event")
+            item = RereviewItem(new_id("i"), repo, reason, key, now)
+            self._items[item.id] = item
+            if event is not None:
+                self._item_events.append((item.id, source, head, matched, now))
+            self._log(now, "system", None, "rereview_item.opened", "rereview_item", item.id, None,
+                      {"repo": repo, "reason": reason, "key": key}, f"the collector opened {reason} for {repo}")
+            return self._with_events(item)
+
+    def add_rereview_item_event(self, *, item_id, head_sha, matched, now, source="central"):
+        check_matched(matched)
+        with self._lock:
+            item = self._item(item_id)
+            if item.closed_at is not None:
+                raise Conflict("closed")
+            if item.reason != "scorecard_signal":
+                raise Conflict("wrong_reason")
+            if (source, item.repo.lower(), head_sha) not in self._events:
+                raise Conflict("no_event")
+            if any(r[0] == item_id and r[1] == source and r[2] == head_sha for r in self._item_events):
+                raise Conflict("event_exists")
+            self._item_events.append((item_id, source, head_sha, tuple(matched), now))
+            self._log(now, "system", None, "rereview_item.event_added", "rereview_item", item_id, None,
+                      {"head_sha": head_sha, "source": source, "matched": list(matched)}, "a later scorecard event matched")
+            return self._with_events(item)
+
+    def _close(self, item_id, now, kind, actor_id, note, events_seen=None):
+        item = self._item(item_id)
+        if item.closed_at is not None:
+            raise Conflict("closed")
+        if events_seen is not None and len(self._with_events(item).events) != events_seen:
+            raise Conflict("item_changed")  # a later event joined after the admin looked: the decision is about what was seen (R6)
+        record = self._intake.get(item.repo.lower())
+        if kind == "person" and record is not None and record.problem is not None:
+            raise Conflict("record_unreadable")  # who owns the app is not known
+        last = next((r for r in sorted(self._requests.values(), key=lambda r: (r.created_at, r.id), reverse=True)
+                     if r.kind == "registration" and r.repo.lower() == item.repo.lower() and r.state in REGISTERED), None)
+        if kind == "person" and ((record is not None and record.owner == actor_id) or (last is not None and last.requested_by == actor_id)):
+            raise Conflict("own_app")  # the record's owner, or the requester of the app's last approved registration
+        if kind == "person" and actor_id not in self._people:
+            raise Conflict("unknown_person")  # Postgres: closed_by references person
+        closed = dc.replace(item, closed_at=now, close_kind=kind, closed_by=actor_id, close_note=note)
+        self._items[item_id] = closed
+        self._log(now, "person" if kind == "person" else "system", actor_id, "rereview_item.closed", "rereview_item", item_id,
+                  {"open": True}, {"open": False, "close_kind": kind}, note)
+        return self._with_events(closed)
+
+    def close_rereview_item(self, *, item_id, actor_id, note, now, events_seen):
+        check_note(note)
+        if actor_id is None:
+            raise Conflict("unknown_person")
+        with self._lock:
+            return self._close(item_id, now, "person", actor_id, note, events_seen)
+
+    def auto_close_rereview_item(self, *, item_id, note, now):
+        check_note(note)
+        with self._lock:
+            item = self._item(item_id)
+            if item.reason not in DATE_REASONS:
+                raise Conflict("wrong_reason")  # only a date closes by itself; a scorecard signal is an admin's decision
+            return self._close(item_id, now, "auto", None, note)
+
+    def set_rereview_status(self, *, source, problem, counts, now):
+        check_status(source, problem, counts)
+        with self._lock:
+            kept = self._status.get(source)
+            last_ok = now if problem is None else (kept.last_ok_at if kept else None)
+            self._status[source] = RereviewStatus(source, problem, dict(counts), now, last_ok)
+
+    def rereview_status(self):
+        with self._lock:
+            return dict(self._status)
+
+    def rereview_event(self, repo, head_sha, source="central"):
+        with self._lock:
+            return self._events.get((source, str(repo).lower(), head_sha))
+
+    def rereview_watermark(self, repo):
+        with self._lock:
+            mark = self._watermarks.get(str(repo).lower())
+            return mark.run_id if mark else None
+
+    def set_rereview_watermark(self, *, repo, run_id, now):
+        check_watermark(repo, run_id)
+        with self._lock:
+            kept = self._watermarks.get(repo.lower())
+            if kept is None or run_id >= kept.run_id:  # equal: the walk finished at the same place again, and when is noted
+                self._watermarks[repo.lower()] = Watermark(kept.repo if kept else repo, run_id, now)
+
+    def rereview_watermarks(self):
+        with self._lock:
+            return sorted(self._watermarks.values(), key=lambda w: w.repo.lower())
+
+    def hold_pending_event(self, *, source, run_repo, run_id, doc, now):
+        event_row(doc, run_repo, run_id, now, source)  # only a valid event waits
+        with self._lock:
+            self._pending.setdefault((run_repo.lower(), run_id), PendingEvent(source, run_repo, run_id, dict(doc), now))
+
+    def pending_events(self):
+        with self._lock:
+            return sorted(self._pending.values(), key=lambda p: (p.run_repo.lower(), p.run_id))
+
+    def drop_pending_event(self, *, run_repo, run_id):
+        with self._lock:
+            self._pending.pop((run_repo.lower(), run_id), None)
+
+    def record_failed_run(self, *, repo, run_id, attempt, last_attempt_at, retention_days, now):
+        check_failed_run(repo, run_id, attempt, retention_days)
+        with self._lock:
+            key = (repo.lower(), run_id)
+            kept = self._failed.get(key)
+            self._failed[key] = FailedRun(kept.repo if kept else repo, run_id, attempt, last_attempt_at, retention_days,
+                                          kept.seen_at if kept else now, now)
+
+    def failed_runs(self, repo=None):
+        with self._lock:
+            return sorted((f for (r, _), f in self._failed.items() if repo is None or r == str(repo).lower()),
+                          key=lambda f: (f.repo.lower(), f.run_id))
+
+    def note_stuck_run(self, *, repo, run_id, now):
+        with self._lock:
+            key = (repo.lower(), run_id)
+            self._stuck[key] = self._stuck.get(key, 0) + 1
+            return self._stuck[key]
+
+    def stuck_runs(self, repo):
+        with self._lock:
+            return {run_id: n for (r, run_id), n in self._stuck.items() if r == str(repo).lower()}
+
+    def clear_stuck_run(self, *, repo, run_id):
+        with self._lock:
+            self._stuck.pop((repo.lower(), run_id), None)
+
+    def drop_failed_run(self, *, repo, run_id):
+        with self._lock:
+            self._failed.pop((repo.lower(), run_id), None)

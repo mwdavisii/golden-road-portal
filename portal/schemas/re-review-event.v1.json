@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/re-review-event.v1.json",
+  "title": "re-review-event/v1",
+  "description": "One assessed scorecard run's signals, for the portal's re-review list. Every string is code-written: trigger IDs, levels, the level engine's summaries, counts, versions, tier names and host:port values from builder-spec.json. It never carries refs, excerpts, justifications or finding text. A run that is not assessed writes none.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "pr", "head_sha", "tree_sha", "scorecard_version", "created", "level", "floor", "complete", "signals"],
+  "properties": {
+    "schema": {"const": "re-review-event/v1"},
+    "repo": {"type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "pr": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 999999999}, {"type": "null"}], "description": "null when the run had no pull request number"},
+    "head_sha": {"$ref": "scorecard.v1.json#/$defs/sha", "description": "the PR head commit (the merge commit's second parent)"},
+    "tree_sha": {"$ref": "scorecard.v1.json#/$defs/sha", "description": "the assessed merge tree, as in the scorecard"},
+    "scorecard_version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$", "description": "the builder release the scorecard ran from"},
+    "created": {"$ref": "finding.v2.json#/$defs/timestamp"},
+    "level": {"$ref": "scorecard.v1.json#/$defs/level"},
+    "floor": {"$ref": "scorecard.v1.json#/$defs/level"},
+    "complete": {"type": "boolean"},
+    "signals": {"type": "array", "maxItems": 40, "items": {"oneOf": [{"$ref": "#/$defs/trigger_signal"}, {"$ref": "#/$defs/recorded_signal"}]}}
+  },
+  "$defs": {
+    "summary": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$", "description": "one line: no control character (the portal stores and shows it)"},
+    "trigger_signal": {
+      "type": "object", "additionalProperties": false, "required": ["id", "kind", "level", "summary", "count"],
+      "properties": {
+        "id": {"$ref": "scorecard.v2.json#/$defs/trigger"},
+        "kind": {"const": "trigger"},
+        "level": {"$ref": "scorecard.v1.json#/$defs/level"},
+        "summary": {"$ref": "#/$defs/summary"},
+        "count": {"type": "integer", "minimum": 1, "description": "the true number of distinct items behind the trigger (the scorecard reason's total); the card lists at most 20 refs"}
+      }
+    },
+    "recorded_signal": {
+      "type": "object", "additionalProperties": false, "required": ["id", "kind", "summary"],
+      "properties": {
+        "id": {"enum": ["builder-bumped", "egress-removed", "resources-lowered"]},
+        "kind": {"const": "recorded"},
+        "summary": {"$ref": "#/$defs/summary"}
+      }
+    }
+  }
+}

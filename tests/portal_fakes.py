@@ -122,6 +122,7 @@ PERMISSION_RULES = (
     ("GET", rf"{REPO_PATH}", "metadata", "read"),
     ("GET", rf"{REPO_PATH}/(contents/.*|git/ref/.*|commits/[0-9a-f]{{40}})", "contents", "read"),
     ("GET", rf"{REPO_PATH}/git/blobs/[0-9a-f]{{40}}", "contents", "read"),
+    ("GET", rf"{REPO_PATH}/compare/.+", "contents", "read"),
     ("GET", rf"{REPO_PATH}/git/trees/[0-9a-f]{{40}}", "contents", "read"),
     ("PUT", rf"{REPO_PATH}/contents/.*", "contents", "write"),
     ("POST", rf"{REPO_PATH}/git/refs", "contents", "write"),
@@ -132,6 +133,10 @@ PERMISSION_RULES = (
     ("PUT", rf"{REPO_PATH}/pulls/\d+/merge", "contents", "write"),
     ("GET", rf"{REPO_PATH}/commits/[0-9a-f]{{40}}/check-runs", "checks", "read"),
     ("GET", rf"{REPO_PATH}/actions/runs", "actions", "read"),
+    ("GET", rf"{REPO_PATH}/actions/workflows/[^/]+/runs", "actions", "read"),
+    ("GET", rf"{REPO_PATH}/actions/runs/\d+/artifacts", "actions", "read"),
+    ("GET", rf"{REPO_PATH}/actions/runs/\d+", "actions", "read"),
+    ("GET", rf"{REPO_PATH}/actions/artifacts/\d+/zip", "actions", "read"),
     ("GET", rf"{REPO_PATH}/rulesets(/\d+)?", "administration", "read"),
 )
 
@@ -144,7 +149,7 @@ class FakeGitHub:
     def __init__(self, api_host="api.github.com", web_host="github.com", permissions=None):
         self.api_host, self.web_host = api_host, web_host
         self.hosts = {api_host, web_host}
-        self.routes, self.calls = {}, []
+        self.routes, self.calls, self.fallbacks = {}, [], []
         # the write installation's permissions (the recorded installation's, unless a test narrows them)
         self.permissions = dict(self.fixture("installation")["permissions"] if permissions is None else permissions)
 
@@ -160,6 +165,11 @@ class FakeGitHub:
         self.routes.setdefault((method, host or self.api_host, path), []).extend(answers)
         return self
 
+    def on_any(self, method, pattern, answer, host=None):
+        """One answer for every path that matches `pattern` (a regex) and has no answer of its own: a 404 for files a test doesn't name."""
+        self.fallbacks.append((method, host or self.api_host, re.compile(pattern), answer))
+        return self
+
     @staticmethod
     def fixture(name):
         return json.loads((FIXTURES / "github" / f"{name}.json").read_text())
@@ -172,7 +182,10 @@ class FakeGitHub:
             return httpx.Response(403, json={"message": "Resource not accessible by integration"})
         answers = self.routes.get(key)
         if not answers:
-            raise AssertionError(f"FakeGitHub has no answer for {request.method} {request.url}")
+            found = next((a for m, h, rx, a in self.fallbacks if (m, h) == key[:2] and rx.fullmatch(key[2])), None)
+            if found is None:
+                raise AssertionError(f"FakeGitHub has no answer for {request.method} {request.url}")
+            answers = [found]
         answer = answers.pop(0) if len(answers) > 1 else answers[0]
         if callable(answer):
             return answer(request)
@@ -183,21 +196,22 @@ class FakeGitHub:
         return [c for c in self.calls if c["method"] == method and c["path"] == path]
 
 
-def approved_request(store, people, now, repo="acme/notes"):
-    """A registration by owner, approved by admin with the record the web would build, claimed by the writer (state writing)."""
+def approved_request(store, people, now, repo="acme/notes", claim=True):
+    """A registration by owner, approved by admin with the record the web would build, claimed by the writer (state writing), or
+    left approved with claim=False."""
     from portal.registration import intake_record
     # the portal fixture already seeds a pending registration of acme/notes by owner: use it rather than open a second one
     req = next((r for r in store.requests_by(people["owner"].id) if r.repo == repo and r.state == "pending"), None) or store.create_registration(
         person_id=people["owner"].id, now=now, draft={"schema": "registration-draft/v1", "repo": repo,
                                                       "purpose": "Stores short team notes; no email, no files.",
-                                                      "data_classification": "internal", "proposed_tier": "low"})
+                                                      "data_classification": "public"})
     evidence = store.evidence_for(req.id, req.submission) or give_evidence(store, req, now=now)
-    final, errors = intake_record(req, approver_id=people["admin"].id, tier="moderate", classification="internal", review_by="2027-10-23",
+    final, errors = intake_record(req, approver_id=people["admin"].id, tier="moderate", classification="public", review_by="2027-10-23",
                                   justification="Purpose and classification checked.", now=now, evidence=evidence)
     assert not errors
     store.decide(request_id=req.id, actor_id=people["admin"].id, actor_groups=["golden-road-admins"], approve=True,
                  note=final["approval_justification"], final=final, now=now)
-    return store.claim_approved(now=now)
+    return store.claim_approved(now=now) if claim else store.get_request(req.id)
 
 
 def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None, environment="test", identity=True,
@@ -275,21 +289,47 @@ def seed(store, people, now):
     store.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, now), RepoAdmin("acme/tools", "owner-gh", 1001, now)], observed_at=now)
     request = store.create_registration(person_id=people["owner"].id, now=now, draft={
         "schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes; no email, no files.",
-        "data_classification": "internal", "proposed_tier": "low"})
-    give_evidence(store, request, now=now)  # the platform's evidence at the floor low/internal, so an admin can approve
+        "data_classification": "public"})
+    give_evidence(store, request, now=now)  # the platform's evidence at the floor low/public, so an admin can approve
     return {"link": link.id, "request": request.id, "owner": people["owner"].id}
 
 
 # The factory's config/registration.yaml as a dict (registration-rules/v1): what the floor tests and the collector tests use.
-RULES = {"schema": "registration-rules/v1", "no_spec": {"tier": "high", "data_classification": "restricted"},
-         "classification_tier": {"public": "low", "internal": "low", "restricted": "high", "phi": "high"},
+RULES = {"schema": "registration-rules/v1", "no_spec": {"tier": "high", "data_classification": "confidential"},
+         "classification_tier": {"public": "low", "confidential": "high", "protected": "high"},
          "raise_to": {"write_roles": "moderate", "secret_env": "moderate", "model_gateway_egress": "moderate",
                       "other_egress": "moderate", "many_dependencies": "moderate"},
          "many_dependencies_over": 50}
 
 
+def intake_trees(gh, repo, commit, records, *, root=(), owner_entries=None, truncated=False):
+    """The Git Trees API at `commit`, from the root tree down to each intake/<owner>/<name>.yaml in `records`: the root (with `root`'s
+    entries), intake/ and each owner's tree. Each route answers this, replacing any earlier answer. owner_entries adds entries to every
+    owner tree (a big directory); truncated marks the owner trees truncated, as GitHub does past its limit."""
+    owners = sorted({p.split("/")[1] for p in records})
+    intake_sha = git_sha(f"tree {repo} {commit} intake".encode())
+    entries = list(root) + ([{"path": "intake", "mode": "040000", "type": "tree", "sha": intake_sha}] if owners else [])
+    gh.routes[("GET", gh.api_host, f"/repos/{repo}/git/trees/{commit}")] = [(200, {"sha": commit, "truncated": False, "tree": entries})]
+    if not owners:
+        return gh
+    sha_of = {o: git_sha(f"tree {repo} {commit} intake/{o}".encode()) for o in owners}
+    gh.routes[("GET", gh.api_host, f"/repos/{repo}/git/trees/{intake_sha}")] = [(200, {"sha": intake_sha, "truncated": False, "tree": [
+        {"path": o, "mode": "040000", "type": "tree", "sha": sha_of[o]} for o in owners]})]
+    for o in owners:
+        names = [{"path": p.rsplit("/", 1)[1], "mode": "100644", "type": "blob", "sha": "b" * 40} for p in records if p.split("/")[1] == o]
+        gh.routes[("GET", gh.api_host, f"/repos/{repo}/git/trees/{sha_of[o]}")] = [
+            (200, {"sha": sha_of[o], "truncated": truncated, "tree": list(owner_entries or []) + names})]
+    return gh
+
+
+def git_sha(raw: bytes) -> str:
+    """The blob SHA git (and the contents API's "sha") gives these bytes."""
+    return hashlib.sha1(b"blob %d\0" % len(raw) + raw, usedforsecurity=False).hexdigest()
+
+
 # What the read installation is granted (the collector's App): Metadata and Contents, read only. A call needing more gets 403.
 READ_PERMISSIONS = {"metadata": "read", "contents": "read"}
+READ_WITH_ACTIONS = {**READ_PERMISSIONS, "actions": "read"}  # the read App from 0.5.1: it lists scorecard runs and downloads their artifacts
 KNOWN_FILES = ("builder-spec.json", ".builder.lock", "requirements.txt", "package-lock.json", "config/registration.yaml")
 
 
@@ -300,13 +340,15 @@ def repo_at(gh, repo, files, *, commit="a" * 40, branch="main", modes=None):
     gh.on("GET", f"/repos/{repo}/git/ref/heads/{branch}", (200, {"object": {"sha": commit}}))
     # the commit's root tree: each root file is a regular file unless `modes` says otherwise (120000 symlink, 160000 submodule)
     root = [{"path": p, "mode": (modes or {}).get(p, "100644"), "type": "blob", "sha": "b" * 40} for p in sorted(files) if "/" not in p]
-    gh.on("GET", f"/repos/{repo}/git/trees/{commit}", (200, {"sha": commit, "tree": root, "truncated": False}))
+    intake_trees(gh, repo, commit, [p for p in files if p.startswith("intake/")], root=root)  # the root tree, down to each named record
+    gh.on_any("GET", rf"/repos/{re.escape(repo)}/contents/intake/.+", (404, {"message": "Not Found"}))  # no intake record unless named
     for path in sorted(set(KNOWN_FILES) | set(files)):
         entry = files.get(path)
         if entry is None:
             answer = (404, {"message": "Not Found"})
         elif isinstance(entry, bytes):
-            answer = (200, {"type": "file", "encoding": "base64", "size": len(entry), "content": base64.b64encode(entry).decode()})
+            answer = (200, {"type": "file", "encoding": "base64", "size": len(entry), "content": base64.b64encode(entry).decode(),
+                            "sha": git_sha(entry)})
         elif isinstance(entry, int):
             answer = (entry, {"message": "status"})
         else:
@@ -317,14 +359,89 @@ def repo_at(gh, repo, files, *, commit="a" * 40, branch="main", modes=None):
 
 def evidence_doc(repo, commit="e" * 40, **changes):
     """A valid registration-evidence/v1 for `repo` with a spec, no signals and nothing noteworthy."""
-    doc = {"schema": "registration-evidence/v1", "repo": repo, "commit": commit, "spec_present": True, "data_classification": "internal",
+    doc = {"schema": "registration-evidence/v1", "repo": repo, "commit": commit, "spec_present": True, "data_classification": "public",
            "app_type": "python", "resources_tier": "default", "egress": [], "secret_env": [], "write_roles": [], "write_routes": 0,
            "builder_version": "0.3.10", "dependencies": {"count": 3, "lockfile_present": True, "lockfile": "requirements.txt"}, "signals": []}
     return {**doc, **changes}
 
 
-def give_evidence(store, request, *, floor_tier="low", floor_classification="internal", commit="e" * 40, now=T0, **changes):
-    """Record the collector's evidence for `request`'s current submission, as the collector would."""
+def give_evidence(store, request, *, floor_tier="low", floor_classification="public", commit="e" * 40, now=T0, record_sha=None, record=None,
+                  **changes):
+    """Record the collector's evidence for `request`'s current submission, as the collector would (with the record a change replaces)."""
     return store.add_evidence(request_id=request.id, submission=request.submission, commit=commit,
                               evidence=evidence_doc(request.repo, commit, **changes), floor_tier=floor_tier,
-                              floor_classification=floor_classification, rules_commit="f" * 40, now=now)
+                              floor_classification=floor_classification, rules_commit="f" * 40, now=now, record_sha=record_sha, record=record)
+
+
+def record_view(owner, **changes):
+    """The collector's view of a portal-written intake/v2 record of acme/tools (collectors.intake.parse_record's shape)."""
+    return {"schema": "intake/v2", "by_portal": True, "tier": "moderate", "data_classification": "public",
+            "purpose": "Builds internal tools; no PHI, no email.", "owner": owner, "review_by": "2026-11-15", **changes}
+
+
+def approved_change(store, people, now, *, record, record_sha="c" * 40, repo="acme/tools", tier="moderate", classification="public",
+                    purpose="Builds internal tools; no PHI, no email.", review_by="2027-10-23", requester="owner", claim=True):
+    """A change of `repo`'s registration (its evidence names `record`), approved by admin and claimed by the writer (state writing)."""
+    from portal.registration import intake_record
+    req = store.create_registration(person_id=people[requester].id, now=now, draft={
+        "schema": "registration-draft/v1", "repo": repo, "purpose": purpose, "data_classification": classification})
+    evidence = give_evidence(store, req, now=now, record_sha=record_sha, record=record)
+    final, errors = intake_record(req, approver_id=people["admin"].id, tier=tier, classification=classification, review_by=review_by,
+                                  justification="Change checked against the current record.", now=now, evidence=evidence)
+    assert not errors, errors
+    store.decide(request_id=req.id, actor_id=people["admin"].id, actor_groups=["golden-road-admins"], approve=True,
+                 note=final["approval_justification"], final=final, now=now)
+    return store.claim_approved(now=now) if claim else store.get_request(req.id)
+
+
+def factory_with_records(gh, records, *, commit="f" * 40, modes=None, org="acme"):
+    """The factory's default branch at `commit` holding intake records ({"acme/notes": bytes}): its root tree, the intake tree, each owner's
+    tree and each blob, as the git data API answers them. `modes` gives a record another mode (120000 is a symlink)."""
+    repo = f"{org}/scorecard-factory"
+    gh.on("GET", f"/repos/{repo}", (200, {"default_branch": "main"}))
+    gh.on("GET", f"/repos/{repo}/git/ref/heads/main", (200, {"object": {"sha": commit}}))
+    owners = sorted({name.split("/")[0] for name in records})
+    tree_sha = {o: git_sha(f"tree {o}".encode()) for o in owners}
+    gh.on("GET", f"/repos/{repo}/git/trees/{commit}", (200, {"sha": commit, "truncated": False, "tree": [
+        {"path": "config", "mode": "040000", "type": "tree", "sha": "0" * 40},
+        {"path": "intake", "mode": "040000", "type": "tree", "sha": "1" * 40}]}))
+    gh.on("GET", f"/repos/{repo}/git/trees/{'1' * 40}", (200, {"sha": "1" * 40, "truncated": False, "tree": [
+        {"path": o, "mode": "040000", "type": "tree", "sha": tree_sha[o]} for o in owners]}))
+    for o in owners:
+        entries = []
+        for name, raw in sorted(records.items()):
+            if name.split("/")[0] != o:
+                continue
+            sha = git_sha(raw)
+            entries.append({"path": name.split("/")[1] + ".yaml", "mode": (modes or {}).get(name, "100644"), "type": "blob", "sha": sha})
+            gh.on("GET", f"/repos/{repo}/git/blobs/{sha}", (200, {"sha": sha, "encoding": "base64", "size": len(raw),
+                                                                  "content": base64.b64encode(raw).decode()}))
+        gh.on("GET", f"/repos/{repo}/git/trees/{tree_sha[o]}", (200, {"sha": tree_sha[o], "truncated": False, "tree": entries}))
+    return gh
+
+
+class FakeStorage:
+    """Actions' artifact storage, behind GitHub's redirect: answers each stored blob by its path and logs every request with its headers."""
+
+    def __init__(self, host="results.storage.example.test"):
+        self.host, self.hosts, self.blobs, self.calls = host, {host}, {}, []
+
+    def put(self, name, data, status=200, headers=None) -> str:
+        self.blobs["/" + name] = (status, data, headers or {})
+        return f"https://{self.host}/{name}?sig=secret-sas-token"
+
+    def handle(self, request):
+        self.calls.append({"path": request.url.path, "headers": dict(request.headers)})
+        status, data, headers = self.blobs[request.url.path]
+        return httpx.Response(status, stream=httpx.ByteStream(data), headers=headers)  # streamed, as storage answers (iter_raw reads it)
+
+
+def zipped(entries) -> bytes:
+    """A zip held in memory: {name: bytes}."""
+    import io
+    import zipfile
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return out.getvalue()

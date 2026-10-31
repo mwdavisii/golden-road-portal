@@ -32,10 +32,10 @@ def branch_name(request_id: str) -> str:
     return f"portal/request-{request_id}"
 
 
-def title(request) -> str:
+def title(request, change=False) -> str:
     if request.kind == "binding":
         return f"Connections for {request.repo} ({request.final.get('environment')}) (portal request {request.id})"
-    return f"Register {request.repo} (portal request {request.id})"
+    return f"{'Change the registration of' if change else 'Register'} {request.repo} (portal request {request.id})"
 
 
 def fenced(text: str) -> str:
@@ -59,6 +59,31 @@ def _override_lines(f, approver) -> list[str]:
     if not override:
         return []
     return [f"- Approved below the floor by {_name(approver)} (`{override['by']}`):", fenced(override["reason"]), ""]
+
+
+MAX_CODE = 200  # a field in the PR body: GitHub refuses a body over 65536 characters
+
+
+def _code(value) -> str:
+    """A value from a record, in a code span: never markup, never a mention, and cut to MAX_CODE characters."""
+    text = ("none" if value is None else str(value)).replace("`", "'").replace("\r", " ").replace("\n", " ")
+    return "`" + (text[:MAX_CODE] + "…" if len(text) > MAX_CODE else text) + "`"
+
+
+CHANGED_FIELDS = (("schema", "Record"), ("tier", "Tier"), ("data_classification", "Data classification"), ("owner", "Owner"),
+                  ("review_by", "Review by"))
+
+
+def _change_lines(f, current) -> list[str]:
+    """What a change does to the record it replaces (spec 2026-10-31 C8): each field that moves, current → new; the purpose fenced."""
+    if current is None:
+        return []
+    if current.get("schema") == "invalid":
+        return ["Changes to the current record: it was not a valid intake record, and this replaces it whole.", ""]
+    lines = [f"- {label}: {_code(current.get(key))} → {_code(f.get(key))}" for key, label in CHANGED_FIELDS if current.get(key) != f.get(key)]
+    if current.get("purpose") != f["purpose"]:
+        lines += ["- Purpose, from:", fenced(current.get("purpose") or ""), "  to:", fenced(f["purpose"])]
+    return ["Changes to the current record:", *(lines or ["- none of its fields"]), ""]
 
 
 WRITER_MERGES = "Written by the golden road portal's writer. It merges once the required checks pass."
@@ -98,14 +123,17 @@ def _binding_body(request, requester, platform_user, writer_merges) -> str:
     ])
 
 
-def pr_body(request, requester, approver, target, platform_user=None) -> str:
+def pr_body(request, requester, approver, target, platform_user=None, current=None) -> str:
     """target: the request's allowlist.target_for, which says who merges (allowlist.writer_merges). platform_user: Secret Server's
-    platform account (the writer's secret_server.platform_user), named for a binding's secrets."""
+    platform account (the writer's secret_server.platform_user), named for a binding's secrets. current: for a change, the stored
+    view of the record it replaces (its evidence's record)."""
     if request.kind == "binding":
         return _binding_body(request, requester, platform_user, writer_merges(target))
     f = request.final
+    what = "change the registration of" if current is not None else "register"
     return "\n".join([
-        f"Portal request `{request.id}`: register `{request.repo}`.", "",
+        f"Portal request `{request.id}`: {what} `{request.repo}`.", "",
+        *_change_lines(f, current),
         f"- Requested by {_name(requester)} (`{request.requested_by}`)",
         f"- Approved by {_name(approver)} (`{request.decided_by}`) at {f['approved_at']}",
         f"- Tier `{f['tier']}`, data classification `{f['data_classification']}`, review by {f['review_by']}",

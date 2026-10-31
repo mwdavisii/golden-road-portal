@@ -161,3 +161,28 @@ def test_the_secret_process_link_must_be_https():
     assert name in Settings.check({**ENV, name: "https://user@wiki.example.test/page"})[1]
     s, problems = Settings.check({**ENV, name: "https://wiki.example.test/page?id=7"})
     assert problems == {} and s.secret_process_url == "https://wiki.example.test/page?id=7"
+
+
+def test_the_classification_policy_link_is_optional_and_https():
+    s, problems = Settings.check(ENV)
+    assert problems == {} and s.classification_policy_url == ""
+    s, problems = Settings.check({**ENV, "PORTAL_CLASSIFICATION_POLICY_URL": "https://policies.example.test/data?v=2"})
+    assert problems == {} and s.classification_policy_url == "https://policies.example.test/data?v=2"
+    s, problems = Settings.check({**ENV, "PORTAL_CLASSIFICATION_POLICY_URL": "https://policies.example.test/data#levels"})
+    assert problems == {} and s.classification_policy_url == "https://policies.example.test/data#levels"
+    for bad in ("http://policies.example.test/data", "https://user@policies.example.test/data", "policies.example.test",
+                "javascript:alert(1)", "https://policies.example.test/a b", "https://policies.example.test/a\nb",
+                'https://policies.example.test/"x', " https://policies.example.test/p", "https://policies.example.test/" + "a" * 2030):
+        s, problems = Settings.check({**ENV, "PORTAL_CLASSIFICATION_POLICY_URL": bad})
+        assert s is None and set(problems) == {"PORTAL_CLASSIFICATION_POLICY_URL"}, bad
+
+
+def test_the_rereview_stale_days_default_to_30_and_0_turns_the_flag_off():
+    s, problems = Settings.check(ENV)
+    assert problems == {} and s.rereview_stale_days == 30
+    for raw, days in (("", 30), ("0", 0), ("90", 90)):
+        s, problems = Settings.check({**ENV, "PORTAL_REREVIEW_STALE_DAYS": raw})
+        assert problems == {} and s.rereview_stale_days == days
+    for bad in ("-1", "a month", "36501"):
+        s, problems = Settings.check({**ENV, "PORTAL_REREVIEW_STALE_DAYS": bad})
+        assert s is None and set(problems) == {"PORTAL_REREVIEW_STALE_DAYS"} and bad not in problems["PORTAL_REREVIEW_STALE_DAYS"]

@@ -5,45 +5,34 @@ and the posted directory id goes through next_binding. Nothing in a form is trus
 Each environment (test, prod) has its own connections (spec 2026-10-29 GitOps deploy repo, G3 and G9): every route takes
 `environment` as a query (GET) or form (POST) value, test by default, and any other value is a 400.
 
-Delinea Secret Server secrets (spec 2026-10-29 Delinea secrets, "The portal"): the page searches as the person (their Secret Server
-user, through a GitHub link they verified with OAuth) and asks the platform's account whether each secret is shared with it. A
-submit is checked again by next_binding, whatever the form posts. No page, form or request ever carries a value."""
+Delinea Secret Server secrets (spec 2026-10-29 Delinea secrets, "The portal"; spec 2026-10-30 R7): the steps in routes_secrets.py
+search as the person (their Secret Server user, through a GitHub link they verified with OAuth) and ask the platform's account
+whether each secret is shared with it. The final POST here is checked again by next_binding, whatever the form posts, and the secret
+must be in the folder the steps chose. No page, form or request ever carries a value."""
 
-import dataclasses as dc
-import re
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Form, Query, Request
-from fastapi.responses import RedirectResponse
 
-from ..binding_record import ENVIRONMENTS, BindingRefused, environment_state, next_binding, secret_tokens
+from ..binding_record import ENVIRONMENTS, BindingRefused, SecretServerUnavailable, environment_state, next_binding, secret_tokens
 from ..bindings import effects
 from ..ids import new_id
 from ..secretserver import SecretServerError
-from ..store.base import Conflict
+from ..store.base import DATE_REASONS, Conflict
 from .access import ADMIN, APP_ADMIN
+from .flash import redirect
 from .render import page
+from .secret_steps import DIGITS, SECRET_SERVER_DOWN
 
 router = APIRouter()
 IN_PROGRESS = "A change to this app's connections is in progress. Wait for it to finish."
 NOT_REPO_ADMIN = "Only an admin of the repository, as the portal last saw it, can change its connections."
-SEARCH_MAX = 100  # characters of search text
-SHOWN_MAX = 20  # search results shown: one page of the search, never every page
-DIGITS = re.compile(r"[1-9][0-9]{0,9}")  # ASCII only: int() takes other scripts' digits
 NO_LINK = ("Link your GitHub account (verified) first: the portal finds your Secret Server user through it. An admin-made link "
            "is not enough; link it yourself from your page.")
 NO_SECRET_SERVER = "Secret Server is not set up here."
-SECRET_SERVER_DOWN = "Secret Server could not answer: try again."
-
-
-@dc.dataclass(frozen=True)
-class SecretResult:
-    id: int
-    name: str
-    folder: str
-    template_name: str
-    shared: bool
-    fields: tuple  # the template's non-file fields, only for a shared secret
+CONFIRM_FIRST = "Confirm the removal first: press Remove, then confirm it."
+NOTHING_TO_REMOVE = "There is nothing to remove."
+WRONG_FOLDER = "Choose the secret from its folder: start again from Add a secret."
 
 
 def binding_state(store, repo, environment):
@@ -80,80 +69,67 @@ def secret_user(request):
     return state.settings.secret_server.user_for(state.store.links_for(request.state.principal.person.id))
 
 
-def _parse_search(q, folder):
-    """(text, folder id or None, error or None) from the page's search query."""
-    if not isinstance(q, str) or len(q) > SEARCH_MAX:
-        return "", None, f"Search text is at most {SEARCH_MAX} characters."
-    if folder in ("", None):
-        return q, None, None
-    if not isinstance(folder, str) or not DIGITS.fullmatch(folder):
-        return q, None, "Choose a folder from the list."
-    return q, int(folder), None
+def confirmation(current, repo, what=None, secret=None) -> dict | None:
+    """The confirmation card for a removal the person asked for, or None when there is nothing to remove (spec 2026-10-30 R6)."""
+    current, base = current or {}, app_url(repo, "test").split("?", 1)[0]
+    if what == "azure-identity" and current.get("azure_identity"):
+        also = " It also removes the Databricks connection." if current.get("databricks") else ""
+        return {"title": "Remove the Azure identity?", "action": f"{base}/remove", "fields": [("what", "azure-identity")],
+                "text": "The app loses its Azure workload identity in this environment." + also}
+    if what == "databricks" and current.get("databricks"):
+        return {"title": "Remove the Databricks connection?", "action": f"{base}/remove", "fields": [("what", "databricks")],
+                "text": "The app loses its Databricks connection in this environment. The Azure identity stays."}
+    if secret is not None and any(s["env"] == secret for s in current.get("secrets") or []):
+        return {"title": f"Remove the secret {secret}?", "action": f"{base}/secrets/remove", "fields": [("env", secret)],
+                "text": f"The app no longer gets {secret} in this environment. The secret itself stays in Secret Server."}
+    return None
 
 
-def secrets_view(request, search):
-    """What the secrets section shows: {"secret_results", "folders", "secret_note", "searched", "secrets_truncated"}. Only the
-    repo's admin (the one who can add) gets folders and results. Secret Server is searched only when the person submitted a
-    search: `search` is (text, folder id), or None for none (a plain page load, an error re-render)."""
-    state = request.app.state
-    view = {"secret_results": [], "folders": {}, "secret_note": None, "searched": search is not None, "secrets_truncated": False}
-    if state.settings.secret_server is None or not request.state.app_repo_admin:
-        return view
-    user = secret_user(request)
-    if user is None:
-        return {**view, "secret_note": NO_LINK}
-    failure, results, more = None, [], False
-    try:
-        with secret_tokens(state.settings.secret_server, user) as (client, person_token, platform_token):
-            folders = client.folders(person_token)
-            if search is not None:
-                found, more = client.search_first(person_token, text=search[0], folder_id=search[1], take=SHOWN_MAX)
-                fields = {}
-                for s in found:
-                    shared = client.shared_with_platform(platform_token, s.id)
-                    if shared and s.template_id not in fields:
-                        fields[s.template_id] = tuple(client.template_fields(platform_token, s.template_id))
-                    results.append(SecretResult(s.id, s.name, folders.get(s.folder_id, str(s.folder_id)), s.template_name, shared,
-                                                fields[s.template_id] if shared else ()))
-    except SecretServerError:
-        failure = SECRET_SERVER_DOWN  # never the error's text
-    if failure:
-        return {**view, "secret_note": failure}
-    return {**view, "secret_results": results, "folders": folders, "secrets_truncated": more}
-
-
-def app_page(request, environment, status=200, errors=(), search=None):
+def app_page(request, environment, status=200, errors=(), confirm=None):
     state, repo = request.app.state, request.state.app_repo
     directory, org = state.settings.directory, state.settings.org
     current, open_one, failed, registration = binding_state(state.store, repo, environment)
     identity = (current or {}).get("azure_identity")
     owner_name, repo_name = repo.split("/")
     shown = open_one.final if open_one else current  # what composed.yaml gets: the pending binding once recorded, else the current
+    records = state.store.intake_observed(repo)  # the factory's record (spec 2026-10-31 R7): its open date reasons are the owner's banner
+    reviews = [i for i in state.store.rereview_items() if i.repo.lower() == repo.lower() and i.reason in DATE_REASONS]
     return page(request, "app.html", status, repo=repo, owner_name=owner_name, repo_name=repo_name, registration=registration, directory=directory,
+                record=records[0] if records else None, reviews=reviews,
                 environment=environment, environments=ENVIRONMENTS, current=current, open_request=open_one, failed=failed,
                 can_change=request.state.app_repo_admin,
                 principals=directory.principals_for(org, repo) if directory else [],
                 warehouses=directory.warehouses_for(identity["directory_id"]) if directory and identity else [],
                 effects=effects(shown), shown_secrets=sorted((shown or {}).get("secrets") or [], key=lambda s: s["env"]),
                 current_secrets=sorted((current or {}).get("secrets") or [], key=lambda s: s["env"]),
-                search_text=search[0] if search else "", search_folder=search[1] if search else None,
-                shown_max=SHOWN_MAX, errors=list(errors), **secrets_view(request, search))
+                errors=list(errors), confirm=confirm)
 
 
 @router.get("/apps/{owner}/{repo}")
-def show(request: Request, owner: str, repo: str, environment: str = Query("test"), q: str | None = Query(None),
-         folder: str | None = Query(None), principal=APP_ADMIN):
+def show(request: Request, owner: str, repo: str, environment: str = Query("test"), confirm: str | None = Query(None),
+         confirm_secret: str | None = Query(None), principal=APP_ADMIN):
     if environment not in ENVIRONMENTS:
         return _bad_environment(request)
-    if q is None and folder is None:  # no search submitted: Secret Server is not searched
-        return app_page(request, environment)
-    text, folder_id, problem = _parse_search("" if q is None else q, folder)
-    if problem:
-        return app_page(request, environment, 400, [problem])
-    return app_page(request, environment, search=(text, folder_id))
+    if confirm is not None or confirm_secret is not None:  # a removal asks first; only its confirming POST removes
+        if not request.state.app_repo_admin:
+            return app_page(request, environment, 403, [NOT_REPO_ADMIN])
+        current, open_one, _, _ = binding_state(request.app.state.store, request.state.app_repo, environment)
+        if open_one is not None:
+            return app_page(request, environment, 409, [IN_PROGRESS])
+        card = confirmation(current, request.state.app_repo, what=confirm, secret=confirm_secret)
+        if card is None:
+            return app_page(request, environment, 400, [NOTHING_TO_REMOVE])
+        return app_page(request, environment, confirm=card)
+    return app_page(request, environment)
 
 
-def _change(request, principal, environment, **choice):
+def person_folders(secret_server, user) -> dict:
+    """The folders the person can see in Secret Server now (the steps' Source). Raises SecretServerError."""
+    with secret_tokens(secret_server, user) as (client, person_token, _):
+        return client.folders(person_token)
+
+
+def _change(request, principal, environment, flash_key, confirmed=None, folder=None, **choice):
     # the path parameters are not used: request.state.app_repo is the checked, stored owner/name
     state, repo = request.app.state, request.state.app_repo
     secret_choice = "add_secret" in choice or "remove_secret" in choice
@@ -172,46 +148,61 @@ def _change(request, principal, environment, **choice):
         return app_page(request, environment, 400, [NO_SECRET_SERVER])
     if "add_secret" in choice:
         choice.update(secret_server=state.settings.secret_server, secret_user=secret_user(request))
+    if confirmed is not None and confirmed != "yes":  # a removal needs its confirming POST (spec 2026-10-30 R6)
+        return app_page(request, environment, 400, [CONFIRM_FIRST])
     try:
         final = next_binding(current=current, repo=repo, org=state.settings.org, directory=state.settings.directory,
                              person_id=principal.person.id, request_id=request_id, now=now, environment=environment, **choice)
+    except SecretServerUnavailable as exc:
+        return app_page(request, environment, 503, [str(exc)])
     except BindingRefused as exc:
         return app_page(request, environment, 400, [str(exc)])
+    if folder is not None:  # the secret must be the one picked in its folder (spec 2026-10-30 R7): every step re-checks the earlier ones
+        added = next(s for s in final["secrets"] if s["env"] == choice["add_secret"]["env"])
+        try:
+            visible = person_folders(state.settings.secret_server, choice["secret_user"])
+        except SecretServerError:
+            return app_page(request, environment, 503, [SECRET_SERVER_DOWN])
+        if added["folder_id"] != folder or folder not in visible:
+            return app_page(request, environment, 400, [WRONG_FOLDER])
     try:
         state.store.create_binding(request_id=request_id, person_id=principal.person.id, final=final, now=now, current=current)
     except Conflict as exc:
         if exc.code != "open_request_exists":  # request_exists, unknown_person: a bug, not a race the person can retry
             raise
         return app_page(request, environment, 409, [IN_PROGRESS])
-    return RedirectResponse(app_url(repo, environment), status_code=303)
+    return redirect(app_url(repo, environment), flash_key)
 
 
 @router.post("/apps/{owner}/{repo}/azure-identity")
 def link_identity(request: Request, owner: str, repo: str, principal_id: str = Form(""), principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
-    return _change(request, principal, environment, principal_id=principal_id)
+    return _change(request, principal, environment, "connection", principal_id=principal_id)
 
 
 @router.post("/apps/{owner}/{repo}/databricks")
 def link_databricks(request: Request, owner: str, repo: str, warehouse_id: str = Form(""), principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
-    return _change(request, principal, environment, warehouse_id=warehouse_id)
+    return _change(request, principal, environment, "connection", warehouse_id=warehouse_id)
 
 
 @router.post("/apps/{owner}/{repo}/remove")
-def remove(request: Request, owner: str, repo: str, what: str = Form(""), principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
-    return _change(request, principal, environment, remove=what)
+def remove(request: Request, owner: str, repo: str, what: str = Form(""), confirmed: str = Form(""), principal=APP_ADMIN,
+           environment: str = FORM_ENVIRONMENT):
+    return _change(request, principal, environment, "removal", confirmed=confirmed, remove=what)
 
 
 @router.post("/apps/{owner}/{repo}/secrets")
-def add_secret(request: Request, owner: str, repo: str, secret_id: str = Form(""), field_slug: str = Form(""), env: str = Form(""),
-               principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
-    # only the id, the field and the env name are taken from the form; next_binding asks Secret Server for the rest
+def add_secret(request: Request, owner: str, repo: str, folder: str = Form(""), secret_id: str = Form(""), field_slug: str = Form(""),
+               env: str = Form(""), principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
+    # only the folder, the id, the field and the env name are taken from the form; next_binding asks Secret Server for the rest
     sid = int(secret_id) if DIGITS.fullmatch(secret_id) else None
-    return _change(request, principal, environment, add_secret={"secret_id": sid, "field_slug": field_slug, "env": env})
+    fid = int(folder) if DIGITS.fullmatch(folder) else 0   # 0 is no folder: never a Secret Server id
+    return _change(request, principal, environment, "secret", folder=fid, add_secret={"secret_id": sid, "field_slug": field_slug, "env": env})
 
 
 @router.post("/apps/{owner}/{repo}/secrets/remove")
-def remove_secret(request: Request, owner: str, repo: str, env: str = Form(""), principal=APP_ADMIN, environment: str = FORM_ENVIRONMENT):
-    return _change(request, principal, environment, remove_secret=env)
+def remove_secret(request: Request, owner: str, repo: str, env: str = Form(""), confirmed: str = Form(""), principal=APP_ADMIN,
+                  environment: str = FORM_ENVIRONMENT):
+    return _change(request, principal, environment, "removal", confirmed=confirmed, remove_secret=env)
 
 
 @router.get("/admin/directory")

@@ -1,25 +1,29 @@
 {# The platform's evidence for a registration, beside what the person claimed. Everything printed here is escaped (autoescape is on):
    the evidence is repo data checked against patterns, or lines the collector wrote, but nothing here is trusted as HTML. The sentences
    for a waiting reason are written here, in the template, and chosen by code. #}
-{% macro evidence_view(evidence, problem, claim, effective, mismatch) %}
+{% from "_sha.html" import sha %}
+{% macro evidence_view(evidence, problem, claim, effective, mismatch, stale=false, admin=false) %}
 {% set reasons = {
   "rules_missing": "the factory has no config/registration.yaml on its default branch",
   "rules_invalid": "the factory's config/registration.yaml is not valid",
   "rules_unreadable": "the factory's config/registration.yaml can't be read",
-  "repo_unreadable": "the portal's read App can't read this repository"} %}
+  "repo_unreadable": "the portal's read App can't read this repository",
+  "record_unreadable": "the portal's read App can't read this repository's intake record in the factory, so a change can't be compared with it",
+  "record_case_mismatch": "the factory holds this repository's intake record under another spelling of its name too (GitHub's paths are case-sensitive): rename or remove the extra one in the factory"} %}
 {% if not evidence %}
 <p class="callout info">Waiting for the platform's evidence: the collector computes it on its next pass.</p>
 {% if problem %}<p class="error warn">{{ reasons.get(problem, "the evidence could not be computed") }}</p>{% endif %}
 {% else %}
 {% set ev = evidence.evidence %}
+{% if stale and admin %}<p class="error warn">This evidence names a retired classification level (computed before the three levels): send the request back, and the platform computes it again when it is submitted again.</p>
+{% elif stale %}<p class="error warn">This evidence names a retired classification level (computed before the three levels): an admin will send the request back, and the platform computes fresh evidence when you submit it again.</p>{% endif %}
 <div class="table-wrap">
 <table>
 <thead><tr><th></th><th>Claimed</th><th>Computed by the platform (floor)</th><th>Effective</th></tr></thead>
 <tbody>
-<tr{% if "tier" in mismatch %} class="mismatch"{% endif %}><th scope="row">Tier</th><td>{{ claim[0] or "not given" }}</td><td>{{ evidence.floor_tier }}</td>
-<td>{{ effective[0] }}{% if "tier" in mismatch %} <span class="badge state-sent_back">raised by the floor</span>{% endif %}</td></tr>
+<tr><th scope="row">Tier</th><td>not asked: an admin decides</td><td>{{ evidence.floor_tier }}</td><td>{% if not stale %}{{ effective[0] }}{% endif %}</td></tr>
 <tr{% if "data_classification" in mismatch %} class="mismatch"{% endif %}><th scope="row">Data classification</th><td>{{ claim[1] or "not given" }}</td><td>{{ evidence.floor_classification }}</td>
-<td>{{ effective[1] }}{% if "data_classification" in mismatch %} <span class="badge state-sent_back">raised by the floor</span>{% endif %}</td></tr>
+<td>{% if not stale %}{{ effective[1] }}{% endif %}{% if "data_classification" in mismatch %} <span class="badge state-sent_back">raised by the floor</span>{% endif %}</td></tr>
 </tbody>
 </table>
 </div>
@@ -30,7 +34,7 @@
 <p class="meta">Nothing in the repo raised the floor.</p>
 {% endif %}
 <dl class="facts">
-<div><dt>Commit</dt><dd class="mono">{{ evidence.commit }}</dd></div>
+<div><dt>Commit</dt><dd>{{ sha(evidence.commit) }}</dd></div>
 <div><dt>Spec present</dt><dd>{{ "yes" if ev.get("spec_present") else "no" }}</dd></div>
 <div><dt>App type</dt><dd>{{ ev.get("app_type") or "unknown" }}</dd></div>
 <div><dt>Resources tier</dt><dd>{{ ev.get("resources_tier") or "unknown" }}</dd></div>

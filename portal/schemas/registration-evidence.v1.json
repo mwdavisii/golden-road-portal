@@ -8,7 +8,7 @@
   "required": ["schema", "repo", "commit", "spec_present", "data_classification", "app_type", "resources_tier", "egress", "secret_env", "write_roles", "write_routes", "builder_version", "dependencies", "signals"],
   "$defs": {
     "single_line": {"not": {"pattern": "[\\r\\n]"}},
-    "classification": {"enum": ["public", "internal", "restricted", "phi"]}
+    "classification": {"enum": ["public", "confidential", "protected"]}
   },
   "properties": {
     "schema": {"const": "registration-evidence/v1"},

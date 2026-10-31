@@ -13,7 +13,6 @@
     "schema": {"const": "registration-draft/v1"},
     "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
     "purpose": {"type": "string", "maxLength": 4000},
-    "data_classification": {"enum": ["public", "internal", "restricted", "phi"]},
-    "proposed_tier": {"enum": ["low", "moderate", "high"]}
+    "data_classification": {"enum": ["public", "confidential", "protected"]}
   }
 }

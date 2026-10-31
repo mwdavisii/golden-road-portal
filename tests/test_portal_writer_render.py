@@ -31,7 +31,7 @@ def test_the_pr_carries_the_request_the_approver_and_the_justification(portal):
 def test_the_pr_body_names_the_evidence_commit_the_floor_and_any_override(portal):
     req = approved_request(portal.store, portal.people, T0)
     body = pr_body(req, portal.people["owner"], portal.people["admin"])
-    assert "- Evidence: commit `" + "e" * 40 + "`, floor tier `low`, classification `internal`" in body
+    assert "- Evidence: commit `" + "e" * 40 + "`, floor tier `low`, classification `public`" in body
     assert "Approved below the floor" not in body
     override = {"by": req.decided_by, "at": req.final["approved_at"], "reason": "``` @org/security <img src=x> ```` override"}
     body = pr_body(dc.replace(req, final={**req.final, "floor_override": override}), portal.people["owner"], portal.people["admin"])
@@ -112,3 +112,51 @@ def test_pr_body_has_no_default_for_who_merges(portal):
     import inspect
     assert "writer_merges" not in inspect.signature(_pr_body).parameters
     assert inspect.signature(_pr_body).parameters["target"].default is inspect.Parameter.empty
+
+
+def test_a_change_s_title_and_body_list_what_it_changes(portal):
+    from portal_fakes import approved_change, record_view
+    owner = portal.people["owner"].id
+    current = record_view("platform-team", schema="intake/v1", by_portal=False, tier="high", data_classification="confidential",
+                          purpose="A notes API.")
+    del current["review_by"]
+    req = approved_change(portal.store, portal.people, T0, record=current)
+    body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current=current)
+    assert title(req, change=True) == f"Change the registration of acme/tools (portal request {req.id})"
+    assert f"Portal request `{req.id}`: change the registration of `acme/tools`." in body
+    for line in ("- Record: `intake/v1` → `intake/v2`", "- Tier: `high` → `moderate`", "- Data classification: `confidential` → `public`",
+                 f"- Owner: `platform-team` → `{owner}`", "- Review by: `none` → `2027-10-23`"):
+        assert line in body, line
+    assert "- Purpose, from:\n```text\nA notes API.\n```\n  to:\n```text\nBuilds internal tools; no PHI, no email.\n```" in body
+
+
+def test_a_renewal_s_body_lists_only_the_review_date(portal):
+    from portal_fakes import approved_change, record_view
+    current = record_view(portal.people["owner"].id)
+    req = approved_change(portal.store, portal.people, T0, record=current)
+    body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current=current)
+    changes = body.split("Changes to the current record:\n", 1)[1].split("\n\n", 1)[0]
+    assert changes == "- Review by: `2026-11-15` → `2027-10-23`"
+
+
+def test_a_record_that_was_not_valid_is_said_to_be_replaced_whole(portal):
+    from portal_fakes import approved_change
+    req = approved_change(portal.store, portal.people, T0, record={"schema": "invalid"})
+    body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current={"schema": "invalid"})
+    assert "it was not a valid intake record, and this replaces it whole" in body
+
+
+def test_values_from_the_current_record_stay_in_code_spans(portal):
+    from portal_fakes import approved_change, record_view
+    current = record_view("`@acme/security` <b>x</b>\nnext")
+    req = approved_change(portal.store, portal.people, T0, record=current)
+    body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current=current)
+    assert "- Owner: `'@acme/security' <b>x</b> next` →" in body
+
+
+def test_a_value_too_long_for_a_pr_body_is_cut_in_its_code_span(portal):
+    from portal_fakes import approved_change, record_view
+    current = record_view("t" * 5000)
+    req = approved_change(portal.store, portal.people, T0, record=current)
+    body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current=current)
+    assert f"- Owner: `{'t' * 200}…` →" in body and "t" * 201 not in body

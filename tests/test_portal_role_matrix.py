@@ -43,6 +43,8 @@ ROUTES = {
     ("POST", "/admin/people/{person_id}/links"): admin_only(400, anonymous=401),
     ("POST", "/admin/links/{link_id}/remove"): admin_only(400, anonymous=401),
     ("GET", "/admin/approvals"): admin_only(),
+    ("GET", "/admin/rereview"): admin_only(),
+    ("POST", "/admin/rereview/{item_id}/close"): admin_only(400, anonymous=401),   # no note: 400 before the item is looked up
     ("POST", "/admin/requests/{request_id}/approve"): admin_only(400, anonymous=401),
     ("POST", "/admin/requests/{request_id}/send-back"): admin_only(400, anonymous=401),
     ("GET", "/admin/audit"): admin_only(),
@@ -50,6 +52,7 @@ ROUTES = {
     ("GET", "/admin/directory"): admin_only(),
     # the app page: the repo's admin (owner) and portal admins see it; only the repo's admin changes it (an empty choice is a 400)
     ("GET", "/apps/{owner}/{repo}"): {A: 303, O: 200, X: 404, P: 404, D: 200},
+    ("GET", "/apps/{owner}/{repo}/secrets/new"): {A: 303, O: 404, X: 404, P: 404, D: 404},   # 404 for everyone signed in: no Secret Server here
     ("POST", "/apps/{owner}/{repo}/azure-identity"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/databricks"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
@@ -59,7 +62,8 @@ ROUTES = {
 
 
 def fill(path, seeds):
-    return path.format(request_id=seeds["request"], person_id=seeds["owner"], link_id=seeds["link"], owner="acme", repo="notes")
+    return path.format(request_id=seeds["request"], person_id=seeds["owner"], link_id=seeds["link"], owner="acme", repo="notes",
+                       item_id="i_" + "0" * 32)
 
 
 def call(portal, who, method, path, headers=None):

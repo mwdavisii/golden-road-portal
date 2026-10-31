@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% from "_evidence.html" import evidence_view %}
+{% from "_change.html" import change_view %}
+{% from "_classification.html" import classification_cards with context %}
 {% set active = "approvals" %}
 {% block title %}Approvals - golden road{% endblock %}
 {% block main %}
@@ -12,7 +14,7 @@
 <section>
 <div class="card-head">
 <h2 class="repo">{{ r.repo }}</h2>
-<span class="badge state-{{ r.state }}">{{ r.state }}</span>
+<span><span class="badge state-{{ r.state }}">{{ STATE_LABELS.get(r.state, r.state) }}</span>{% if item.change %}<span class="tag">change</span>{% endif %}</span>
 </div>
 <p class="meta">Requested by {{ item.requester.display_name if item.requester else r.requested_by }}
 {% if item.links %}(GitHub:{% for link in item.links %} {{ link.github_login }} [{{ link.source }}{% if link.github_user_id is none %}, no GitHub user ID{% endif %}]{% endfor %}){% else %}(no GitHub login linked){% endif %}
@@ -21,35 +23,48 @@ on {{ r.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
 {% if item.admin_seen %}<p class="callout ok">Admin of {{ r.repo }} on GitHub, as the portal last saw it ({{ item.admin_seen.observed_at.strftime("%Y-%m-%d %H:%M") }} UTC).</p>
 {% elif item.stale_note %}<p class="error warn">{{ item.stale_note }} Approving will be refused until the collector has run again.</p>
 {% else %}<p class="error">The portal does not see the requester as an admin of {{ r.repo }}. Approving will be refused.</p>{% endif %}
+{{ change_view(item.change) }}
 <h3>Purpose</h3>
 <pre class="prose">{{ r.draft.get("purpose", "") }}</pre>
-{{ evidence_view(item.evidence, item.problem, item.claim, item.effective, item.mismatch) }}
+{{ evidence_view(item.evidence, item.problem, item.claim, item.effective, item.mismatch, stale=item.stale, admin=true) }}
 <div class="decision">
 {% if item.mine %}
 <p class="callout info">You requested this, so another admin must decide it.</p>
 {% else %}
 <h3>Decide</h3>
-<form method="post" action="/admin/requests/{{ r.id }}/approve">
+<form method="post" action="/admin/requests/{{ r.id }}/approve" class="decide"{% if item.evidence and not item.stale %} data-approval data-tiers="{{ tiers|join(' ') }}" data-classifications="{{ classifications|join(' ') }}" data-floor-tier="{{ item.evidence.floor_tier }}" data-floor-classification="{{ item.evidence.floor_classification }}"{% endif %}>
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
 <input type="hidden" name="submission" value="{{ r.submission }}">
-<div class="field-row">
-<p><label>Tier
-<select name="tier">{% for t in tiers %}<option value="{{ t }}"{% if item.effective[0] == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
-<p><label>Data classification
-<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if item.effective[1] == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
-<p><label>Review by <input type="date" name="review_by" value="{{ review_by }}" required></label></p>
+<fieldset class="choices">
+<legend>Tier</legend>
+<div class="choice-grid">
+{% for t in tiers %}<label class="choice"><input type="radio" name="tier" value="{{ t }}" required{% if item.effective[0] == t %} checked{% endif %}>
+<span class="choice-title">{{ t|capitalize }}{% if item.evidence and item.evidence.floor_tier == t %} <span class="tag">floor</span>{% endif %}</span></label>
+{% endfor %}
 </div>
-<p><label>Why this is right <span class="hint">(10 to 1000 characters, one line)</span><br>
-<input type="text" name="justification" size="80" required minlength="10" maxlength="1000"></label></p>
-<p><label>Reason to approve below the floor <span class="hint">(only when you choose a lower tier or classification than the floor; 30 to 1000 characters, one line)</span><br>
-<input type="text" name="floor_override_reason" size="80" maxlength="1000"></label></p>
-<p class="actions"><button type="submit"{% if not item.evidence %} disabled{% endif %}>Approve</button></p>
+</fieldset>
+{{ classification_cards(item.effective[1], item.evidence.floor_classification if item.evidence else none) }}
+<p class="field"><label for="review-{{ r.id }}">Review by</label>
+<input id="review-{{ r.id }}" type="date" name="review_by" value="{{ review_by }}" required></p>
+<p class="field"><label for="why-{{ r.id }}">Why this is right</label>
+<span class="hint">One line, 10 to 1000 characters. It goes into the record.</span>
+<input id="why-{{ r.id }}" type="text" name="justification" required minlength="10" maxlength="1000" data-counter="why-count-{{ r.id }}" data-min="10">
+<span class="counter" id="why-count-{{ r.id }}"></span></p>
+<div class="override" data-override>
+<p class="field"><label for="override-{{ r.id }}">Reason to approve below the floor</label>
+<span class="hint">Only when you choose a lower tier or classification than the floor: 30 to 1000 characters, one line. It goes into the record and the audit log.</span>
+<input id="override-{{ r.id }}" type="text" name="floor_override_reason" maxlength="1000" data-counter="override-count-{{ r.id }}" data-min="30">
+<span class="counter" id="override-count-{{ r.id }}"></span></p>
+</div>
+<p class="actions"><button type="submit" data-approve aria-describedby="approve-why-{{ r.id }}"{% if not item.evidence or item.stale %} disabled{% endif %}>Approve</button>
+<span class="hint" id="approve-why-{{ r.id }}" data-approve-why aria-live="polite">{% if not item.evidence %}Waiting for the platform's evidence.{% elif item.stale %}Send it back: the evidence names a retired level.{% endif %}</span></p>
 </form>
 <form class="send-back" method="post" action="/admin/requests/{{ r.id }}/send-back">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<label for="send-back-{{ r.id }}">What to change</label>
-<p class="inline-field"><input id="send-back-{{ r.id }}" type="text" name="justification" size="80" required minlength="10" maxlength="1000">
-<button class="secondary" type="submit">Send back</button></p>
+<p class="field"><label for="send-back-{{ r.id }}">What to change</label>
+<span class="hint">One line, 10 to 1000 characters. The requester sees it.</span>
+<input id="send-back-{{ r.id }}" type="text" name="justification" required minlength="10" maxlength="1000"></p>
+<p class="actions"><button class="secondary" type="submit">Send back</button></p>
 </form>
 {% endif %}
 </div>

@@ -48,3 +48,15 @@ def test_an_unexpected_status_is_a_github_error_without_github_s_text():
     with pytest.raises(GitHubError) as err:
         GitHub(API, httpx.Client(transport=transport(gh)), lambda: "ghs_x").call("GET", "/repos/acme/x")
     assert (err.value.status, err.value.method, err.value.path) == (500, "GET", "/repos/acme/x") and "boom" not in str(err.value)
+
+
+def test_an_installation_token_keeps_the_permissions_it_was_granted():
+    gh, key = FakeGitHub(), new_rsa_key()
+    expires = (dt.datetime(2026, 10, 31, 13, tzinfo=dt.UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gh.on("POST", "/app/installations/777/access_tokens", (201, {"token": "ghs_" + "a" * 36, "expires_at": expires,
+                                                                 "permissions": {"metadata": "read", "contents": "read", "actions": "read"}}))
+    tokens = InstallationToken(httpx.Client(transport=transport(gh)), API, 424242, pem(key), 777,
+                               clock=lambda: dt.datetime(2026, 10, 31, 12, tzinfo=dt.UTC).timestamp())
+    assert tokens.permissions == {}
+    tokens()
+    assert tokens.permissions == {"metadata": "read", "contents": "read", "actions": "read"}

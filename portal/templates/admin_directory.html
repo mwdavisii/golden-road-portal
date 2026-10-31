@@ -5,27 +5,34 @@
 <span class="eyebrow">Admin</span>
 <h1>Directory</h1>
 {% if directory %}
-<p>This is the mock directory: it stands in for what security's and analytics' processes produce. An app's page offers only the principals tagged for it and the warehouses granted to its principal.</p>
-<p>Tenant <span class="mono">{{ directory.tenant_id }}</span>, recorded in a binding as verified by <span class="mono">{{ directory.name }}</span>.</p>
-<section>
+<p class="lead">This is the mock directory: it stands in for what security's and analytics' processes produce. An app's page offers only the principals tagged for it and the warehouses granted to its principal.</p>
+<dl class="facts summary">
+<div><dt>Tenant</dt><dd class="mono">{{ directory.tenant_id }}</dd></div>
+<div><dt>Recorded as verified by</dt><dd class="mono">{{ directory.name }}</dd></div>
+</dl>
+<section class="card">
 <h2>Service principals</h2>
 {% if directory.principals %}
 <div class="table-wrap"><table>
-<tr><th>ID</th><th>Display name</th><th>Client ID</th><th>Tagged for</th></tr>
+<thead><tr><th scope="col">ID</th><th scope="col">Display name</th><th scope="col">Client ID</th><th scope="col">Tagged for</th></tr></thead>
+<tbody>
 {% for p in directory.principals %}<tr><td class="mono">{{ p.id }}</td><td>{{ p.display_name }}</td><td class="mono">{{ p.client_id }}</td><td class="mono">{{ org }}/{{ p.tagged_repo_name }}</td></tr>
 {% endfor %}
+</tbody>
 </table></div>
-{% else %}<p>None.</p>{% endif %}
+{% else %}<p class="empty">None.</p>{% endif %}
 </section>
-<section>
+<section class="card">
 <h2>SQL warehouses</h2>
 {% if directory.warehouses %}
 <div class="table-wrap"><table>
-<tr><th>ID</th><th>Display name</th><th>Host</th><th>HTTP path</th><th>Catalog</th><th>Schema</th><th>Granted to</th></tr>
+<thead><tr><th scope="col">ID</th><th scope="col">Display name</th><th scope="col">Host</th><th scope="col">HTTP path</th><th scope="col">Catalog</th><th scope="col">Schema</th><th scope="col">Granted to</th></tr></thead>
+<tbody>
 {% for w in directory.warehouses %}<tr><td class="mono">{{ w.id }}</td><td>{{ w.display_name }}</td><td class="mono">{{ w.host }}</td><td class="mono">{{ w.http_path }}</td><td class="mono">{{ w.catalog or "" }}</td><td class="mono">{{ w.schema or "" }}</td><td class="mono">{{ w.granted_to|join(", ") }}</td></tr>
 {% endfor %}
+</tbody>
 </table></div>
-{% else %}<p>None.</p>{% endif %}
+{% else %}<p class="empty">None.</p>{% endif %}
 </section>
 {% else %}
 <div class="empty"><p>The directory is off on this portal: PORTAL_DIRECTORY is not set, so apps have no connections to pick.</p></div>

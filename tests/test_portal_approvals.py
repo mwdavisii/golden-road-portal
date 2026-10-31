@@ -1,11 +1,11 @@
-from portal_fakes import T0
+from portal_fakes import T0, make_settings
 
 from portal.contracts import validate
 from portal.store.base import RepoAdmin
 
 
 def approve(portal, who="admin", **form):
-    data = {"csrf_token": portal.csrfs[who], "submission": "1", "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
+    data = {"csrf_token": portal.csrfs[who], "submission": "1", "tier": "moderate", "data_classification": "public", "review_by": "2027-10-23",
             "justification": "Purpose and classification checked.", **form}
     return portal.client(who).post(f"/admin/requests/{portal.seeds['request']}/approve", data=data)
 
@@ -20,7 +20,7 @@ def test_the_approval_page_escapes_the_purpose(portal):
     portal.store.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0), RepoAdmin("acme/evil", "owner-gh", 1001, T0)], observed_at=T0)
     portal.store.create_registration(person_id=portal.people["owner"].id, now=T0, draft={
         "schema": "registration-draft/v1", "repo": "acme/evil", "purpose": "<script>alert(1)</script> and more words",
-        "data_classification": "internal", "proposed_tier": "low"})
+        "data_classification": "public"})
     text = portal.client("admin").get("/admin/approvals").text
     assert "<script>alert(1)" not in text and "&lt;script&gt;alert(1)&lt;/script&gt;" in text
 
@@ -40,8 +40,8 @@ def test_a_requester_can_never_approve_their_own_request(portal):
     portal.store.add_link(person_id=admin.id, github_login="admin-gh", github_user_id=3003, source="admin", actor_id=portal.people["ops"].id,
                           reason="seeded for this test", now=T0)
     mine = portal.store.create_registration(person_id=admin.id, now=T0, draft={"schema": "registration-draft/v1", "repo": "acme/self",
-                                            "purpose": "An admin's own app.", "data_classification": "internal", "proposed_tier": "low"})
-    data = {"csrf_token": portal.csrfs["admin"], "tier": "low", "data_classification": "internal", "review_by": "2027-10-23",
+                                            "purpose": "An admin's own app.", "data_classification": "public"})
+    data = {"csrf_token": portal.csrfs["admin"], "tier": "low", "data_classification": "public", "review_by": "2027-10-23",
             "justification": "Approving my own request."}
     response = portal.client("admin").post(f"/admin/requests/{mine.id}/approve", data=data)
     assert response.status_code == 403 and portal.store.get_request(mine.id).state == "pending"
@@ -105,3 +105,38 @@ def test_a_registration_through_a_link_without_a_verified_user_id_is_shown_as_un
     page = portal.client("admin").get("/admin/approvals").text
     assert "Unverified" in page and "no GitHub user ID" in page
     assert approve(portal).status_code == 303, "shown as unverified, still the approver's call"
+
+
+def test_the_decision_offers_tier_and_classification_as_cards_with_the_floor_and_the_policy(portal):
+    portal.app.state.settings = make_settings(directory=portal.settings.directory, classification_policy_url="https://policies.example.test/d")
+    text = portal.client("admin").get("/admin/approvals").text
+    for tier in ("low", "moderate", "high"):
+        assert f'<input type="radio" name="tier" value="{tier}" required' in text
+    for level in ("public", "confidential", "protected"):
+        assert f'<input type="radio" name="data_classification" value="{level}" required' in text
+    assert '<a href="https://policies.example.test/d" target="_blank" rel="noopener noreferrer">Read the data classification policy</a>' in text
+    assert "staff and the groups that need it" in text and text.count('<span class="tag">floor</span>') == 2
+    assert 'data-approval data-tiers="low moderate high" data-classifications="public confidential protected"' in text
+    assert 'data-floor-tier="low" data-floor-classification="public"' in text   # the seeded evidence
+    assert 'src="/static/forms.js"' in text and "data-counter=" in text and "data-override" in text
+
+
+def test_without_evidence_approve_is_disabled_with_the_reason_and_no_script_hook(portal):
+    portal.store.create_registration(person_id=portal.people["owner"].id, now=T0, draft={
+        "schema": "registration-draft/v1", "repo": "acme/tools", "purpose": "Builds internal tools; no email.", "data_classification": "public"})
+    text = portal.client("admin").get("/admin/approvals").text
+    assert text.count("data-approval ") == 1   # only the seeded request, which has evidence
+    rid = next(r.id for r in portal.store.requests_in(("pending",)) if r.repo == "acme/tools")
+    assert f'<button type="submit" data-approve aria-describedby="approve-why-{rid}" disabled>Approve</button>' in text
+    assert f'<span class="hint" id="approve-why-{rid}" data-approve-why aria-live="polite">Waiting for the platform\'s evidence.</span>' in text
+
+
+def test_only_approve_s_reason_is_a_live_region(portal):
+    text = portal.client("admin").get("/admin/approvals").text
+    assert text.count('aria-live="polite"') == text.count("data-approve-why") and '<span class="counter"' in text
+    assert all("aria-live" not in span.split(">")[0] for span in text.split('<span class="counter"')[1:])
+
+
+def test_states_show_as_words(portal):
+    text = portal.client("admin").get("/admin/approvals").text
+    assert '<span class="badge state-pending">Pending</span>' in text and ">pending</span>" not in text

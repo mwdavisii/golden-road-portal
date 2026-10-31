@@ -1,45 +1,59 @@
 {% extends "base.html" %}
+{% from "_classification.html" import classification_cards with context %}
 {% set active = "register" %}
-{% block title %}Register an app - golden road{% endblock %}
+{% block title %}{% if change %}Change or renew the registration{% else %}Register an app{% endif %} - golden road{% endblock %}
 {% block head %}<script src="/static/register.js" defer></script>{% endblock %}
 {% block main %}
-<div class="narrow">
 <span class="eyebrow">Registration</span>
+{% if change %}
+<h1>Change or renew the registration</h1>
+<p class="lead">A change goes through the same review as a first registration: the platform computes the floor again, and an admin decides the tier, the classification and the next review date.</p>
+{% else %}
 <h1>Register an app</h1>
 <p class="lead">A registration says who owns an app, what it is for and how sensitive its data is. An admin reviews it before anything is recorded.</p>
-{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
+{% endif %}
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
 {% if not principal.signed_in %}
-<div class="empty"><p><a href="/login?next=/register">Sign in</a> to register an app. A draft in the link you opened is kept in this tab and filled in after you sign in.</p></div>
+<div class="empty"><p><a href="/login?next={{ back|urlencode }}">Sign in</a> to register an app. A draft in the link you opened is kept in this tab and filled in after you sign in.</p></div>
 {% elif not repos %}
 <div class="empty"><p>The portal sees no repository that you are an admin of. <a href="/link/github">Link your GitHub login</a> first, and give the portal a few minutes to see your repositories.</p></div>
 {% else %}
-<p id="draft-status" class="callout info" role="status"></p>
+<p id="draft-status" class="callout info" role="status" hidden></p>
+{% if change %}
+<section class="card" id="current-card" aria-labelledby="current-record" data-repo="{{ change.repo }}" data-prefilled="{{ 'true' if form.purpose == change.purpose and not change.problem else 'false' }}">
+<h2 id="current-record">The current registration of <span class="mono">{{ change.repo }}</span></h2>
+{% if change.problem == "case_mismatch" %}
+<p class="error warn">The factory holds this repository's record under two spellings of its name (GitHub's paths are case-sensitive). A request waits until the extra one is renamed or removed in the factory.</p>
+{% elif change.problem %}
+<p class="error warn">The factory's record for this repository can't be read ({{ change.problem }}). The admin sees that when deciding, and approving replaces it with a complete record.</p>
+{% else %}
+<dl class="facts summary">
+<div><dt>Record</dt><dd>{{ change.schema }}</dd></div>
+<div><dt>Tier</dt><dd>{{ change.tier }}</dd></div>
+<div><dt>Data classification</dt><dd>{{ change.data_classification }}</dd></div>
+<div><dt>Review by</dt><dd>{{ change.review_by.isoformat() if change.review_by else "none (registered outside the portal)" }}</dd></div>
+</dl>
+<p class="hint">To renew it, keep the purpose and the classification and submit: an admin approves it again and sets the next review date. To change it, edit them. Whoever submits becomes the owner once it is approved.</p>
+{% endif %}
+</section>
+{% endif %}
 <section class="form-card">
 <form id="register-form" method="post" action="/register">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<p><label>Repository
-<select name="repo" required>
+<p class="field"><label for="repo">Repository</label>
+<select id="repo" name="repo" class="mono" required>
 {% for r in repos %}<option value="{{ r.repo }}"{% if form.repo == r.repo %} selected{% endif %}>{{ r.repo }}</option>
 {% endfor %}
-</select></label></p>
-<p><label>What the app is for, and what it does not do<br>
-<textarea name="purpose" rows="6" cols="70" required minlength="10" maxlength="4000">{{ form.purpose }}</textarea></label></p>
-<div class="field-row">
-<p><label>Data classification
-<select name="data_classification" required>
-{% for c in classifications %}<option value="{{ c }}"{% if form.data_classification == c %} selected{% endif %}>{{ c }}</option>
-{% endfor %}
-</select></label></p>
-<p><label>Proposed tier
-<select name="proposed_tier" required>
-{% for t in tiers %}<option value="{{ t }}"{% if form.proposed_tier == t %} selected{% endif %}>{{ t }}</option>
-{% endfor %}
-</select></label>
-<span class="hint">The platform computes a minimum tier and classification from the repo; an admin decides.</span></p>
-</div>
-<p class="actions"><button type="submit">Submit for review</button></p>
+</select>
+<span class="hint">Only repositories you administer on GitHub appear here.</span></p>
+<p class="field"><label for="purpose">What the app is for, and what it does not do</label>
+<textarea id="purpose" name="purpose" rows="5" required minlength="10" maxlength="4000" data-counter="purpose-count" data-min="10">{{ form.purpose }}</textarea>
+<span class="hint">Say what it does and, just as important, what it does not do: the admin decides from this.</span>
+<span class="counter" id="purpose-count"></span></p>
+{{ classification_cards(form.data_classification) }}
+<p class="hint">The platform computes a minimum tier and classification from the repo; an admin decides.</p>
+<p class="actions"><button class="gold" type="submit">Submit for review</button></p>
 </form>
 </section>
 {% endif %}
-</div>
 {% endblock %}

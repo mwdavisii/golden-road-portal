@@ -1,48 +1,49 @@
 {% extends "base.html" %}
 {% set active = "start" %}
 {% block title %}Start here - golden road{% endblock %}
+{% block head %}<script src="/static/start.js" defer></script>{% endblock %}
 {% block main %}
-<div class="hero">
-<span class="eyebrow">Golden road</span>
+<span class="eyebrow">Getting started</span>
 <h1>Start here</h1>
 <p class="lead">The golden road packages an app so that it can be deployed, checked and reviewed the same way every time.</p>
-</div>
-
-<ol class="route">
-<li><section>
+<div class="progress" hidden><progress id="start-progress" value="0" max="3" aria-labelledby="start-progress-label"></progress><span id="start-progress-label">0 of 3 done</span></div>
+<ol class="steps">
+<li><span class="step-num" aria-hidden="true">1</span><div>
 <h2>Before you start</h2>
-<ul class="checklist">
-<li>You can read <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents"><code>{{ settings.org }}/golden-road-agents</code></a> on <code>{{ settings.github_host }}</code>. Open the link: if you see the repository, you're set. If not, ask the platform team for access.</li>
-<li>Install <code>uv</code>, the Python tool the skill uses to install the builder:
-<ul>
+<ul class="prereqs">
+<li><label for="pre-access"><input type="checkbox" id="pre-access" data-prereq><span class="prereq-title">You can read the golden-road-agents repository</span></label>
+<p class="prereq-body">Open <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents"><code>{{ settings.org }}/golden-road-agents</code></a> on <code>{{ settings.github_host }}</code>: if you see the repository, you're set. If not, ask the platform team for access.</p></li>
+<li><label for="pre-uv"><input type="checkbox" id="pre-uv" data-prereq><span class="prereq-title">Install <code>uv</code>, the Python tool the skill uses to install the builder</span></label>
+<div class="prereq-body"><ul>
 <li>macOS: <code>brew install uv</code></li>
 <li>Windows: <code>winget install --id=astral-sh.uv -e</code></li>
 <li>Linux, or macOS without Homebrew: <code>curl -LsSf https://astral.sh/uv/install.sh | sh</code></li>
 </ul>
-Then open a new terminal and check that <code>uv --version</code> prints a version. Other ways to install it are in
-<a href="https://docs.astral.sh/uv/getting-started/installation/">uv's installation guide</a>.</li>
-<li>Sign in to GitHub with <code>gh auth login --hostname {{ settings.github_host }}</code>.</li>
+<p>Then open a new terminal and check that <code>uv --version</code> prints a version. Other ways to install it are in
+<a href="https://docs.astral.sh/uv/getting-started/installation/">uv's installation guide</a>.</p></div></li>
+<li><label for="pre-gh"><input type="checkbox" id="pre-gh" data-prereq><span class="prereq-title">Sign in to GitHub</span></label>
+<p class="prereq-body">Run <code>gh auth login --hostname {{ settings.github_host }}</code>.</p></li>
 </ul>
-</section></li>
+</div></li>
 
-<li><section>
+<li><span class="step-num" aria-hidden="true">2</span><div>
 <h2>Paste this into your agent</h2>
-<p>Open your agent in the app's folder and paste:</p>
+<p class="meta">Open your agent in the app's folder, then paste.</p>
 <div class="terminal">
 <div class="terminal-bar">Prompt for your agent <button type="button" data-copy="paste-block">Copy</button></div>
 <pre id="paste-block">{% with org=settings.org, github_host=settings.github_host %}{% include "paste_block.txt" %}{% endwith %}</pre>
 </div>
-</section></li>
+</div></li>
 
-<li><section>
+<li><span class="step-num" aria-hidden="true">3</span><div>
 <h2>Starter files and versions</h2>
 <p>The starter files are in <a href="{{ settings.github_web }}/{{ settings.org }}/golden-road-agents/releases">the golden-road-agents releases</a>.
 The current versions show here once the portal reads those releases.</p>
-</section></li>
-
-<li><section>
-<h2>Register your app</h2>
-<p>When your app is packaged, <a href="/register">register it</a>. An admin reviews every registration.</p>
-</section></li>
+</div></li>
 </ol>
+
+<section class="card dark">
+<div><h2>Register your app</h2><p>When it is packaged, register it. An admin reviews every registration.</p></div>
+<a class="button gold" href="/register">Register an app</a>
+</section>
 {% endblock %}

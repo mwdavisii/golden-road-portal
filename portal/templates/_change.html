@@ -1,0 +1,28 @@
+{# A change of a registration (spec 2026-10-31 C4): the record it replaces, field by field, beside what the request proposes. Every value is
+   escaped (autoescape is on): the record is factory data the collector checked against intake/v1 or intake/v2. #}
+{% macro change_view(change) %}
+{% if change %}
+<section class="card" aria-label="The current registration">
+{% if change.invalid %}
+<h3>A change to the current registration</h3>
+<p class="error warn">The current record is not a valid intake record: approving replaces it with a complete intake/v2 record.</p>
+{% if change.scorecard %}<p class="meta">The record says <span class="mono">scorecard: {{ change.scorecard }}</span>, and the replacement keeps it.</p>{% endif %}
+{% else %}
+<h3>{% if change.renewal %}A renewal of the current registration{% else %}A change to the current registration{% endif %}</h3>
+<p class="meta">The current record is {{ change.kind }}.</p>
+{% if change.owner_changes %}<p class="callout warn">Owner changes from {{ change.owner_from }} to {{ change.owner_to }}.</p>{% endif %}
+<div class="table-wrap">
+<table>
+<thead><tr><th scope="col">Field</th><th scope="col">Current</th><th scope="col">Proposed</th></tr></thead>
+<tbody>
+{% for row in change.rows %}<tr{% if row.changed %} class="mismatch"{% endif %}><th scope="row">{{ row.label }}</th><td>{{ row.current }}</td><td>{{ row.proposed }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% if change.current_purpose is not none %}<h4>Current purpose</h4>
+<pre class="prose">{{ change.current_purpose }}</pre>{% endif %}
+{% endif %}
+</section>
+{% endif %}
+{% endmacro %}

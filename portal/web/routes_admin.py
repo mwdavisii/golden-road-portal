@@ -2,16 +2,17 @@ import datetime as dt
 import re
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 
 from ..auth.github_link import LOGIN
 from ..contracts import validate
-from ..registration import CLASSIFICATIONS, NO_EVIDENCE, TIERS, add_months, intake_record
+from ..registration import CLASSIFICATIONS, NO_EVIDENCE, STALE_EVIDENCE, TIERS, add_months, intake_record
 from ..store.base import Conflict
 from .access import ADMIN
+from .flash import redirect
 from .render import page
 from .ownership import fresh_admin_repos, stale_message
-from .routes_register import evidence_context
+from .routes_register import change_context, evidence_context
 
 router = APIRouter()
 
@@ -50,7 +51,7 @@ def add_link(request: Request, person_id: str, github_login: str = Form(""), rea
         status, message = {"not_found": (404, "No such person."), "self_link": (403, "You can't link a GitHub login to yourself: another admin must.")}.get(
             exc.code, (409, "That login is already linked to someone."))
         return people_page(request, status, [message])
-    return RedirectResponse("/admin/people", status_code=303)
+    return redirect("/admin/people", "link_added")
 
 
 @router.post("/admin/links/{link_id}/remove")
@@ -62,7 +63,7 @@ def remove_link(request: Request, link_id: str, reason: str = Form(""), principa
         request.app.state.store.remove_link(link_id=link_id, actor_id=principal.person.id, reason=reason, now=request.app.state.clock())
     except Conflict:
         return people_page(request, 404, ["No such link."])
-    return RedirectResponse("/admin/people", status_code=303)
+    return redirect("/admin/people", "link_removed")
 
 
 @router.get("/admin/audit")
@@ -87,11 +88,12 @@ def approvals_page(request, principal, status=200, errors=()):
     items = []
     for r in store.requests_in(("pending",)):
         fresh, stale = fresh_admin_repos(store, r.requested_by, request.app.state.clock(), settings.repo_admins_stale_after)
+        context = evidence_context(store, r)
         items.append({"request": r, "requester": store.get_person(r.requested_by), "links": store.links_for(r.requested_by),
                       "admin_seen": next((a for a in fresh if a.repo == r.repo), None),
                       "unverified": bool(store.links_for(r.requested_by)) and all(link.github_user_id is None for link in store.links_for(r.requested_by)),
                       "stale_note": stale_message(stale) if any(a.repo == r.repo for a in stale) and not any(a.repo == r.repo for a in fresh) else None,
-                      "mine": r.requested_by == principal.person.id, **evidence_context(store, r)})
+                      "mine": r.requested_by == principal.person.id, "change": change_context(store, r, context["evidence"]), **context})
     return page(request, "admin_approvals.html", status, items=items, errors=list(errors), tiers=TIERS, classifications=CLASSIFICATIONS,
                 review_by=add_months(today, settings.review_months).isoformat())
 
@@ -114,6 +116,7 @@ def _pending(request, principal, request_id):
 
 DECIDE_CONFLICT = {
     "no_evidence": NO_EVIDENCE,
+    "stale_evidence": STALE_EVIDENCE,
     "evidence_mismatch": "The platform's evidence changed under this approval: reload the page and decide again.",
     "below_floor": "That tier or data classification is below the platform's floor, and the reason to approve it anyway is missing or not valid.",
 }
@@ -139,7 +142,7 @@ def approve(request: Request, request_id: str, tier: str = Form(""), data_classi
                                    review_by=review_by, justification=justification, now=now,
                                    evidence=store.evidence_for(found.id, found.submission), override_reason=floor_override_reason)
     if errors:
-        return approvals_page(request, principal, 409 if errors == [NO_EVIDENCE] else 400, errors)
+        return approvals_page(request, principal, 409 if errors in ([NO_EVIDENCE], [STALE_EVIDENCE]) else 400, errors)
     found, refused = _pending(request, principal, request_id)
     if refused:
         return refused
@@ -153,7 +156,7 @@ def approve(request: Request, request_id: str, tier: str = Form(""), data_classi
                      note=record["approval_justification"], final=record, floor_override=record.get("floor_override"), now=now)
     except Conflict as exc:
         return approvals_page(request, principal, 409, [DECIDE_CONFLICT.get(exc.code, "That request was already decided.")])
-    return RedirectResponse("/admin/approvals", status_code=303)
+    return redirect("/admin/approvals", "approved")
 
 
 @router.post("/admin/requests/{request_id}/send-back")
@@ -169,4 +172,4 @@ def send_back(request: Request, request_id: str, justification: str = Form(""), 
                                        note=note, final=None, now=request.app.state.clock())
     except Conflict:
         return approvals_page(request, principal, 409, ["That request was already decided."])
-    return RedirectResponse("/admin/approvals", status_code=303)
+    return redirect("/admin/approvals", "sent_back")

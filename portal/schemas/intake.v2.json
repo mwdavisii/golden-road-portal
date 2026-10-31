@@ -16,7 +16,7 @@
     "tier": {"enum": ["low", "moderate", "high"]},
     "purpose": {"type": "string", "minLength": 10, "maxLength": 4000},
     "owner": {"$ref": "#/$defs/person"},
-    "data_classification": {"enum": ["public", "internal", "restricted", "phi"]},
+    "data_classification": {"enum": ["public", "confidential", "protected"]},
     "registered_by": {"$ref": "#/$defs/person"},
     "approved_by": {"$ref": "#/$defs/person"},
     "approved_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
@@ -26,7 +26,7 @@
     "scorecard": {"enum": ["per-app", "central"]},
     "evidence_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "floor_tier": {"enum": ["low", "moderate", "high"]},
-    "floor_classification": {"enum": ["public", "internal", "restricted", "phi"]},
+    "floor_classification": {"enum": ["public", "confidential", "protected"]},
     "floor_override": {
       "type": "object",
       "additionalProperties": false,

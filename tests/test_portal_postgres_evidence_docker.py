@@ -11,11 +11,13 @@ from portal_pg import pg_db, pg_server  # noqa: F401
 from psycopg import errors
 from psycopg.types.json import Jsonb
 
+from portal.store.base import Conflict
+
 pytestmark = pytest.mark.docker
 
 NOW = dt.datetime(2026, 10, 23, 12, tzinfo=dt.UTC)
 DRAFT = {"schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes.",
-         "data_classification": "internal", "proposed_tier": "low"}
+         "data_classification": "public"}
 COMMIT = "e" * 40
 EVIDENCE_SQL = ("INSERT INTO registration_evidence (request_id, submission, commit_sha, evidence, floor_tier, floor_classification, rules_commit, "
                 "computed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, now())")
@@ -40,12 +42,12 @@ def seed(pg_db, repo="acme/notes"):
         store.close()
 
 
-def evidence_row(ids, *, submission=1, commit=COMMIT, floor=("low", "internal"), evidence=None):
+def evidence_row(ids, *, submission=1, commit=COMMIT, floor=("low", "public"), evidence=None):
     doc = evidence_doc(ids["repo"], commit) if evidence is None else evidence
     return (ids["request"], submission, commit, Jsonb(doc), floor[0], floor[1], "f" * 40)
 
 
-def final_for(commit=COMMIT, floor=("low", "internal"), tier="moderate", classification="internal"):
+def final_for(commit=COMMIT, floor=("low", "public"), tier="moderate", classification="public"):
     return {"schema": "intake/v2", "tier": tier, "data_classification": classification, "approved_at": "2026-10-23T12:00:00Z",
             "evidence_commit": commit, "floor_tier": floor[0],
             "floor_classification": floor[1]}
@@ -64,11 +66,11 @@ def test_the_collector_inserts_evidence_and_problems_and_nothing_else_new(pg_db)
         conn.execute(EVIDENCE_SQL, evidence_row(ids))
         assert conn.execute("SELECT id, kind, repo, state, submission FROM request").fetchall() == [
             (ids["request"], "registration", "acme/notes", "pending", 1)]
-        for statement in ("SELECT draft FROM request", "SELECT * FROM request", "UPDATE request SET state = 'sent_back'",
-                          "INSERT INTO audit_log (at, actor_kind, action, subject_kind, subject_id, reason) VALUES (now(), 'system', 't', 'person', 'p_x', 'r')",
-                          "SELECT * FROM person"):
+        for statement in ("SELECT draft FROM request", "SELECT * FROM request", "UPDATE request SET state = 'sent_back'", "SELECT * FROM person"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
+        with pytest.raises(errors.RaiseException, match="re-review items"):  # since 0010 it may audit re-review items, and only those
+            conn.execute("INSERT INTO audit_log (at, actor_kind, action, subject_kind, subject_id, reason) VALUES (now(), 'system', 't', 'person', 'p_x', 'r')")
 
 
 @pytest.mark.parametrize("statement", ["UPDATE registration_evidence SET floor_tier = 'low'", "DELETE FROM registration_evidence",
@@ -115,7 +117,7 @@ def test_an_evidence_row_or_a_problem_row_never_both(pg_db):
     with as_role(pg_db, "portal_collector") as conn:
         with pytest.raises(errors.CheckViolation):
             conn.execute("INSERT INTO registration_evidence (request_id, submission, commit_sha, evidence, floor_tier, floor_classification, "
-                         "rules_commit, problem, computed_at) VALUES (%s, 1, %s, %s, 'low', 'internal', %s, 'rules_missing', now())",
+                         "rules_commit, problem, computed_at) VALUES (%s, 1, %s, %s, 'low', 'public', %s, 'rules_missing', now())",
                          (ids["request"], COMMIT, Jsonb(evidence_doc(ids["repo"], COMMIT)), "f" * 40))
         with pytest.raises(errors.CheckViolation):
             conn.execute("INSERT INTO registration_evidence (request_id, submission, computed_at) VALUES (%s, 1, now())", (ids["request"],))
@@ -214,7 +216,7 @@ def test_web_and_writer_read_evidence(pg_db):
 # ---- migration 0005: the database refuses an approval without evidence, or below the floor without the approver's override ----
 
 
-def evidenced(pg_db, floor=("low", "internal"), repo="acme/notes"):
+def evidenced(pg_db, floor=("low", "public"), repo="acme/notes"):
     ids = seed(pg_db, repo)
     with as_role(pg_db, "portal_collector") as conn:
         conn.execute(EVIDENCE_SQL, evidence_row(ids, floor=floor))
@@ -238,24 +240,24 @@ def test_an_approval_without_evidence_is_refused_by_the_database(pg_db):
 
 
 def test_an_approval_below_the_floor_without_an_override_is_refused_by_the_database(pg_db):
-    ids = evidenced(pg_db, floor=("high", "internal"))
+    ids = evidenced(pg_db, floor=("high", "public"))
     with pytest.raises(errors.RaiseException, match="below the floor needs the approver's override"):
-        approve_as_web(pg_db, ids, final_for(floor=("high", "internal"), tier="moderate"))
-    ids2 = evidenced(pg_db, floor=("low", "restricted"), repo="acme/two")
+        approve_as_web(pg_db, ids, final_for(floor=("high", "public"), tier="moderate"))
+    ids2 = evidenced(pg_db, floor=("low", "confidential"), repo="acme/two")
     with pytest.raises(errors.RaiseException, match="below the floor needs the approver's override"):
-        approve_as_web(pg_db, ids2, final_for(floor=("low", "restricted"), classification="internal"))
+        approve_as_web(pg_db, ids2, final_for(floor=("low", "confidential"), classification="public"))
 
 
 @pytest.mark.parametrize("who, reason", [("other", "The spec over-declares egress; checked with the team."), ("admin", "x" * 29)])
 def test_an_override_must_be_the_approver_s_with_30_characters(pg_db, who, reason):
-    ids = evidenced(pg_db, floor=("high", "internal"))
+    ids = evidenced(pg_db, floor=("high", "public"))
     override = an_override(ids["owner"] if who == "other" else ids["admin"], reason)
-    final = {**final_for(floor=("high", "internal"), tier="moderate"), "floor_override": override}
+    final = {**final_for(floor=("high", "public"), tier="moderate"), "floor_override": override}
     with pytest.raises(errors.RaiseException, match="override reason of at least 30"):
         approve_as_web(pg_db, ids, final, override)
 
 
-@pytest.mark.parametrize("change", [{"evidence_commit": "d" * 40}, {"floor_tier": "high"}, {"floor_classification": "phi"}])
+@pytest.mark.parametrize("change", [{"evidence_commit": "d" * 40}, {"floor_tier": "high"}, {"floor_classification": "protected"}])
 def test_the_record_must_carry_the_stored_evidence_commit_and_floor(pg_db, change):
     ids = evidenced(pg_db)
     with pytest.raises(errors.RaiseException, match="carries the stored evidence commit and floor"):
@@ -270,8 +272,8 @@ def test_an_override_above_the_floor_is_refused(pg_db):
 
 
 def test_the_record_and_the_request_carry_the_same_override(pg_db):
-    ids = evidenced(pg_db, floor=("high", "internal"))
-    base = final_for(floor=("high", "internal"), tier="moderate")
+    ids = evidenced(pg_db, floor=("high", "public"))
+    base = final_for(floor=("high", "public"), tier="moderate")
     one, two = an_override(ids["admin"]), an_override(ids["admin"], "A different reason that is long enough too.")
     for final, row in (({**base, "floor_override": one}, two), ({**base, "floor_override": one}, None), (base, one)):
         with pytest.raises(errors.RaiseException, match="same override"):
@@ -286,16 +288,66 @@ def test_an_approval_at_the_floor_with_evidence_is_accepted(pg_db):
 
 
 def test_an_approval_below_the_floor_with_the_approver_s_override_is_accepted(pg_db):
-    ids = evidenced(pg_db, floor=("high", "internal"))
+    ids = evidenced(pg_db, floor=("high", "public"))
     override = an_override(ids["admin"])
-    approve_as_web(pg_db, ids, {**final_for(floor=("high", "internal"), tier="moderate"), "floor_override": override}, override)
+    approve_as_web(pg_db, ids, {**final_for(floor=("high", "public"), tier="moderate"), "floor_override": override}, override)
     with as_role(pg_db, "portal_owner") as conn:
         assert conn.execute("SELECT floor_override->>'by' FROM request WHERE id = %s", (ids["request"],)).fetchone()[0] == ids["admin"]
 
 
 @pytest.mark.parametrize("change", [{"at": "2026-10-24T12:00:00Z"}, {"reason": "r" * 40 + "\nsecond line"}, {"reason": "r" * 1001}])
 def test_the_database_wants_the_approval_time_and_a_single_line_of_at_most_1000_characters(pg_db, change):
-    ids = evidenced(pg_db, floor=("high", "internal"))
+    ids = evidenced(pg_db, floor=("high", "public"))
     bad = {**an_override(ids["admin"]), **change}
     with pytest.raises(errors.RaiseException, match="approval time and a single line"):
-        approve_as_web(pg_db, ids, {**final_for(floor=("high", "internal"), tier="moderate"), "floor_override": bad}, bad)
+        approve_as_web(pg_db, ids, {**final_for(floor=("high", "public"), tier="moderate"), "floor_override": bad}, bad)
+
+
+def old_evidence(pg_db, ids):
+    """A row written before 0008: drop the check as the owner, insert, put the check back NOT VALID, as 0008 left it."""
+    with psycopg.connect(pg_db(), autocommit=True) as owner:
+        owner.execute("ALTER TABLE registration_evidence DROP CONSTRAINT registration_evidence_floor_classification_check")
+        owner.execute(EVIDENCE_SQL, evidence_row(ids, floor=("low", "internal")))
+        owner.execute("ALTER TABLE registration_evidence ADD CONSTRAINT registration_evidence_floor_classification_check "
+                      "CHECK (floor_classification IN ('public', 'confidential', 'protected')) NOT VALID")
+
+
+def test_0008_takes_only_the_three_levels_and_refuses_an_approval_on_old_evidence(pg_db):
+    ids = seed(pg_db)
+    with as_role(pg_db, "portal_collector") as conn:
+        with pytest.raises(errors.CheckViolation):
+            conn.execute(EVIDENCE_SQL, evidence_row(ids, floor=("low", "internal")))
+    old_evidence(pg_db, ids)
+    with as_role(pg_db, "portal_web") as conn:
+        sql, params = decide_sql(ids, final_for(floor=("low", "internal"), tier="low", classification="public"))
+        with pytest.raises(errors.RaiseException, match="retired classification level"):
+            conn.execute(sql, params)
+
+
+@pytest.mark.parametrize("app_checks", [True, False])
+def test_the_store_refuses_an_approval_on_old_evidence_as_stale_evidence(pg_db, monkeypatch, app_checks):
+    """check_approval says stale_evidence first; when it doesn't (False: the database alone), 0008's guard maps to the same code."""
+    from portal.store import postgres
+    ids = seed(pg_db)
+    old_evidence(pg_db, ids)
+    if not app_checks:
+        monkeypatch.setattr(postgres, "check_approval", lambda *args: None)
+    store = postgres.PostgresStore(pg_db("portal_web"))
+    try:
+        with pytest.raises(Conflict) as exc:
+            store.decide(request_id=ids["request"], actor_id=ids["admin"], actor_groups=["g"], approve=True, note="checked",
+                         final=final_for(floor=("low", "internal"), tier="low", classification="public"), now=NOW)
+        assert exc.value.code == "stale_evidence"
+        assert store.get_request(ids["request"]).state == "pending"
+    finally:
+        store.close()
+
+
+def test_0008_compares_against_the_three_levels(pg_db):
+    ids = seed(pg_db)
+    with as_role(pg_db, "portal_collector") as conn:
+        conn.execute(EVIDENCE_SQL, evidence_row(ids, floor=("low", "confidential")))
+    with as_role(pg_db, "portal_web") as conn:
+        sql, params = decide_sql(ids, final_for(floor=("low", "confidential"), tier="low", classification="public"))
+        with pytest.raises(errors.RaiseException, match="below the floor"):   # public is below confidential
+            conn.execute(sql, params)

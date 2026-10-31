@@ -15,7 +15,7 @@ from .render import page
 
 router = APIRouter()
 LOGIN_TTL = dt.timedelta(minutes=10)
-LOCAL_PATH = re.compile(r"/(?![/\\])[A-Za-z0-9._~!$&'()*+,;=:@/%-]{0,200}")
+LOCAL_PATH = re.compile(r"/(?![/\\])[A-Za-z0-9._~!$&'()*+,;=:@/%?-]{0,200}")  # a query too: /register?repo=owner/name
 
 
 def safe_next(value) -> str:

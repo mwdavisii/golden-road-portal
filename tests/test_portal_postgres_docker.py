@@ -93,10 +93,10 @@ def test_each_process_role_can_do_its_work_through_the_store(pg_db):
         req = web.create_registration(person_id=owner.id, draft={"schema": "registration-draft/v1", "repo": "acme/notes"}, now=now)
         assert [a.request_id for a in collector.awaiting_evidence()] == [req.id]
         collector.add_evidence(request_id=req.id, submission=1, commit="e" * 40, evidence=evidence_doc("acme/notes"), floor_tier="low",
-                               floor_classification="internal", rules_commit="f" * 40, now=now)
+                               floor_classification="public", rules_commit="f" * 40, now=now)
         assert collector.awaiting_evidence() == [] and web.evidence_for(req.id, 1).commit == "e" * 40
-        web.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final={"schema": "intake/v2", "tier": "moderate", "data_classification": "internal", "evidence_commit": "e" * 40,
-                                                                                      "floor_tier": "low", "floor_classification": "internal"}, now=now)
+        web.decide(request_id=req.id, actor_id=admin.id, actor_groups=["g"], approve=True, note="ok", final={"schema": "intake/v2", "tier": "moderate", "data_classification": "public", "evidence_commit": "e" * 40,
+                                                                                      "floor_tier": "low", "floor_classification": "public"}, now=now)
         assert writer.claim_approved(now=now).id == req.id
         writer.mark_pr_open(request_id=req.id, branch="b", pr_number=1, pr_url="u", head_sha="2" * 40, base_sha="1" * 40, now=now)
         writer.mark_merged(request_id=req.id, merge_sha="d" * 40, now=now)
@@ -128,13 +128,13 @@ import datetime as _dt  # noqa: E402
 
 NOW = _dt.datetime(2026, 10, 23, 12, tzinfo=_dt.UTC)
 COMMIT = "e" * 40
-FINAL = {"schema": "intake/v2", "tier": "moderate", "data_classification": "internal", "evidence_commit": COMMIT, "floor_tier": "low",
-         "floor_classification": "internal"}  # carries the evidence commit and floor that evidence_for() below stores
+FINAL = {"schema": "intake/v2", "tier": "moderate", "data_classification": "public", "evidence_commit": COMMIT, "floor_tier": "low",
+         "floor_classification": "public"}  # carries the evidence commit and floor that evidence_for() below stores
 
 
 def evidence_for_request(store, request_id, repo, now):
     store.add_evidence(request_id=request_id, submission=1, commit=COMMIT, evidence=evidence_doc(repo, COMMIT), floor_tier="low",
-                       floor_classification="internal", rules_commit="f" * 40, now=now)
+                       floor_classification="public", rules_commit="f" * 40, now=now)
 DRAFT = {"schema": "registration-draft/v1", "repo": "acme/notes"}
 
 
@@ -359,7 +359,7 @@ def test_0007_applies_to_a_database_migrated_through_0006_that_has_binding_rows(
     from portal import migrate
     from portal.store.postgres import PostgresStore
     every = migrate.migrations()
-    assert every[-1].stem == "0007_binding_environment"
+    assert "0007_binding_environment" in [p.stem for p in every]  # later migrations are applied by the other tests
     name = f"portal_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
         conn.execute(sql.Composed([sql.SQL("CREATE DATABASE "), sql.Identifier(name), sql.SQL(" OWNER portal_owner")]))
@@ -381,7 +381,7 @@ def test_0007_applies_to_a_database_migrated_through_0006_that_has_binding_rows(
             store.mark_pr_open(request_id=merged, branch="portal/request-" + merged, pr_number=1, pr_url="https://github.example/acme/x/pull/1",
                                head_sha="a" * 40, base_sha="b" * 40, now=NOW)
             store.mark_merged(request_id=merged, merge_sha="c" * 40, now=NOW)
-            monkeypatch.setattr(migrate, "migrations", lambda: every)
+            monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0007"])
             assert migrate.apply(dsn()) == ["0007_binding_environment"] and migrate.apply(dsn()) == []
             assert (store.get_request(merged).state, store.get_request(merged).final["schema"]) == ("merged", "binding/v1")
             assert store.get_request(still_open).state == "approved"
@@ -399,3 +399,38 @@ def test_0007_applies_to_a_database_migrated_through_0006_that_has_binding_rows(
 
 
 from portal.store.base import Conflict  # noqa: E402
+
+
+def test_0009_indexes_the_audit_log_by_subject(pg_db):
+    with psycopg.connect(pg_db(), autocommit=True) as conn:
+        [definition] = conn.execute("SELECT indexdef FROM pg_indexes WHERE tablename = 'audit_log' AND indexname = 'audit_log_subject'").fetchone()
+    assert definition.endswith("(subject_kind, subject_id, id)")
+
+
+def test_0009_applies_to_a_database_migrated_through_0008_that_has_audit_rows(pg_server, monkeypatch):
+    """The index builds over the rows already there, and audit_for reads them through it afterwards."""
+    import uuid
+    from portal import migrate
+    from portal.store.postgres import PostgresStore
+    every = migrate.migrations()
+    name = f"portal_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
+        conn.execute(sql.Composed([sql.SQL("CREATE DATABASE "), sql.Identifier(name), sql.SQL(" OWNER portal_owner")]))
+    dsn = lambda role="portal_owner": pg_server.dsn(role, name)  # noqa: E731
+    try:
+        monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0008"])
+        assert migrate.apply(dsn())[-1] == "0008_three_classification_levels"
+        store = PostgresStore(dsn())
+        try:
+            owner, _, _ = store.sign_in(issuer="i", subject="o", display_name="O", email=None, groups=[], roles=[], now=NOW,
+                                        max_age=_dt.timedelta(hours=8))
+            req = store.create_registration(person_id=owner.id, now=NOW, draft={
+                "schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes.", "data_classification": "public"})
+            monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0009"])
+            assert migrate.apply(dsn()) == ["0009_audit_log_subject_index"]
+            assert [e.action for e in store.audit_for("request", req.id)] == ["request.created"]
+        finally:
+            store.close()
+    finally:
+        with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
+            conn.execute(sql.Composed([sql.SQL("DROP DATABASE "), sql.Identifier(name), sql.SQL(" WITH (FORCE)")]))

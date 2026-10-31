@@ -9,7 +9,11 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ..ids import new_id
-from .base import LINK_SOURCES, PROBLEMS, AuditEntry, Awaiting, Conflict, Evidence, Link, LoginState, Person, RepoAdmin, Request, Session, check_approval, check_binding, token_hash
+from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, Conflict, Evidence, FailedRun,
+                   IntakeObserved, ItemEvent,
+                   Link, LoginState, Person, RepoAdmin, Request, RereviewEvent, RereviewItem, RereviewStatus, Session, check_approval,
+                   check_binding, check_failed_run, check_item, check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row,
+                   item_event, token_hash, PendingEvent, Watermark)
 
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason) "
          "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
@@ -33,7 +37,36 @@ def _request(r):
 
 def _evidence(r):
     return Evidence(r["request_id"], r["submission"], r["commit_sha"], r["evidence"], r["floor_tier"], r["floor_classification"], r["rules_commit"],
-                    r["computed_at"])
+                    r["computed_at"], r["record_sha"], r["record"])
+
+
+def _observed(r):
+    return IntakeObserved(r["repo"], r["blob_sha"], r["schema"], r["by_portal"], r["owner"], r["tier"], r["data_classification"], r["purpose"],
+                          r["review_by"], r["scorecard"], r["problem"], r["observed_at"])
+
+
+def _event(r):
+    return RereviewEvent(r["repo"], r["head_sha"], r["pr"], r["level"], r["floor"], r["complete"], r["created"], r["tree_sha"],
+                         r["scorecard_version"], tuple(r["signals"]), r["run_repo"], r["run_id"], r["observed_at"], r["source"])
+
+
+def _item(r, events=()):
+    return RereviewItem(r["id"], r["repo"], r["reason"], r["key"], r["opened_at"], r["closed_at"], r["close_kind"], r["closed_by"],
+                        r["close_note"], tuple(events))
+
+
+# What 0010's re-review triggers say, as the Conflict the store's own checks give: the triggers fire only when a check above them
+# raced a concurrent change, or a process role asked for what only the other may do.
+TRIGGER_CONFLICTS = (("owns the app", "own_app"), ("can't be read", "record_unreadable"), ("closed once", "closed"), ("joins only an open", "closed"),
+                     ("closes an item as a person", "wrong_role"), ("closes only a date item", "wrong_role"))
+ITEM_INDEXES = {"rereview_item_once": "item_exists", "rereview_item_one_open": "item_open"}
+
+
+def _trigger_conflict(exc) -> Conflict:
+    code = next((code for words, code in TRIGGER_CONFLICTS if words in str(exc)), None)
+    if code is None:
+        raise exc
+    return Conflict(code)
 
 
 def _json(value):
@@ -52,11 +85,21 @@ class PostgresStore:
     def _log(conn, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         conn.execute(AUDIT, (now, actor_kind, actor_id, action, subject_kind, subject_id, _json(before), _json(after), reason))
 
+    @staticmethod
+    def _audit_entry(r) -> AuditEntry:
+        return AuditEntry(r["at"], r["actor_kind"], r["actor_id"], r["action"], r["subject_kind"], r["subject_id"], r["before"], r["after"], r["reason"])
+
     def audit_entries(self, limit=200):
         with self.pool.connection() as conn:
             rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
-        return [AuditEntry(r["at"], r["actor_kind"], r["actor_id"], r["action"], r["subject_kind"], r["subject_id"], r["before"], r["after"], r["reason"])
-                for r in rows]
+        return [self._audit_entry(r) for r in rows]
+
+    def audit_for(self, subject_kind, subject_id):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason FROM audit_log "
+                                "WHERE subject_kind = %s AND subject_id = %s ORDER BY id",
+                                (subject_kind, subject_id)).fetchall()
+        return [self._audit_entry(r) for r in rows]
 
     # ---- people and sessions ----
 
@@ -286,8 +329,8 @@ class PostgresStore:
                                        "decision_note = %s, final = %s, floor_override = %s WHERE id = %s RETURNING *",
                                        (state, now, actor_id, now, list(actor_groups), note, _json(dict(final) if approve else None),
                                         _json(kept), request_id)).fetchone()
-            except errors.RaiseException:  # the database's own rule (migration 0005) saw what check_approval did not
-                raise Conflict("below_floor") from None
+            except errors.RaiseException as exc:  # the database's own rule (migrations 0005, 0008) saw what check_approval did not
+                raise Conflict("stale_evidence" if "retired classification level" in str(exc) else "below_floor") from None
             self._log(conn, now, "person", actor_id, f"request.{state}", "request", request_id, {"state": "pending"},
                       {"state": state, **({"final": dict(final)} if approve else {}), **({"floor_override": kept} if kept else {})}, note)
             return _request(row)
@@ -304,14 +347,17 @@ class PostgresStore:
                                 "AND p.problem IS NOT NULL), r.id LIMIT %s", (limit,)).fetchall()
         return [Awaiting(r["id"], r["repo"], r["submission"]) for r in rows]
 
-    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now):
+    def add_evidence(self, *, request_id, submission, commit, evidence, floor_tier, floor_classification, rules_commit, now,
+                     record_sha=None, record=None):
+        check_record(record_sha, record)
         with self.pool.connection() as conn:
             try:
                 with conn.transaction():
                     row = conn.execute("INSERT INTO registration_evidence (request_id, submission, commit_sha, evidence, floor_tier, "
-                                       "floor_classification, rules_commit, computed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                                       "floor_classification, rules_commit, computed_at, record_sha, record) "
+                                       "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
                                        (request_id, submission, commit, Jsonb(dict(evidence)), floor_tier, floor_classification, rules_commit,
-                                        now)).fetchone()
+                                        now, record_sha, _json(record))).fetchone()
             except errors.UniqueViolation:
                 raise Conflict("evidence_exists") from None
             except errors.RaiseException:
@@ -382,3 +428,276 @@ class PostgresStore:
             self._log(conn, now, "writer", None, "request.failed", "request", request_id, {"state": before},
                       {"state": "failed", "failure_reason": reason}, reason)
             return _request(row)
+
+    # ---- observed: the factory's intake records ----
+
+    def replace_intake_observed(self, rows, *, observed_at):
+        check_observed(rows)
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM intake_observed")
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO intake_observed (repo, blob_sha, schema, by_portal, owner, tier, data_classification, purpose, "
+                                "review_by, scorecard, problem, observed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                [(r.repo, r.blob_sha, r.schema, r.by_portal, r.owner, r.tier, r.data_classification, r.purpose, r.review_by,
+                                  r.scorecard, r.problem, observed_at) for r in rows])
+
+    def intake_observed(self, repo=None):
+        with self.pool.connection() as conn:
+            if repo is None:
+                rows = conn.execute("SELECT * FROM intake_observed ORDER BY lower(repo)").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM intake_observed WHERE lower(repo) = lower(%s)", (str(repo),)).fetchall()
+        return [_observed(r) for r in rows]
+
+    # ---- observed: scorecard runs and their events ----
+
+    def rereview_runs_seen(self, repo, run_ids):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT run_id FROM rereview_run WHERE lower(repo) = lower(%s) AND run_id = ANY(%s)",
+                                (repo, list(run_ids))).fetchall()
+        return {r["run_id"] for r in rows}
+
+    def record_rereview_run(self, *, repo, run_id, outcome, now):
+        if not REPO_NAME.fullmatch(repo or "") or outcome not in RUN_OUTCOMES or type(run_id) is not int or run_id < 1:
+            raise ValueError("a run names its repo and has a positive id and a known outcome")
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    conn.execute("INSERT INTO rereview_run (repo, run_id, outcome, seen_at) VALUES (%s, %s, %s, %s)", (repo, run_id, outcome, now))
+            except errors.UniqueViolation:
+                raise Conflict("run_seen") from None
+
+    def rereview_run_counts(self):
+        with self.pool.connection() as conn:
+            return {r["outcome"]: r["n"] for r in conn.execute("SELECT outcome, count(*) AS n FROM rereview_run GROUP BY outcome").fetchall()}
+
+    def add_rereview_event(self, *, doc, run_repo, run_id, now, source="central"):
+        event = event_row(doc, run_repo, run_id, now, source)
+        with self.pool.connection() as conn:
+            row = conn.execute("INSERT INTO rereview_event (source, repo, head_sha, pr, level, floor, complete, created, tree_sha, scorecard_version, "
+                               "signals, run_repo, run_id, observed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                               "ON CONFLICT DO NOTHING RETURNING *",
+                               (source, event.repo, event.head_sha, event.pr, event.level, event.floor, event.complete, event.created,
+                                event.tree_sha, event.scorecard_version, Jsonb(list(event.signals)), run_repo, run_id, now)).fetchone()
+        return _event(row) if row else None
+
+    # ---- the re-review list ----
+
+    @staticmethod
+    def _items(conn, rows):
+        """The item rows with their events, oldest first."""
+        ids = [r["id"] for r in rows]
+        joined = conn.execute("SELECT ie.item_id, ie.matched, ie.added_at, e.* FROM rereview_item_event ie JOIN rereview_event e "
+                              "ON e.source = ie.source AND e.repo = ie.repo AND e.head_sha = ie.head_sha WHERE ie.item_id = ANY(%s) "
+                              "ORDER BY ie.added_at, e.head_sha, e.source",
+                              (ids,)).fetchall() if ids else []
+        events = {}
+        for r in joined:
+            events.setdefault(r["item_id"], []).append(ItemEvent(_event(r), tuple(r["matched"]), r["added_at"]))
+        return [_item(r, events.get(r["id"], ())) for r in rows]
+
+    def rereview_items(self, *, open_only=True):
+        with self.pool.connection() as conn:
+            if open_only:
+                rows = conn.execute("SELECT * FROM rereview_item WHERE closed_at IS NULL ORDER BY opened_at, id").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM rereview_item ORDER BY opened_at, id").fetchall()
+            return self._items(conn, rows)
+
+    def _one_item(self, conn, item_id):
+        found = self._items(conn, conn.execute("SELECT * FROM rereview_item WHERE id = %s", (item_id,)).fetchall())
+        if not found:
+            raise Conflict("not_found")
+        return found[0]
+
+    def open_rereview_item(self, *, repo, reason, key, now, event=None):
+        check_item(repo, reason, key, event)
+        item_id = new_id("i")
+        with self.pool.connection() as conn:
+            if conn.execute("SELECT 1 FROM rereview_item WHERE lower(repo) = lower(%s) AND reason = %s AND key = %s", (repo, reason, key)).fetchone():
+                raise Conflict("item_exists")
+            if conn.execute("SELECT 1 FROM rereview_item WHERE lower(repo) = lower(%s) AND reason = %s AND closed_at IS NULL", (repo, reason)).fetchone():
+                raise Conflict("item_open")
+            stored, (head, matched, source) = None, item_event(event) if event is not None else (None, None, None)
+            if event is not None:
+                stored = conn.execute("SELECT repo FROM rereview_event WHERE source = %s AND lower(repo) = lower(%s) AND head_sha = %s",
+                                      (source, repo, head)).fetchone()
+                if stored is None:
+                    raise Conflict("no_event")
+            try:
+                with conn.transaction():
+                    conn.execute("INSERT INTO rereview_item (id, repo, reason, key, opened_at) VALUES (%s, %s, %s, %s, %s)", (item_id, repo, reason, key, now))
+                    if event is not None:
+                        conn.execute("INSERT INTO rereview_item_event (item_id, source, repo, head_sha, matched, added_at) "
+                                     "VALUES (%s, %s, %s, %s, %s, %s)", (item_id, source, stored["repo"], head, Jsonb(list(matched)), now))
+            except errors.UniqueViolation as exc:  # a concurrent pass got there first: say which rule it hit
+                raise Conflict(ITEM_INDEXES.get(exc.diag.constraint_name, "item_exists")) from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "system", None, "rereview_item.opened", "rereview_item", item_id, None,
+                      {"repo": repo, "reason": reason, "key": key}, f"the collector opened {reason} for {repo}")
+            return self._one_item(conn, item_id)
+
+    def add_rereview_item_event(self, *, item_id, head_sha, matched, now, source="central"):
+        check_matched(matched)
+        with self.pool.connection() as conn:
+            item = conn.execute("SELECT * FROM rereview_item WHERE id = %s FOR UPDATE", (item_id,)).fetchone()
+            if item is None:
+                raise Conflict("not_found")
+            if item["closed_at"] is not None:
+                raise Conflict("closed")
+            if item["reason"] != "scorecard_signal":
+                raise Conflict("wrong_reason")
+            stored = conn.execute("SELECT repo FROM rereview_event WHERE source = %s AND lower(repo) = lower(%s) AND head_sha = %s",
+                                  (source, item["repo"], head_sha)).fetchone()
+            if stored is None:
+                raise Conflict("no_event")
+            try:
+                with conn.transaction():
+                    conn.execute("INSERT INTO rereview_item_event (item_id, source, repo, head_sha, matched, added_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                                 (item_id, source, stored["repo"], head_sha, Jsonb(list(matched)), now))
+            except errors.UniqueViolation:
+                raise Conflict("event_exists") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "system", None, "rereview_item.event_added", "rereview_item", item_id, None,
+                      {"head_sha": head_sha, "source": source, "matched": list(matched)}, "a later scorecard event matched")
+            return self._one_item(conn, item_id)
+
+    def _close(self, item_id, now, kind, actor_id, note, events_seen=None):
+        with self.pool.connection() as conn:
+            item = conn.execute("SELECT * FROM rereview_item WHERE id = %s FOR UPDATE", (item_id,)).fetchone()
+            if item is None:
+                raise Conflict("not_found")
+            if kind == "auto" and item["reason"] not in DATE_REASONS:
+                raise Conflict("wrong_reason")  # before the state, as in MemoryStore
+            if item["closed_at"] is not None:
+                raise Conflict("closed")
+            if events_seen is not None and conn.execute("SELECT count(*) AS n FROM rereview_item_event WHERE item_id = %s",
+                                                        (item_id,)).fetchone()["n"] != events_seen:
+                raise Conflict("item_changed")  # a later event joined after the admin looked (the item's row lock holds it now)
+            if kind == "person" and not conn.execute("SELECT has_table_privilege('request', 'SELECT') AS ok").fetchone()["ok"]:
+                raise Conflict("wrong_role")  # only the web closes an item as a person (the collector can't read requests either)
+            if kind == "person" and conn.execute("SELECT 1 FROM intake_observed WHERE lower(repo) = lower(%s) AND problem IS NOT NULL",
+                                                 (item["repo"],)).fetchone():
+                raise Conflict("record_unreadable")  # who owns the app is not known
+            if kind == "person" and conn.execute(
+                    "SELECT 1 FROM intake_observed WHERE lower(repo) = lower(%(repo)s) AND owner = %(actor)s UNION ALL "
+                    "SELECT 1 FROM (SELECT requested_by FROM request WHERE kind = 'registration' AND lower(repo) = lower(%(repo)s) "
+                    "AND state IN ('approved', 'writing', 'pr_open', 'merged') ORDER BY created_at DESC, id DESC LIMIT 1) last "
+                    "WHERE last.requested_by = %(actor)s", {"repo": item["repo"], "actor": actor_id}).fetchone():
+                raise Conflict("own_app")  # the record's owner, or the requester of the app's last approved registration
+            try:
+                with conn.transaction():
+                    conn.execute("UPDATE rereview_item SET closed_at = %s, close_kind = %s, closed_by = %s, close_note = %s WHERE id = %s",
+                                 (now, kind, actor_id, note, item_id))
+            except errors.RaiseException as exc:  # e.g. the collector recorded the admin as the owner after the check above
+                raise _trigger_conflict(exc) from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("unknown_person") from None  # closed_by references person
+            self._log(conn, now, "person" if kind == "person" else "system", actor_id, "rereview_item.closed", "rereview_item", item_id,
+                      {"open": True}, {"open": False, "close_kind": kind}, note)
+            return self._one_item(conn, item_id)
+
+    def close_rereview_item(self, *, item_id, actor_id, note, now, events_seen):
+        check_note(note)
+        if actor_id is None:
+            raise Conflict("unknown_person")
+        return self._close(item_id, now, "person", actor_id, note, events_seen)
+
+    def auto_close_rereview_item(self, *, item_id, note, now):
+        check_note(note)
+        return self._close(item_id, now, "auto", None, note)
+
+    def set_rereview_status(self, *, source, problem, counts, now):
+        check_status(source, problem, counts)
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO rereview_source (source, problem, counts, checked_at) VALUES (%s, %s, %s, %s) ON CONFLICT (source) "
+                         "DO UPDATE SET problem = EXCLUDED.problem, counts = EXCLUDED.counts, checked_at = EXCLUDED.checked_at",
+                         (source, problem, Jsonb(dict(counts)), now))
+
+    def rereview_status(self):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM rereview_source").fetchall()
+        return {r["source"]: RereviewStatus(r["source"], r["problem"], r["counts"], r["checked_at"], r["last_ok_at"]) for r in rows}
+
+    def rereview_event(self, repo, head_sha, source="central"):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM rereview_event WHERE source = %s AND lower(repo) = lower(%s) AND head_sha = %s",
+                               (source, str(repo), head_sha)).fetchone()
+        return _event(row) if row else None
+
+    def rereview_watermark(self, repo):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT run_id FROM rereview_watermark WHERE lower(repo) = lower(%s)", (str(repo),)).fetchone()
+        return row["run_id"] if row else None
+
+    def set_rereview_watermark(self, *, repo, run_id, now):
+        check_watermark(repo, run_id)
+        with self.pool.connection() as conn:
+            found = conn.execute("SELECT repo, run_id FROM rereview_watermark WHERE lower(repo) = lower(%s) FOR UPDATE", (repo,)).fetchone()
+            if found is None:
+                conn.execute("INSERT INTO rereview_watermark (repo, run_id, updated_at) VALUES (%s, %s, %s)", (repo, run_id, now))
+            elif run_id >= found["run_id"]:  # equal: the walk finished at the same place again, and when is noted
+                conn.execute("UPDATE rereview_watermark SET run_id = %s, updated_at = %s WHERE repo = %s", (run_id, now, found["repo"]))
+
+    def record_failed_run(self, *, repo, run_id, attempt, last_attempt_at, retention_days, now):
+        check_failed_run(repo, run_id, attempt, retention_days)
+        with self.pool.connection() as conn:
+            found = conn.execute("SELECT repo FROM rereview_failed_run WHERE lower(repo) = lower(%s) AND run_id = %s FOR UPDATE",
+                                 (repo, run_id)).fetchone()
+            if found is None:
+                conn.execute("INSERT INTO rereview_failed_run (repo, run_id, attempt, last_attempt_at, retention_days, seen_at, checked_at) "
+                             "VALUES (%s, %s, %s, %s, %s, %s, %s)", (repo, run_id, attempt, last_attempt_at, retention_days, now, now))
+            else:
+                conn.execute("UPDATE rereview_failed_run SET attempt = %s, last_attempt_at = %s, retention_days = %s, checked_at = %s "
+                             "WHERE repo = %s AND run_id = %s", (attempt, last_attempt_at, retention_days, now, found["repo"], run_id))
+
+    def failed_runs(self, repo=None):
+        with self.pool.connection() as conn:
+            if repo is None:
+                rows = conn.execute("SELECT * FROM rereview_failed_run ORDER BY lower(repo), run_id").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM rereview_failed_run WHERE lower(repo) = lower(%s) ORDER BY run_id", (str(repo),)).fetchall()
+        return [FailedRun(r["repo"], r["run_id"], r["attempt"], r["last_attempt_at"], r["retention_days"], r["seen_at"], r["checked_at"])
+                for r in rows]
+
+    def note_stuck_run(self, *, repo, run_id, now):
+        with self.pool.connection() as conn:
+            row = conn.execute("INSERT INTO rereview_stuck_run (repo, run_id, passes, first_at) VALUES (%s, %s, 1, %s) "
+                               "ON CONFLICT (lower(repo), run_id) DO UPDATE SET passes = rereview_stuck_run.passes + 1 RETURNING passes",
+                               (repo, run_id, now)).fetchone()
+        return row["passes"]
+
+    def stuck_runs(self, repo):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT run_id, passes FROM rereview_stuck_run WHERE lower(repo) = lower(%s)", (str(repo),)).fetchall()
+        return {r["run_id"]: r["passes"] for r in rows}
+
+    def clear_stuck_run(self, *, repo, run_id):
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM rereview_stuck_run WHERE lower(repo) = lower(%s) AND run_id = %s", (repo, run_id))
+
+    def drop_failed_run(self, *, repo, run_id):
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM rereview_failed_run WHERE lower(repo) = lower(%s) AND run_id = %s", (repo, run_id))
+
+    def rereview_watermarks(self):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT repo, run_id, updated_at FROM rereview_watermark ORDER BY lower(repo)").fetchall()
+        return [Watermark(r["repo"], r["run_id"], r["updated_at"]) for r in rows]
+
+    def hold_pending_event(self, *, source, run_repo, run_id, doc, now):
+        event = event_row(doc, run_repo, run_id, now, source)  # only a valid event waits
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO rereview_pending_event (source, run_repo, run_id, repo, doc, seen_at) VALUES (%s, %s, %s, %s, %s, %s) "
+                         "ON CONFLICT DO NOTHING", (source, run_repo, run_id, event.repo, Jsonb(dict(doc)), now))
+
+    def pending_events(self):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM rereview_pending_event ORDER BY lower(run_repo), run_id").fetchall()
+        return [PendingEvent(r["source"], r["run_repo"], r["run_id"], r["doc"], r["seen_at"]) for r in rows]
+
+    def drop_pending_event(self, *, run_repo, run_id):
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM rereview_pending_event WHERE lower(run_repo) = lower(%s) AND run_id = %s", (run_repo, run_id))

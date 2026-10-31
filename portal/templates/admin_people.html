@@ -3,11 +3,11 @@
 {% block title %}People - golden road{% endblock %}
 {% block main %}
 <span class="eyebrow">Admin</span>
-<h1>People</h1>
-{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
-<p class="lead"><a href="/admin/identity-links.json">Export identity links (identity-link/v1)</a></p>
+<div class="card-head"><h1>People</h1><a class="button secondary" href="/admin/identity-links.json">Export identity links (identity-link/v1)</a></div>
+<p class="lead">Everyone who has signed in, and the GitHub logins linked to them. An admin links a login for someone else, never for themselves; every change is in the audit log.</p>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
 {% for person, links in people %}
-<section>
+<section class="card person">
 <div class="card-head">
 <h2>{{ person.display_name }}</h2>
 <span>{% for role in person.last_roles %}<span class="badge role">{{ role }}</span> {% endfor %}</span>
@@ -20,7 +20,8 @@
 <li><form method="post" action="/admin/links/{{ link.id }}/remove">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
 <span class="login">{{ link.github_login }} <span class="badge">{{ link.source }}</span></span>
-<input type="text" name="reason" placeholder="Why remove it (10 characters or more)" aria-label="Why remove {{ link.github_login }}" required minlength="10" maxlength="1000">
+<label class="visually-hidden" for="remove-{{ link.id }}">Why remove {{ link.github_login }}</label>
+<input id="remove-{{ link.id }}" type="text" name="reason" placeholder="Why remove it (10 characters or more)" required minlength="10" maxlength="1000">
 <button class="danger" type="submit">Remove</button>
 </form></li>
 {% endfor %}
@@ -30,9 +31,12 @@
 {% endif %}
 <form class="add-link" method="post" action="/admin/people/{{ person.id }}/links">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<input type="text" name="github_login" placeholder="GitHub login" aria-label="GitHub login" required maxlength="100">
-<input type="text" name="reason" placeholder="Why this login is theirs (10 characters or more)" aria-label="Why this login is theirs" required minlength="10" maxlength="1000">
-<button class="secondary" type="submit">Add link</button>
+<p class="field"><label for="login-{{ person.id }}">GitHub login</label>
+<input id="login-{{ person.id }}" class="mono" type="text" name="github_login" required maxlength="100"></p>
+<p class="field"><label for="why-{{ person.id }}">Why this login is theirs</label>
+<input id="why-{{ person.id }}" type="text" name="reason" required minlength="10" maxlength="1000">
+<span class="hint">One line, 10 to 1000 characters. It goes into the audit log.</span></p>
+<p class="actions"><button class="secondary" type="submit">Add link</button></p>
 </form>
 </section>
 {% endfor %}

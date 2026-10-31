@@ -5,10 +5,13 @@ against a pattern, or a line written here from a fixed template and filled only 
 import json
 import re
 
+from ..classification import LEVELS, RETIRED, retired_message, retired_values
 from ..contracts import validate
 from ..floor import compute_floor
 from ..github.client import GitHubError
 from ..store.base import Conflict
+from ..writer.allowlist import factory
+from .intake import RecordCaseMismatch, RecordUnreadable, current_record
 from .repo_files import UNREADABLE, Transient, head_commit, read_stored, tree_modes
 from .rules import RulesProblem, load_rules
 
@@ -45,27 +48,32 @@ def _json(raw):
 
 
 def _spec(gh, repo, commit, modes, signals):
+    """(the spec or None, the level a retired data_classification maps to or None)."""
     raw = read_stored(gh, repo, "builder-spec.json", commit, CAPS["builder-spec.json"], modes)
     if raw is None:
         signals.append(_signal("no_spec", "No builder-spec.json in the repository at this commit."))
-        return None
+        return None, None
     if raw is UNREADABLE:
         signals.append(_unreadable("builder-spec.json"))
-        return None
+        return None, None
     doc = _json(raw)
+    retired = retired_values(doc)
+    if retired:  # builder 0.5.0 (spec 2026-10-30 C4): name the replacement, and keep the level it maps to for the floor
+        signals.append(_signal("no_spec", f"builder-spec.json: {retired_message(retired[0])}."))
+        return None, max((RETIRED[v] for v in retired), key=LEVELS.index)
     if doc is UNREADABLE or validate("builder-spec.v1", doc):
         signals.append(_signal("no_spec", "builder-spec.json is not valid builder-spec/v1."))
-        return None
+        return None, None
     lists = [doc.get("egress", []), doc.get("env", []), (doc.get("authz") or {}).get("roles", []), (doc.get("authz") or {}).get("rules", [])]
     if any(len(items) > MAX_ITEMS for items in lists):
         signals.append(_unreadable("builder-spec.json"))
-        return None
+        return None, None
     authz = doc.get("authz") or {}
     copied = [e["name"] for e in doc["env"] if e.get("secret") is True] + [r["name"] for r in authz.get("roles", []) if r["access"] == "write"]
     if any(len(name) > MAX_NAME for name in copied):  # the evidence schema bounds the names it copies: a longer one is not a spec we accept
         signals.append(_signal("no_spec", "builder-spec.json is not valid builder-spec/v1."))
-        return None
-    return doc
+        return None, None
+    return doc, None
 
 
 def _count(name, doc_or_raw) -> int | None:
@@ -110,11 +118,11 @@ def _builder_version(gh, repo, commit, modes, signals):
 def compute_evidence(gh, repo, commit, *, gateway_hosts, many_dependencies_over) -> dict:
     signals: list[dict] = []
     modes = tree_modes(gh, repo, commit)
-    spec = _spec(gh, repo, commit, modes, signals)
+    spec, retired = _spec(gh, repo, commit, modes, signals)
     version = _builder_version(gh, repo, commit, modes, signals)
     dependencies = _dependencies(gh, repo, commit, modes, spec, signals)
     doc = {"schema": "registration-evidence/v1", "repo": repo, "commit": commit, "spec_present": spec is not None,
-           "data_classification": None, "app_type": None, "resources_tier": None, "egress": [], "secret_env": [], "write_roles": [],
+           "data_classification": retired, "app_type": None, "resources_tier": None, "egress": [], "secret_env": [], "write_roles": [],
            "write_routes": 0, "builder_version": version, "dependencies": dependencies, "signals": signals}
     if spec is not None:
         authz = spec.get("authz") or {}
@@ -146,7 +154,9 @@ def compute_evidence(gh, repo, commit, *, gateway_hosts, many_dependencies_over)
 def collect_evidence(gh, store, *, org, gateway_hosts, now) -> dict:
     """One pass: for each pending registration without evidence, read the factory's rules and the repo's default branch at one commit,
     compute the evidence and the floor, and store both. The store hands out only (request, repo, submission): never the draft.
-    A problem the portal can name is stored as a reason the request waits; a transient GitHub error stores nothing (next pass retries)."""
+    For a repo that already has an intake record (a change), the record's blob SHA and view, read at the rules commit, are stored with
+    the evidence. A problem the portal can name is stored as a reason the request waits; a transient GitHub error stores nothing (next
+    pass retries)."""
     waiting = store.awaiting_evidence()
     if not waiting:
         return {"computed": 0, "waiting": 0}
@@ -170,6 +180,11 @@ def collect_evidence(gh, store, *, org, gateway_hosts, now) -> dict:
         try:
             commit = head_commit(gh, request.repo)
             doc = compute_evidence(gh, request.repo, commit, gateway_hosts=gateway_hosts, many_dependencies_over=rules["many_dependencies_over"])
+            record_sha, record = current_record(gh, factory(org), request.repo, rules_commit)  # a change, or (None, None)
+        except (RecordUnreadable, RecordCaseMismatch) as exc:
+            problem = "record_case_mismatch" if isinstance(exc, RecordCaseMismatch) else "record_unreadable"
+            note(request, problem)
+            continue
         except Transient:
             transient = True
             continue
@@ -187,7 +202,8 @@ def collect_evidence(gh, store, *, org, gateway_hosts, now) -> dict:
         floor_tier, floor_classification = compute_floor(doc, rules)
         try:
             store.add_evidence(request_id=request.request_id, submission=request.submission, commit=commit, evidence=doc,
-                               floor_tier=floor_tier, floor_classification=floor_classification, rules_commit=rules_commit, now=now)
+                               floor_tier=floor_tier, floor_classification=floor_classification, rules_commit=rules_commit, now=now,
+                               record_sha=record_sha, record=record)
             computed += 1
         except Conflict:
             continue  # evidence_exists or not_awaiting: another pass or a decision got there first

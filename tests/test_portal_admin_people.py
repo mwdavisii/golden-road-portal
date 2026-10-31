@@ -1,3 +1,5 @@
+import pytest
+
 from portal.contracts import validate
 
 
@@ -77,3 +79,49 @@ def test_a_login_with_two_user_ids_in_the_observation_gets_none(portal):
     person = portal.people["other"].id
     assert post(portal, f"/admin/people/{person}/links", github_login="dup-gh", reason="confirmed by the team lead").status_code == 303
     assert portal.store.links_for(person)[0].github_user_id is None
+
+
+# ---- the reskin (spec 2026-10-30 R1): cards, real labels, alerts, toasts ----
+
+def test_the_people_page_is_cards_with_labelled_fields(portal):
+    text = portal.client("admin").get("/admin/people").text
+    assert text.count('<section class="card person">') == len(portal.store.list_people())
+    link = portal.seeds["link"]
+    assert f'<label class="visually-hidden" for="remove-{link}">Why remove owner-gh</label>' in text
+    assert '<ul class="link-list">' in text and '<form class="add-link"' in text and "No GitHub login linked." in text
+    for person in portal.store.list_people():
+        assert f'<label for="login-{person.id}">GitHub login</label>' in text and f'<label for="why-{person.id}">' in text
+
+
+def test_a_refused_link_is_an_alert_and_a_done_one_a_toast(portal):
+    response = post(portal, f"/admin/people/{portal.people['other'].id}/links", github_login="other-gh", reason="short")
+    assert '<p class="error" role="alert">Give a reason of 10 to 1000 characters on one line.</p>' in response.text
+    client = portal.client("admin")
+    added = client.post(f"/admin/people/{portal.people['other'].id}/links",
+                        data={"csrf_token": portal.csrfs["admin"], "github_login": "other-gh", "reason": "confirmed by the team lead"})
+    assert added.status_code == 303 and '<p class="toast" role="status">GitHub login linked</p>' in client.get("/admin/people").text
+    removed = client.post(f"/admin/links/{portal.seeds['link']}/remove", data={"csrf_token": portal.csrfs["admin"], "reason": "linked to the wrong person"})
+    assert removed.status_code == 303 and '<p class="toast" role="status">GitHub login unlinked</p>' in client.get("/admin/people").text
+
+
+@pytest.mark.parametrize("path", ["/admin/audit", "/admin/directory"])
+def test_the_admin_tables_have_headers_with_scope(portal, path):
+    text = portal.client("admin").get(path).text
+    assert "<thead><tr>" in text and '<th scope="col">' in text and "<tr><th>" not in text
+
+
+def test_the_audit_log_rows_are_compact_with_the_details_folded(portal):
+    post(portal, f"/admin/people/{portal.people['other'].id}/links", github_login="other-gh", reason="confirmed by the team lead")
+    text = portal.client("admin").get("/admin/audit").text
+    table = text[text.index('<table class="audit">'):text.index("</table>")]
+    assert '<colgroup><col class="when"><col class="who"><col class="action"><col class="subject"><col class="details"></colgroup>' in table
+    rows = table.split("<tbody>")[1].split("</tr>")[:-1]
+    assert rows and all(row.count("<details>") == 1 for row in rows)
+    for row in rows:   # before, after and the reason sit inside the fold, never in a cell of their own
+        assert "&#34;" not in row.split("<details>")[0] and "{" not in row.split("<details>")[0]
+    assert "<summary>confirmed by the team lead</summary>" in table and '<pre class="json">' in table
+
+
+def test_an_audit_action_breaks_only_after_its_dots(portal):
+    text = portal.client("admin").get("/admin/audit").text
+    assert "<code>identity_link.<wbr>created</code>" in text or "<code>request.<wbr>created</code>" in text

@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% from "_sha.html" import sha %}
+{% set active = "rereview" %}
+{% block title %}Re-review - golden road{% endblock %}
+{% block main %}
+<span class="eyebrow">Admin</span>
+<h1>Re-review</h1>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+<p class="lead">{{ items|length }} open{% if stale_days %}, {{ stale_count }} open more than {{ stale_days }} days{% endif %}.</p>
+{% set events_source = sources.get("events") %}{% set intake_source = sources.get("intake") %}
+{% if events_source and events_source.problem == "actions_unreadable" %}<p class="error warn">actions_unreadable: the read App can't read Actions, so scorecard signals are not collected. Give it Actions: read (the portal README, "GitHub Apps").</p>{% endif %}
+{% if intake_source and intake_source.problem == "factory_unreadable" %}<p class="error warn">factory_unreadable: the read App can't read the factory, so the review dates are the ones it read last.</p>{% endif %}
+{% if events_source and events_source.problem == "factory_unreadable" %}<p class="error warn">factory_unreadable: the read App can't read the factory, so central scorecard runs are not collected.</p>{% endif %}
+{% if events_source and events_source.problem == "artifact_host_refused" %}<p class="error warn">artifact_host_refused: GitHub redirects scorecard artifact downloads to a host the collector won't fetch from, so no scorecard event is read until it is allowed: add the host to PORTAL_ARTIFACT_HOSTS and to the collector's egress.</p>{% endif %}
+{% if events_source and events_source.problem == "github_busy" %}<p class="error warn">github_busy: GitHub didn't answer on the last pass, so scorecard events are read again on the next one.</p>{% endif %}
+{% set given_up = (events_source.counts.get("unreadable_after_retries", 0) if events_source else 0) %}
+{% if given_up %}<p class="meta">{{ given_up }} scorecard run{{ "s were" if given_up != 1 else " was" }} recorded unreadable: GitHub didn't answer for {{ "them" if given_up != 1 else "it" }} on twelve passes, so the runs below were read on.</p>{% endif %}
+{% if events_source and events_source.problem == "factory_not_main" %}<p class="error warn">factory_not_main: the factory's default branch is not main, and scorecard-assess runs only from main, so central scorecard runs are not collected. Make main the factory's default branch.</p>{% endif %}
+{% if skipped %}<p class="meta">{{ skipped }} scorecard run{{ "s were" if skipped != 1 else " was" }} not read for the list: the artifact was missing, expired, too large or not a valid event, or the run was not trusted. Counted, never shown.</p>{% endif %}
+{% if not items %}<div class="empty"><p>Nothing to re-review.</p></div>{% endif %}
+{% for entry in items %}
+{% set i = entry.item %}
+<section class="card" aria-labelledby="item-{{ i.id }}">
+<div class="card-head">
+<h2 class="repo" id="item-{{ i.id }}">{{ i.repo }}</h2>
+<span><span class="badge">{{ REASON_WORDS[i.reason] }}</span>{% if entry.stale %}<span class="tag">Open {{ entry.days }} days</span>{% endif %}</span>
+</div>
+<p class="meta">Opened {{ i.opened_at.strftime("%Y-%m-%d") }}{% if entry.owner %}; owner {{ entry.owner }}{% endif %}.</p>
+{% if i.reason == "scorecard_signal" %}
+<div class="table-wrap">
+<table>
+<thead><tr><th scope="col">Pull request</th><th scope="col">Head</th><th scope="col">Level</th><th scope="col">Signals that matched</th></tr></thead>
+<tbody>
+{% for e in i.events %}<tr><td>{% if e.event.pr %}#{{ e.event.pr }}{% else %}none{% endif %}</td><td>{{ sha(e.event.head_sha) }}</td><td>{{ e.event.level }}</td>
+<td><ul class="checklist">{% for s in e.event.signals if s.id in e.matched %}<li><span class="mono">{{ s.id }}</span>: {{ s.summary }}</li>{% endfor %}</ul></td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p>Review by {{ i.key }}: {% if i.reason == "review_overdue" %}the date has passed.{% else %}the date is near.{% endif %} A change or renewal of the registration that moves the date closes this by itself.</p>
+{% endif %}
+{% if entry.mine %}
+<p class="callout info">You own this app, so another admin must close this.</p>
+{% elif entry.unreadable %}
+<p class="callout info">This app's intake record can't be read, so it can be closed once the record is fixed.</p>
+{% else %}
+<form method="post" action="/admin/rereview/{{ i.id }}/close">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="hidden" name="events_seen" value="{{ i.events|length }}">
+<p class="field"><label for="note-{{ i.id }}">What you decided</label>
+<span class="hint">One line, 10 to 1000 characters. It goes into the audit log.</span>
+<input id="note-{{ i.id }}" type="text" name="note" required minlength="10" maxlength="1000" data-counter="note-count-{{ i.id }}" data-min="10">
+<span class="counter" id="note-count-{{ i.id }}"></span></p>
+<p class="actions"><button class="secondary" type="submit">Close</button></p>
+</form>
+{% endif %}
+</section>
+{% endfor %}
+{% if parts or runs or pending %}
+<h2>The collector</h2>
+<ul class="link-list">
+{% for p in parts %}<li><strong>{{ p.name }}</strong>: checked {{ p.checked }}{% if p.worked %}, last worked {{ p.worked }}{% endif %}{% if p.status.problem %} ({{ p.status.problem }}){% endif %}.{% if p.stopped %} <span class="tag">has not worked for more than three of the collector's intervals</span>{% endif %}</li>
+{% endfor %}
+{% for r in runs %}<li><span class="mono">{{ r.repo }}</span>: read down to run {{ r.run_id }}, {{ r.age }}{% if r.rechecked %}; {{ r.rechecked }} run{{ "s" if r.rechecked != 1 else "" }} re-checked until it succeeds{% endif %}.</li>
+{% endfor %}
+{% if pending %}<li>{{ pending }} event{{ "s wait" if pending != 1 else " waits" }} for its app's intake record.</li>{% endif %}
+</ul>
+{% endif %}
+{% if outside %}
+<h2>Registered outside the portal</h2>
+<p class="meta">These intake/v1 records have no review date, so they get no date reason. A change or renewal in the portal replaces each with an intake/v2 record that has one.</p>
+<ul class="link-list">{% for o in outside %}<li class="mono">{{ o.repo }}</li>{% endfor %}</ul>
+{% endif %}
+{% if unreadable %}
+<h2>Records the portal can't read</h2>
+<p class="meta">Their review dates are not read, so their open items are kept as they are until the record can be read again.</p>
+<ul class="link-list">{% for o in unreadable %}<li><span class="mono">{{ o.repo }}</span>: {{ problem_words.get(o.problem, o.problem) }}.</li>{% endfor %}</ul>
+{% endif %}
+{% endblock %}

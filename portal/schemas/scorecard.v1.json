@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/scorecard.v1.json",
+  "title": "scorecard/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated_at", "checkpoint", "tool", "app", "level", "floor", "reasons", "triggers_fired", "asvs", "assessment", "signals", "observations", "suppressions_applied", "delta"],
+  "properties": {
+    "schema": {"const": "scorecard/v1"},
+    "generated_at": {"$ref": "finding.v2.json#/$defs/timestamp"},
+    "checkpoint": {"enum": ["pr", "release", "running"]},
+    "tool": {
+      "type": "object", "additionalProperties": false, "required": ["name", "version"],
+      "properties": {"name": {"const": "scorecard"}, "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}}
+    },
+    "app": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repo", "commit", "base", "tree_sha", "intake_found", "tier", "purpose", "data_classification", "asvs_level"],
+      "properties": {
+        "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "commit": {"$ref": "#/$defs/sha"},
+        "base": {"$ref": "#/$defs/sha"},
+        "tree_sha": {"$ref": "#/$defs/sha"},
+        "intake_found": {"type": "boolean"},
+        "tier": {"enum": ["low", "moderate", "high", null]},
+        "purpose": {"type": ["string", "null"]},
+        "data_classification": {"enum": ["public", "confidential", "protected", null]},
+        "asvs_level": {"enum": [1, 2, 3]}
+      },
+      "allOf": [
+        {"if": {"properties": {"intake_found": {"const": true}}, "required": ["intake_found"]},
+         "then": {"properties": {"tier": {"type": "string"}, "purpose": {"type": "string"}, "data_classification": {"type": "string"}}},
+         "else": {"properties": {"tier": {"type": "null"}, "purpose": {"type": "null"}}}}
+      ]
+    },
+    "level": {"$ref": "#/$defs/level"},
+    "floor": {"$ref": "#/$defs/level"},
+    "reasons": {"type": "array", "items": {"$ref": "#/$defs/reason"}},
+    "triggers_fired": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/trigger"}},
+    "asvs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "source_sha256", "level", "overall_score", "coverage", "coverage_threshold", "counts", "agent_requirements", "platform_provided", "tool_covered", "confirmed_na", "chapters", "results"],
+      "properties": {
+        "version": {"const": "5.0.0"},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "level": {"enum": [1, 2, 3]},
+        "overall_score": {"$ref": "#/$defs/percent"},
+        "coverage": {"$ref": "#/$defs/percent"},
+        "coverage_threshold": {"type": "number", "minimum": 0, "maximum": 100},
+        "counts": {"$ref": "#/$defs/counts"},
+        "agent_requirements": {"$ref": "#/$defs/count"},
+        "platform_provided": {"$ref": "#/$defs/count"},
+        "tool_covered": {"$ref": "#/$defs/count"},
+        "confirmed_na": {"$ref": "#/$defs/count"},
+        "chapters": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["chapter", "name", "score", "counts"],
+            "properties": {
+              "chapter": {"type": "string", "pattern": "^v5\\.0\\.0-[1-9][0-9]*$"},
+              "name": {"type": "string", "minLength": 1},
+              "score": {"$ref": "#/$defs/percent"},
+              "counts": {"$ref": "#/$defs/counts"}
+            }
+          }
+        },
+        "results": {"type": "array", "items": {"$ref": "requirement-result.v1.json"}}
+      }
+    },
+    "assessment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["present", "tree_sha", "prompt_version", "model", "complete", "ignored_results", "findings"],
+      "properties": {
+        "present": {"type": "boolean"},
+        "tree_sha": {"anyOf": [{"$ref": "#/$defs/sha"}, {"type": "null"}]},
+        "prompt_version": {"anyOf": [{"$ref": "assessment.v1.json#/properties/prompt_version"}, {"type": "null"}]},
+        "model": {"anyOf": [{"$ref": "assessment.v1.json#/properties/model"}, {"type": "null"}]},
+        "complete": {"type": "boolean"},
+        "ignored_results": {"type": "array", "items": {"type": "string"}},
+        "findings": {"type": "array", "items": {"$ref": "finding.v2.json"}}
+      }
+    },
+    "signals": {
+      "type": "object", "additionalProperties": false,
+      "required": ["findings", "skipped_packages", "lookup_failures", "input_problems", "pr_text_hits"],
+      "properties": {
+        "findings": {"type": "array", "items": {"$ref": "finding.v2.json"}},
+        "skipped_packages": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": false, "required": ["ecosystem", "name", "reason"],
+                    "properties": {"ecosystem": {"enum": ["pypi", "npm"]}, "name": {"type": "string"}, "reason": {"type": "string"}}}
+        },
+        "lookup_failures": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": false, "required": ["source", "detail"],
+                    "properties": {"source": {"type": "string", "minLength": 1}, "detail": {"type": "string", "minLength": 1}}}
+        },
+        "input_problems": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": false, "required": ["source", "detail"],
+                    "properties": {"source": {"type": "string", "minLength": 1}, "detail": {"type": "string", "minLength": 1}}}
+        },
+        "pr_text_hits": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": false, "required": ["source", "rule"],
+                    "properties": {"source": {"type": "string", "minLength": 1}, "rule": {"type": "string", "minLength": 1}}}
+        }
+      }
+    },
+    "observations": {
+      "type": "object", "additionalProperties": false, "required": ["checks", "findings"],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": false, "required": ["name", "state", "observed_at"],
+                    "properties": {"name": {"type": "string", "minLength": 1}, "state": {"enum": ["success", "pending", "missing", "failure"]},
+                                   "observed_at": {"$ref": "finding.v2.json#/$defs/timestamp"}}}
+        },
+        "findings": {"type": "array", "items": {"$ref": "finding.v2.json"}}
+      }
+    },
+    "suppressions_applied": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": false, "required": ["id", "finding_id"],
+                "properties": {"id": {"$ref": "override.v2.json#/properties/id"}, "finding_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+    },
+    "delta": {"type": "null"},
+    "openssf": {"type": ["object", "null"]},
+    "quality": {"type": ["object", "null"]},
+    "llm_top10": {"type": ["object", "null"]}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "level": {"enum": ["standard", "elevated", "security_review"]},
+    "trigger": {"type": "string", "pattern": "^T-(1[0-2]|1[4-9]|21|[1-9])$"},
+    "count": {"type": "integer", "minimum": 0},
+    "percent": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 100}, {"type": "null"}]},
+    "counts": {
+      "type": "object", "additionalProperties": false, "required": ["pass", "fail", "na", "needs_human"],
+      "properties": {"pass": {"$ref": "#/$defs/count"}, "fail": {"$ref": "#/$defs/count"}, "na": {"$ref": "#/$defs/count"}, "needs_human": {"$ref": "#/$defs/count"}}
+    },
+    "reason": {
+      "type": "object", "additionalProperties": false, "required": ["trigger", "level", "summary", "refs"],
+      "properties": {
+        "trigger": {"$ref": "#/$defs/trigger"},
+        "level": {"$ref": "#/$defs/level"},
+        "summary": {"type": "string", "minLength": 1},
+        "total": {"type": "integer", "minimum": 1, "description": "the true number of distinct items behind this reason; refs lists at most 20 of them"},
+        "refs": {
+          "type": "array", "maxItems": 20,
+          "items": {
+            "type": "object", "additionalProperties": false, "minProperties": 1,
+            "properties": {
+              "file": {"$ref": "finding.v2.json#/$defs/repo_path"},
+              "line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+              "finding_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "asvs_id": {"$ref": "requirement-result.v1.json#/properties/asvs_id"},
+              "source": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}

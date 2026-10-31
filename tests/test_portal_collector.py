@@ -90,7 +90,7 @@ def test_the_collector_needs_the_org_and_the_gateway_hosts(tmp_path):
     assert code == 2 and "PORTAL_ORG" in err
 
 
-def test_one_pass_runs_repo_admins_then_evidence_and_a_failure_in_one_does_not_stop_the_other(tmp_path, monkeypatch):
+def test_one_pass_runs_repo_admins_evidence_intake_and_events_and_a_failure_in_one_does_not_stop_the_others(tmp_path, monkeypatch):
     import portal.collectors.__main__ as entry
     import portal.store.postgres as postgres
 
@@ -108,11 +108,116 @@ def test_one_pass_runs_repo_admins_then_evidence_and_a_failure_in_one_does_not_s
         seen.append(("evidence", org, gateway_hosts))
         return {"computed": 2, "waiting": 1, "problem": "rules_missing"}
 
+    def intake(gh, store, *, org, today, due_soon_days, now):
+        seen.append(("intake", org, due_soon_days))
+        return {"records": 2, "unreadable": 0, "opened": 1, "closed": 0}
+
+    def events(gh, store, *, org, signals, now, actions_readable, artifact_hosts):
+        seen.append(("events", actions_readable))
+        return {"stored": 0, "skipped": 0, "problem": "actions_unreadable"}
+
     monkeypatch.setattr(postgres, "PostgresStore", lambda url: Store())
     monkeypatch.setattr(entry, "collect", boom)
     monkeypatch.setattr(entry, "collect_evidence", evidence)
+    monkeypatch.setattr(entry, "collect_intake", intake)
+    monkeypatch.setattr(entry, "collect_events", events)
     monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
     code, err = run_main(["--once"], env_with(tmp_path))
-    assert code == 1 and seen == ["repo_admins", ("evidence", "acme", ("litellm.internal",))]
+    assert code == 1 and seen == ["repo_admins", ("evidence", "acme", ("litellm.internal",)), ("intake", "acme", 30), ("events", None)]
+    assert "collectors: intake: 2 records (0 unreadable), 1 opened, 0 closed" in err
+    assert "collectors: re-review events: 0 stored, 0 skipped (actions_unreadable: give the read App actions: read)" in err
     assert "repo_admins failed: 502 GET /installation/repositories" in err
     assert "collectors: evidence: 2 computed, 1 waiting (rules_missing)" in err
+
+
+@pytest.mark.parametrize("name, value", [("PORTAL_REVIEW_DUE_SOON_DAYS", "soon"), ("PORTAL_REREVIEW_SIGNALS", "T-17,elevated")])
+def test_a_bad_re_review_setting_stops_the_collector_with_its_name(tmp_path, name, value):
+    code, err = run_main(["--once"], {**env_with(tmp_path), name: value})
+    assert code == 2 and name in err and value not in err
+
+
+def test_the_actions_check_reads_the_token_s_permissions(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+
+    class Token:
+        permissions = {"metadata": "read", "contents": "read", "actions": "read"}
+
+        def __call__(self):
+            return "ghs_x"
+
+    class Store:
+        def close(self):
+            pass
+
+    seen = []
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: Store())
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: Token())
+    monkeypatch.setattr(entry, "collect", lambda gh, store, *, now: 0)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: seen.append(k["actions_readable"]) or {"stored": 0, "skipped": 0})
+    code, _ = run_main(["--once"], {**env_with(tmp_path), "PORTAL_REREVIEW_SIGNALS": "T-17"})
+    assert code == 0 and seen == [True]
+
+
+# ---- more cases ----
+
+def test_any_failure_in_one_part_is_logged_by_its_type_and_the_other_parts_still_run(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+
+    class Store:
+        def close(self):
+            pass
+
+    seen = []
+
+    def boom(*a, **k):
+        raise RuntimeError("secret detail that must not be printed")
+
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: Store())
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", boom)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: seen.append("evidence") or {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", boom)
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: seen.append(("events", k["artifact_hosts"])) or {"stored": 0, "skipped": 0})
+    code, err = run_main(["--once"], env_with(tmp_path))
+    assert code == 1 and seen == ["evidence", ("events", ("*.blob.core.windows.net",))]
+    assert "collectors: repo_admins failed: RuntimeError" in err and "collectors: intake failed: RuntimeError" in err and "secret detail" not in err
+
+
+def test_the_artifact_hosts_are_a_setting(tmp_path, monkeypatch):
+    code, err = run_main(["--once"], {**env_with(tmp_path), "PORTAL_ARTIFACT_HOSTS": "https://evil.example.test/"})
+    assert code == 2 and "PORTAL_ARTIFACT_HOSTS" in err and "evil" not in err
+    from portal.collectors.__main__ import artifact_hosts
+    assert artifact_hosts("") == ("*.blob.core.windows.net",) and artifact_hosts(" *.storage.example.test, files.example.test ") == (
+        "*.storage.example.test", "files.example.test")
+
+
+def test_the_http_client_logs_no_request_urls():
+    """httpx logs each request's URL at INFO; a storage URL carries a signature."""
+    import logging
+    import portal.collectors.__main__  # noqa: F401
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_each_part_records_its_status_and_the_interval_so_the_page_can_tell_a_stopped_collector(tmp_path, monkeypatch):
+    """a part that raised is "failed" with the time it last worked; the parts that report nothing of their own (repo
+    admins, evidence) record that they ran, with the collector's interval."""
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+    from portal.store.memory import MemoryStore
+    store = MemoryStore()
+    store.close = lambda: None
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: store)
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, **k: 2)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    code, _ = run_main(["--once"], {**env_with(tmp_path), "PORTAL_COLLECT_INTERVAL": "120"})
+    status = store.rereview_status()
+    assert code == 1 and status["repo_admins"].problem is None and status["repo_admins"].counts == {"interval_seconds": 120}
+    assert status["evidence"].problem == "failed" and status["evidence"].last_ok_at is None
+

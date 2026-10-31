@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/finding.v2.json",
+  "title": "finding/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "source", "rule_id", "category", "severity", "confidence", "location", "evidence", "evidence_verified", "title", "rationale", "fix", "standards", "first_seen"],
+  "properties": {
+    "schema": {"const": "finding/v2"},
+    "id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "minLength": 64, "maxLength": 64},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer", "tool"],
+      "properties": {
+        "layer": {"enum": ["deterministic", "agentic", "drift", "dynamic"]},
+        "tool": {"type": "string", "minLength": 1},
+        "tool_version": {"type": "string"}
+      }
+    },
+    "rule_id": {"type": "string", "minLength": 1, "maxLength": 200, "not": {"pattern": "[\\r\\n]"}},
+    "category": {"enum": ["secrets", "sast", "sca", "license", "image", "iac", "drift", "egress", "authz", "harness", "data-handling", "dependency", "test-integrity", "scope", "injection"]},
+    "severity": {"enum": ["critical", "high", "medium", "low", "info"]},
+    "confidence": {"enum": ["high", "medium", "low"]},
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "file"],
+      "properties": {
+        "kind": {"enum": ["line", "file", "absence"]},
+        "file": {"$ref": "#/$defs/repo_path"},
+        "start_line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "end_line": {"type": "integer", "minimum": 1, "maximum": 2147483647}
+      },
+      "if": {"properties": {"kind": {"const": "line"}}, "required": ["kind"]},
+      "then": {"required": ["start_line"]}
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {"$ref": "#/$defs/anchor"}
+    },
+    "evidence_verified": {"type": "boolean"},
+    "title": {"type": "string", "minLength": 1, "maxLength": 512},
+    "rationale": {"type": "string", "minLength": 1, "maxLength": 8000},
+    "fix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "steps"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "steps": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 2000}},
+        "patch": {"type": "string", "maxLength": 20000}
+      }
+    },
+    "standards": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["framework", "id"],
+        "properties": {
+          "framework": {"enum": ["cwe", "asvs-5.0", "owasp-api-2023", "owasp-llm-2025", "cvss", "epss", "nist-ssdf", "slsa", "pss", "cis-k8s", "hipaa", "golden-road-vc", "golden-road-trigger"]},
+          "id": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {"if": {"properties": {"framework": {"const": "cwe"}}, "required": ["framework"]},
+           "then": {"properties": {"id": {"pattern": "^CWE-[1-9][0-9]*$"}}}},
+          {"if": {"properties": {"framework": {"const": "golden-road-vc"}}, "required": ["framework"]},
+           "then": {"properties": {"id": {"enum": ["VC-1", "VC-2", "VC-3", "VC-4", "VC-5", "VC-6", "VC-INJ"]}}}},
+          {"if": {"properties": {"framework": {"const": "golden-road-trigger"}}, "required": ["framework"]},
+           "then": {"properties": {"id": {"pattern": "^T-(1[0-2]|1[4-9]|21|[1-9])$"}}}}
+        ]
+      },
+      "anyOf": [
+        {"contains": {"properties": {"framework": {"const": "cwe"}}}},
+        {"contains": {"properties": {"framework": {"const": "golden-road-vc"}}}},
+        {"contains": {"properties": {"framework": {"const": "golden-road-trigger"}}}}
+      ]
+    },
+    "first_seen": {"$ref": "#/$defs/timestamp"},
+    "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "allOf": [
+    {"if": {"properties": {"source": {"properties": {"layer": {"const": "agentic"}}}}},
+     "then": {"properties": {"standards": {"contains": {"properties": {"framework": {"enum": ["asvs-5.0", "owasp-api-2023", "owasp-llm-2025", "golden-road-vc"]}}}}}}},
+    {"if": {"properties": {"category": {"const": "injection"}}, "required": ["category"]},
+     "then": {"properties": {"standards": {"items": {"properties": {"framework": {"const": "golden-road-vc"}}}}}}}
+  ],
+  "$defs": {
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "start_line", "snippet"],
+      "properties": {
+        "file": {"$ref": "#/$defs/repo_path"},
+        "start_line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "snippet": {"type": "string", "minLength": 1, "maxLength": 8000, "pattern": "\\S"},
+        "note": {"type": "string", "maxLength": 2000}
+      }
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "anyOf": [
+        {"const": "<unknown>"},
+        {"allOf": [
+          {"not": {"pattern": "[\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]"}},
+          {"not": {"pattern": "\\\\"}},
+          {"not": {"pattern": "^/"}},
+          {"not": {"pattern": "(^|/)\\.\\.(/|$)"}},
+          {"not": {"pattern": "(^|/)\\.(/|$)"}},
+          {"not": {"pattern": "(^|/)\\.git(/|$)"}}
+        ]}
+      ]
+    }
+  }
+}

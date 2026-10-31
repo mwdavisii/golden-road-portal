@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/intake.v1.json",
+  "title": "intake/v1",
+  "description": "The factory's intake/<owner>/<repo>.yaml: the only trusted source of an app's tier and purpose.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "tier", "purpose", "owner", "data_classification"],
+  "properties": {
+    "schema": {"const": "intake/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "tier": {"enum": ["low", "moderate", "high"]},
+    "purpose": {"type": "string", "minLength": 10, "maxLength": 4000},
+    "owner": {"type": "string", "minLength": 1, "not": {"pattern": "[\\r\\n]"}},
+    "data_classification": {"enum": ["public", "confidential", "protected"]},
+    "scorecard": {"enum": ["per-app", "central"], "description": "Who runs this repo's scorecard: the app's own caller workflow (per-app, the default when absent) or the factory's poller (central). The poller assesses only repos marked central."}
+  }
+}

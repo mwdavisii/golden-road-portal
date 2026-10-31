@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/scorecard.v2.json",
+  "title": "scorecard/v2",
+  "description": "The routing scorecard: the level, the reasons (enforced rules that fired, each with what would clear it), every fact the rules read, the shadow rules that would have fired, and the deterministic signals. Written by `scorecard run` when the factory has config/routing.toml.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated_at", "checkpoint", "tool", "app", "level", "floor", "reasons", "triggers_fired", "assessment",
+               "routing", "signals", "observations", "suppressions_applied", "delta"],
+  "properties": {
+    "schema": {"const": "scorecard/v2"},
+    "generated_at": {"$ref": "scorecard.v1.json#/properties/generated_at"},
+    "checkpoint": {"$ref": "scorecard.v1.json#/properties/checkpoint"},
+    "tool": {"$ref": "scorecard.v1.json#/properties/tool"},
+    "app": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repo", "commit", "base", "tree_sha", "intake_found", "tier", "purpose", "data_classification"],
+      "properties": {
+        "repo": {"$ref": "scorecard.v1.json#/properties/app/properties/repo"},
+        "commit": {"$ref": "scorecard.v1.json#/$defs/sha"},
+        "base": {"$ref": "scorecard.v1.json#/$defs/sha"},
+        "tree_sha": {"$ref": "scorecard.v1.json#/$defs/sha"},
+        "intake_found": {"type": "boolean"},
+        "tier": {"$ref": "scorecard.v1.json#/properties/app/properties/tier"},
+        "purpose": {"$ref": "scorecard.v1.json#/properties/app/properties/purpose"},
+        "data_classification": {"$ref": "scorecard.v1.json#/properties/app/properties/data_classification"}
+      }
+    },
+    "level": {"$ref": "scorecard.v1.json#/$defs/level"},
+    "floor": {"$ref": "scorecard.v1.json#/$defs/level"},
+    "reasons": {"type": "array", "items": {"$ref": "#/$defs/reason"}},
+    "triggers_fired": {"type": "array", "items": {"$ref": "#/$defs/trigger"}},
+    "assessment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["present", "tree_sha", "prompt_version", "model", "questions_sha256", "complete"],
+      "properties": {
+        "present": {"type": "boolean"},
+        "tree_sha": {"anyOf": [{"$ref": "scorecard.v1.json#/$defs/sha"}, {"type": "null"}]},
+        "prompt_version": {"anyOf": [{"$ref": "assessment.v1.json#/properties/prompt_version"}, {"type": "null"}]},
+        "model": {"anyOf": [{"$ref": "assessment.v1.json#/properties/model"}, {"type": "null"}]},
+        "questions_sha256": {"anyOf": [{"type": "string", "pattern": "^[0-9a-f]{64}$"}, {"type": "null"}]},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "routing": {
+      "type": "object", "additionalProperties": false, "required": ["facts", "shadow", "undecided"],
+      "properties": {
+        "facts": {"type": "object", "propertyNames": {"$ref": "routing.v1.json#/$defs/fact_name"}, "additionalProperties": {"$ref": "#/$defs/fact"}},
+        "shadow": {"type": "array", "items": {"$ref": "#/$defs/reason"}},
+        "undecided": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["trigger", "mode", "undetermined"],
+          "properties": {"trigger": {"$ref": "#/$defs/trigger"}, "mode": {"enum": ["enforce", "shadow"]}, "undetermined": {"type": "array", "items": {"type": "string"}}}}}
+      }
+    },
+    "signals": {"$ref": "scorecard.v1.json#/properties/signals"},
+    "observations": {"$ref": "scorecard.v1.json#/properties/observations"},
+    "suppressions_applied": {"$ref": "scorecard.v1.json#/properties/suppressions_applied"},
+    "delta": {"$ref": "scorecard.v1.json#/properties/delta"}
+  },
+  "$defs": {
+    "trigger": {"type": "string", "pattern": "^T-[1-9][0-9]{0,2}$"},
+    "ref": {"type": "object", "additionalProperties": false, "minProperties": 1, "properties": {
+      "file": {"$ref": "finding.v2.json#/$defs/repo_path"}, "line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+      "finding_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source": {"type": "string", "minLength": 1}}},
+    "reason": {
+      "type": "object", "additionalProperties": false,
+      "required": ["trigger", "level", "summary", "refs", "total", "reason", "guidance", "unsure"],
+      "properties": {
+        "trigger": {"$ref": "#/$defs/trigger"},
+        "level": {"$ref": "scorecard.v1.json#/$defs/level"},
+        "summary": {"type": "string", "minLength": 1},
+        "refs": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/ref"}},
+        "total": {"type": "integer", "minimum": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "guidance": {"type": "string", "minLength": 1},
+        "unsure": {"type": "boolean"},
+        "undetermined": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "fact": {
+      "type": "object", "required": ["kind", "type", "value", "refs"],
+      "properties": {
+        "kind": {"enum": ["builtin", "spec", "diff", "agent"]},
+        "type": {"enum": ["bool", "answer", "enum", "ordered", "number", "list", "grants"]},
+        "refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}}
+      }
+    }
+  }
+}

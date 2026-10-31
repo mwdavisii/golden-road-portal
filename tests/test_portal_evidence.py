@@ -11,7 +11,7 @@ from portal.contracts import validate
 from portal.github.client import GitHub
 
 API, SHA, GW = "https://api.github.com", "a" * 40, ("litellm.internal",)
-SPEC = {"app_name": "notes", "app_type": "python", "entrypoint": "app.main:app", "port": 8000, "data_classification": "internal",
+SPEC = {"app_name": "notes", "app_type": "python", "entrypoint": "app.main:app", "port": 8000, "data_classification": "public",
         "egress": [], "env": [], "resources_tier": "default"}
 REQS = b"fastapi==0.1 \\\n    --hash=sha256:00\nhttpx==0.2\n# comment\n-r other.txt\n"
 

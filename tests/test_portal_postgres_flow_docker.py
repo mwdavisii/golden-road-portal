@@ -40,13 +40,13 @@ def test_registration_flow_on_postgres_within_the_database_rules(pg_db):
         collector.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0), RepoAdmin("acme/tools", "owner-gh", 1001, T0)], observed_at=T0)
 
         form = {"csrf_token": owner_csrf, "repo": "acme/notes", "purpose": "Stores short team notes; no email, no files.",
-                "data_classification": "internal", "proposed_tier": "low"}
+                "data_classification": "public"}
         created = owner_http.post("/register", data=form)
         assert created.status_code == 303
         rid = created.headers["location"].rsplit("/", 1)[1]
         collector.add_evidence(request_id=rid, submission=1, commit="e" * 40, evidence=evidence_doc("acme/notes", "e" * 40), floor_tier="low",
-                               floor_classification="internal", rules_commit="f" * 40, now=T0)
-        approval = {"csrf_token": admin_csrf, "submission": "1", "tier": "moderate", "data_classification": "internal", "review_by": "2027-10-23",
+                               floor_classification="public", rules_commit="f" * 40, now=T0)
+        approval = {"csrf_token": admin_csrf, "submission": "1", "tier": "moderate", "data_classification": "public", "review_by": "2027-10-23",
                     "justification": "Purpose and classification checked."}
         assert admin_http.post(f"/admin/requests/{rid}/approve", data=approval).status_code == 303
         approved = web.get_request(rid)
@@ -65,7 +65,7 @@ def test_registration_flow_on_postgres_within_the_database_rules(pg_db):
         form2 = {**form, "repo": "acme/tools"}
         rid2 = owner_http.post("/register", data=form2).headers["location"].rsplit("/", 1)[1]
         assert admin_http.post(f"/admin/requests/{rid2}/send-back", data={"csrf_token": admin_csrf, "justification": "Say what it does not do."}).status_code == 303
-        again = {"csrf_token": owner_csrf, "purpose": "Builds internal tools; no PHI, no email, no files.", "data_classification": "internal", "proposed_tier": "low"}
+        again = {"csrf_token": owner_csrf, "purpose": "Builds internal tools; no PHI, no email, no files.", "data_classification": "public"}
         assert owner_http.post(f"/requests/{rid2}", data=again).status_code == 303
         assert web.get_request(rid2).state == "pending" and web.get_request(rid2).decided_by is None
 
