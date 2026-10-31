@@ -8,7 +8,7 @@
   "required": ["schema", "no_spec", "classification_tier", "raise_to", "many_dependencies_over"],
   "$defs": {
     "tier": {"enum": ["low", "moderate", "high"]},
-    "classification": {"enum": ["public", "internal", "restricted", "phi"]}
+    "classification": {"enum": ["public", "confidential", "protected"]}
   },
   "properties": {
     "schema": {"const": "registration-rules/v1"},
@@ -24,12 +24,11 @@
     "classification_tier": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["public", "internal", "restricted", "phi"],
+      "required": ["public", "confidential", "protected"],
       "properties": {
         "public": {"$ref": "#/$defs/tier"},
-        "internal": {"$ref": "#/$defs/tier"},
-        "restricted": {"$ref": "#/$defs/tier"},
-        "phi": {"$ref": "#/$defs/tier"}
+        "confidential": {"$ref": "#/$defs/tier"},
+        "protected": {"$ref": "#/$defs/tier"}
       }
     },
     "raise_to": {

@@ -73,6 +73,8 @@ def _registration(request, cfg, evidence) -> list[str]:
         problems.append("record_mismatch")
     else:
         problems += _floor_problems(request, final, evidence)
+        if evidence is not None and final.get("scorecard") != (evidence.record or {}).get("scorecard"):
+            problems.append("scorecard_changed")  # a change keeps the scorecard mark of the record it replaces
     return problems
 
 

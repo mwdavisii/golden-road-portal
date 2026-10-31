@@ -1,0 +1,2 @@
+{# A commit SHA: its first 12 characters in monospace, the full value in the title (Reskin visual fixes). #}
+{% macro sha(value) %}<span class="mono sha" title="{{ value }}">{{ value[:12] }}</span>{% endmacro %}

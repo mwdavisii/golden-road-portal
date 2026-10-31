@@ -49,6 +49,8 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_IDENTITY_PROCESS_URL`, `PORTAL_DATA_PROCESS_URL` | Optional; `https://` pages that say how to ask for a service principal and for a warehouse grant (linked on the app page) |
 | `PORTAL_SECRET_SERVER` | Optional; `mock` turns on each app's secrets from Delinea Secret Server (`portal/mock_secret_server.json`, served through `portal/secretserver.py`'s client, which never reads a value); unset, the app page shows none. The writer must get the same value |
 | `PORTAL_SECRET_PROCESS_URL` | Optional; an `https://` page that says how to ask security to share a secret with the platform account `golden-road-eso` (linked on the app page) |
+| `PORTAL_CLASSIFICATION_POLICY_URL` | Optional; an `https://` page with the data classification policy, linked (new tab) on the register, resubmit and approval forms. Empty or unset hides the link. |
+| `PORTAL_REREVIEW_STALE_DAYS` | Optional; days after which an open re-review item is flagged stale on the Re-review page (0 to 36500, default 30; `0` turns the flag off) |
 | `PORTAL_SECRET_SERVER_URL` | Must stay unset: it is for a real Secret Server, which there is none of yet. Set, the portal stops (web and writer) |
 
 Anything missing or malformed stops the process at startup.
@@ -112,7 +114,12 @@ Migrations: `0001` the tables and grants, `0002` the database's own rules (the r
 log's id and time), `0003` the pinned commits and no admin link to one's own person, `0004` the platform's registration evidence and
 `0005` the approval rule that uses it, `0006` binding requests (the one kind that starts approved, with no decision), `0007`
 bindings per environment (one open request per kind, repo and environment; the insert guard takes `binding/v2` for `test` or
-`prod` only; a binding request recorded before it, a `binding/v1` with no environment, counts as `test`'s and is left as it is).
+`prod` only; a binding request recorded before it, a `binding/v1` with no environment, counts as `test`'s and is left as it is),
+`0008` the three classification levels, `0009` the audit log's subject index, and `0010` registration changes and the re-review list
+(below): the record a change replaces on its evidence, the collector's caches (`intake_observed`, `rereview_run`, `rereview_event`,
+`rereview_failed_run`, `rereview_watermark`, `rereview_source`) and the re-review items. Only `portal_collector` writes the caches
+and opens items; `portal_web` may only close an item, never for an app the closer owns; the collector's audit entries are `system`
+ones about items only, each written once.
 
 Migrations are forward-only: there are no down migrations. After `0006` an older image still handles registrations, but its
 writer fails every binding request it claims (it knows only registrations). Don't roll the image back once bindings exist; if you
@@ -124,7 +131,66 @@ request waits), and reads only the id, kind, repo, state and submission of `requ
 evidence, not even the schema owner (a trigger refuses it). A resubmission counts `request.submission` up, so it gets fresh
 evidence. `0005` makes the database refuse an approval without the evidence of the request's current submission, and one below the
 stored floor unless the approver recorded an override reason of at least 30 characters. The collector needs `PORTAL_ORG` and
-`PORTAL_MODEL_GATEWAY_HOSTS` (comma-separated host names).
+`PORTAL_MODEL_GATEWAY_HOSTS` (comma-separated host names), and reads three optional re-review settings: `PORTAL_REVIEW_DUE_SOON_DAYS`
+(days before a review date when it is due soon; empty is 30, `0` turns the reason off), `PORTAL_REREVIEW_SIGNALS` (the scorecard
+signals that put an app on the list: trigger IDs, the recorded signals `builder-bumped`, `egress-removed`, `resources-lowered`, and
+`security_review` for any trigger at that level; empty is `security_review`, `T-17`, `T-18`, `T-19`, `egress-removed`) and
+`PORTAL_ARTIFACT_HOSTS` (the storage hosts an artifact download may be redirected to, names or `*.suffix`; empty is
+`*.blob.core.windows.net`). A bad value stops the collector with the setting's name, never its value.
+
+The factory's YAML (the floor rules and the intake records) is read with the scorecard's own rules, including one added in 0.5.1:
+a file with YAML anchors or aliases is refused before it is built (a few hundred bytes of aliases expand past anything a walk over
+the document finishes). The scorecard refuses the same, so factory-check and the poller agree.
+
+## Changing a registration
+
+A registration request for a repo that already has an intake record in the factory is a change: the same form, evidence, floor and
+approval as a first registration. The register page, opened as `/register?repo=<owner>/<repo>` for a repo the person administers, is
+titled "Change or renew the registration" and pre-filled from the record. For every waiting registration the collector also reads
+the factory's `intake/<owner>/<repo>.yaml` at the rules commit and stores its blob SHA and a small view of it with the evidence
+(`record_sha`, `record`); a record it can't compare makes the request wait (`record_unreadable`), and so does a record the factory
+holds under two spellings of its name (`record_case_mismatch`). The approval screen and the request page show current → proposed,
+an owner change ("Owner changes from A to B") and a renewal (the same purpose and classification).
+
+The writer replaces the record only if its blob SHA at the branch base is the stored one (otherwise `record_changed`; GitHub
+refusing the write as a conflict is `record_conflict`; a record's path that is a directory, a symlink or a submodule is `not_a_file`;
+a first registration that meets a record still fails `already_registered`).
+The new record is a complete `intake/v2` from the approval; it keeps the current record's `scorecard: central` (the recheck reports
+`scorecard_changed` if it doesn't), is committed as `modified`, and the pull request is titled "Change the registration of ..." and
+lists each changed field.
+
+## The re-review list
+
+`/admin/rereview` (admins) lists open items, one app and one reason each: `review_overdue`, `review_due_soon` (from each intake/v2
+record's `review_by`) and `scorecard_signal` (from the scorecard's re-review events). The collector opens date items and closes one by
+itself when a change or renewal moves the date; an admin closes any item with a note (10 to 1000 characters, one line, audited), never
+one for an app they own, and the close names the events they saw (a later one sends the page back). A closed item never reopens: a
+later reason opens a new one. An item open longer than `PORTAL_REREVIEW_STALE_DAYS` is flagged stale. An intake/v1 record has no
+review date, so it is listed as registered outside the portal, and records the portal can't read are listed with why.
+
+Each pass the collector reads, through the read App (which needs `actions: read` for the events; without it the page shows
+`actions_unreadable`):
+
+- the factory's intake records at its default branch: `GET /repos/{r}/git/trees/{sha}` and `GET /repos/{r}/git/blobs/{sha}`;
+- the factory's `scorecard-assess.yml` runs and each per-app repo's `scorecard.yml` runs: `GET /repos/{r}/actions/workflows/{workflow}/runs`,
+  down to the source's watermark (every run above it is done), and `GET /repos/{r}/actions/runs/{id}` to re-check a run that had
+  failed until a later attempt succeeds or its artifacts are gone;
+- each new run's `scorecard` artifact: `GET /repos/{r}/actions/runs/{id}/artifacts?name=scorecard`, then
+  `GET /repos/{r}/actions/artifacts/{id}/zip`, a 302 to Actions' storage, which must be one of `PORTAL_ARTIFACT_HOSTS` and is
+  fetched without the token, as stored bytes, never logged; a redirect anywhere else records nothing and shows
+  `artifact_host_refused` on the page until the setting (or the egress) is fixed. The zip (at most 16 MiB) is read in memory and only its entry
+  `re-review-event.json` (at most 1 MiB) is read, then validated against `re-review-event/v1`; nothing is extracted.
+
+Runs are listed whole (GitHub's filtered list stops at 1000) and judged here. A run is read only when GitHub says it is the factory's
+own dispatched assessment of that head, from its default branch `main` with a head on that branch (the branch resolved by
+`git/ref/heads/main`, then `GET /repos/{r}/compare/{commit}...{head}`: a tag named `main` reports the same branch name), titled as the
+workflow's `run-name` titles it, or the app's own pull request run calling the factory's reusable workflow from
+`main`; anything else is counted as `untrusted_run`, never read. In per-app mode the pull request's author could still overwrite the
+artifact after the reusable workflow wrote it: an accepted risk, which central mode doesn't have. Events are kept once per source
+(central or per-app), so a per-app event never hides the central one. An event whose app isn't registered yet waits and is read again
+each pass; a run still going after a day, or one that failed, is re-checked by id. Every run is recorded once with its outcome, and
+anything that fails is counted on the page, never shown. The page also shows each collector part's last good pass (flagged after three
+missed intervals), each run source's watermark and what waits.
 
 ## Development
 

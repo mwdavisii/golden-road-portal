@@ -11,17 +11,16 @@ OWNER, ADMIN, RID = "p_" + "a" * 32, "p_" + "b" * 32, "r_" + "c" * 32
 
 
 def test_a_complete_form_is_a_valid_draft():
-    draft, errors = form_draft("acme/notes", "  Stores short notes.\r\nNo email.  ", "internal", "low")
+    draft, errors = form_draft("acme/notes", "  Stores short notes.\r\nNo email.  ", "public")
     assert errors == [] and draft["purpose"] == "Stores short notes.\nNo email." and validate("registration-draft.v1", draft) == []
 
 
 @pytest.mark.parametrize("args, needle", [
-    (("", "Stores short notes.", "internal", "low"), "Choose a repository"),
-    (("acme/notes", "short", "internal", "low"), "10 to 4000"),
-    (("acme/notes", "x" * 4001, "internal", "low"), "10 to 4000"),
-    (("acme/notes", "Stores short notes.", "secret", "low"), "data classification"),
-    (("acme/notes", "Stores short notes.", "internal", "none"), "tier"),
-    (("acme/../x", "Stores short notes.", "internal", "low"), "Choose a repository"),
+    (("", "Stores short notes.", "public"), "Choose a repository"),
+    (("acme/notes", "short", "public"), "10 to 4000"),
+    (("acme/notes", "x" * 4001, "public"), "10 to 4000"),
+    (("acme/notes", "Stores short notes.", "secret"), "data classification"),
+    (("acme/../x", "Stores short notes.", "public"), "Choose a repository"),
 ])
 def test_an_incomplete_form_says_what_is_missing(args, needle):
     draft, errors = form_draft(*args)
@@ -30,19 +29,19 @@ def test_an_incomplete_form_says_what_is_missing(args, needle):
 
 def request():
     return Request(RID, "registration", "acme/notes", "pending", {"schema": "registration-draft/v1", "repo": "acme/notes",
-                   "purpose": "Stores short team notes.", "data_classification": "internal", "proposed_tier": "low"}, OWNER, T0, T0)
+                   "purpose": "Stores short team notes.", "data_classification": "public"}, OWNER, T0, T0)
 
 
-EV = Evidence(RID, 1, "e" * 40, {}, "moderate", "internal", "f" * 40, T0)
+EV = Evidence(RID, 1, "e" * 40, {}, "moderate", "public", "f" * 40, T0)
 
 
 def args(**kw):
-    return {**dict(approver_id=ADMIN, tier="moderate", classification="internal", review_by="2027-10-23",
+    return {**dict(approver_id=ADMIN, tier="moderate", classification="public", review_by="2027-10-23",
                    justification="Checked the purpose.", now=T0, evidence=EV, override_reason=""), **kw}
 
 
 def test_the_approved_record_is_intake_v2_with_approver_time_and_reason():
-    doc, errors = intake_record(request(), **args(classification="restricted", justification="Raised the tier: it stores clinic names."))
+    doc, errors = intake_record(request(), **args(classification="confidential", justification="Raised the tier: it stores clinic names."))
     assert errors == [] and validate("intake.v2", doc) == []
     assert (doc["owner"], doc["registered_by"], doc["approved_by"], doc["approved_at"], doc["request"], doc["tier"]) == (
         OWNER, OWNER, ADMIN, "2026-10-23T12:00:00Z", RID, "moderate")
@@ -68,7 +67,7 @@ def test_add_months_clamps_to_the_month_s_end():
 
 def test_the_record_carries_the_evidence_commit_and_floor():
     doc, errors = intake_record(request(), **args())
-    assert errors == [] and (doc["evidence_commit"], doc["floor_tier"], doc["floor_classification"]) == ("e" * 40, "moderate", "internal")
+    assert errors == [] and (doc["evidence_commit"], doc["floor_tier"], doc["floor_classification"]) == ("e" * 40, "moderate", "public")
     assert "floor_override" not in doc and validate("intake.v2", doc) == []
 
 

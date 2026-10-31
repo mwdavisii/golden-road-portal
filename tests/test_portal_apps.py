@@ -79,7 +79,7 @@ def test_databricks_needs_a_merged_identity_and_a_granted_warehouse(portal):
     assert response.status_code == 400 and "Link an Azure identity first" in response.text
     link_identity_and_merge(portal)
     page = portal.client("owner").get("/apps/acme/notes").text
-    assert 'value="wh-notes"' in page and "wh-other" not in page and "Linked: <span class=\"mono\">sp-notes</span>" in page
+    assert 'value="wh-notes"' in page and "wh-other" not in page and "<dt>Principal</dt><dd class=\"mono\">sp-notes</dd>" in page
     response = post(portal, "owner", "/apps/acme/notes/databricks", warehouse_id="wh-other")
     assert response.status_code == 400 and "isn't granted to sp-notes" in html.unescape(response.text)
     assert post(portal, "owner", "/apps/acme/notes/databricks", warehouse_id="wh-notes").status_code == 303
@@ -113,7 +113,7 @@ def test_remove_identity_removes_databricks(portal):
     link_databricks_and_merge(portal)
     page = portal.client("owner").get("/apps/acme/notes").text
     assert "also removes the Databricks connection" in page and "DATABRICKS_HOST" in page and "adb-1111111111111111.1.azuredatabricks.net" in page
-    assert post(portal, "owner", "/apps/acme/notes/remove", what="azure-identity").status_code == 303
+    assert post(portal, "owner", "/apps/acme/notes/remove", what="azure-identity", confirmed="yes").status_code == 303
     newest = bindings(portal)[0]
     assert newest.state == "approved" and "azure_identity" not in newest.final and "databricks" not in newest.final
     assert newest.final["linked_by"] == portal.people["owner"].id
@@ -126,14 +126,14 @@ def test_remove_identity_removes_databricks(portal):
 def test_remove_databricks_keeps_the_identity(portal):
     link_identity_and_merge(portal)
     link_databricks_and_merge(portal)
-    assert post(portal, "owner", "/apps/acme/notes/remove", what="databricks").status_code == 303
+    assert post(portal, "owner", "/apps/acme/notes/remove", what="databricks", confirmed="yes").status_code == 303
     final = bindings(portal)[0].final
     assert "databricks" not in final and final["azure_identity"]["directory_id"] == "sp-notes"
 
 
 def test_removing_what_isn_t_linked_is_refused(portal):
     for what in ("azure-identity", "databricks", "everything", ""):
-        assert post(portal, "owner", "/apps/acme/notes/remove", what=what).status_code == 400, what
+        assert post(portal, "owner", "/apps/acme/notes/remove", what=what, confirmed="yes").status_code == 400, what
     assert not bindings(portal)
 
 
@@ -241,10 +241,10 @@ def test_admin_actions_on_a_binding_request_are_refused(portal, monkeypatch):
     monkeypatch.setattr(routes_admin, "intake_record", no_intake)
     post(portal, "owner", "/apps/acme/notes/azure-identity", principal_id="sp-notes")
     [req] = bindings(portal)
-    approve = post(portal, "admin", f"/admin/requests/{req.id}/approve", tier="low", data_classification="internal", review_by="2027-10-23",
+    approve = post(portal, "admin", f"/admin/requests/{req.id}/approve", tier="low", data_classification="public", review_by="2027-10-23",
                    justification="Purpose and classification checked.", submission="1")
     send_back = post(portal, "admin", f"/admin/requests/{req.id}/send-back", justification="Please change the thing.")
-    resubmit = post(portal, "owner", f"/requests/{req.id}", purpose="x" * 30, data_classification="internal", proposed_tier="low")
+    resubmit = post(portal, "owner", f"/requests/{req.id}", purpose="x" * 30, data_classification="public")
     assert (approve.status_code, send_back.status_code, resubmit.status_code) == (409, 409, 409)
     assert "Only a registration is approved here" in approve.text
     assert portal.store.get_request(req.id).state == "approved" and portal.store.get_request(req.id).decided_by is None
@@ -309,8 +309,8 @@ def test_each_environment_has_its_own_current_binding(portal):
     assert post(portal, "owner", "/apps/acme/notes/databricks", warehouse_id="wh-notes", environment="test").status_code == 400  # test has no identity
     assert post(portal, "owner", "/apps/acme/notes/databricks", warehouse_id="wh-notes", environment="prod").status_code == 303
     prod = portal.client("owner").get("/apps/acme/notes?environment=prod").text
-    assert 'Linked: <span class="mono">sp-notes</span>' in prod and "DATABRICKS_HOST" in prod
-    assert 'Linked: <span class="mono">sp-notes</span>' not in portal.client("owner").get("/apps/acme/notes").text
+    assert '<dt>Principal</dt><dd class="mono">sp-notes</dd>' in prod and "DATABRICKS_HOST" in prod
+    assert '<dt>Principal</dt><dd class="mono">sp-notes</dd>' not in portal.client("owner").get("/apps/acme/notes").text
 
 
 @pytest.mark.parametrize("environment", ["staging", "", "Prod", "prod ", "test\n"])
@@ -361,8 +361,8 @@ def secrets(portal):
     return with_secret_server(portal)
 
 
-def add_secret(portal, secret_id="1042", field_slug="password", env="NOTES_DB_PASSWORD", who="owner", **form):
-    return post(portal, who, "/apps/acme/notes/secrets", secret_id=secret_id, field_slug=field_slug, env=env, **form)
+def add_secret(portal, secret_id="1042", field_slug="password", env="NOTES_DB_PASSWORD", who="owner", folder="17", **form):
+    return post(portal, who, "/apps/acme/notes/secrets", folder=folder, secret_id=secret_id, field_slug=field_slug, env=env, **form)
 
 
 def add_and_merge(portal, **form):
@@ -380,30 +380,6 @@ def test_the_secrets_section_is_hidden_without_secret_server(portal):
     assert "Secrets (Delinea Secret Server)" not in page and "/secrets" not in page
     response = add_secret(portal)
     assert response.status_code == 400 and "Secret Server is not set up here" in response.text and not bindings(portal)
-
-
-def test_the_search_lists_what_the_person_can_see_and_marks_the_unshared(secrets):
-    page = secrets.client("owner").get("/apps/acme/notes", params={"q": ""}).text
-    assert "Secrets (Delinea Secret Server)" in page
-    for name in ("notes-db", "notes-api-key", "notes-tls", "portal-smtp"):
-        assert name in page
-    assert "finance-db" not in page and "2001" not in page
-    assert secret_rows(page) == {1042, 1044, 1050}   # 1043 has no form: it isn't shared with golden-road-eso
-    assert "Ask security to share it with" in page and "golden-road-eso" in page
-    assert '<option value="passphrase">' in page and 'value="certificate"' not in page
-    assert 'pattern="[A-Z_][A-Z0-9_]*"' in page and 'maxlength="128"' in page
-    assert "\\Golden Road\\hello-app" in html.unescape(page)
-
-
-def test_the_search_filters_by_text_and_folder(secrets):
-    client = secrets.client("owner")
-    assert secret_rows(client.get("/apps/acme/notes", params={"q": "smtp"}).text) == {1050}
-    assert secret_rows(client.get("/apps/acme/notes", params={"folder": "18"}).text) == {1050}
-    assert secret_rows(client.get("/apps/acme/notes", params={"folder": "30"}).text) == set()   # not the person's folder
-    page = client.get("/apps/acme/notes", params={"q": "x" * 101})
-    assert page.status_code == 400 and "at most 100 characters" in page.text and secret_rows(page.text) == set()
-    page = client.get("/apps/acme/notes", params={"folder": "１８"})
-    assert page.status_code == 400 and secret_rows(page.text) == set()
 
 
 def test_adding_a_secret_creates_the_request(secrets):
@@ -448,18 +424,21 @@ def test_a_duplicate_env_and_a_21st_secret_are_refused(secrets):
 
 def test_removing_a_secret(secrets):
     add_and_merge(secrets)
-    page = secrets.client("owner").get("/apps/acme/notes").text
+    page = secrets.client("owner").get("/apps/acme/notes", params={"confirm_secret": "NOTES_DB_PASSWORD"}).text
     assert 'action="/apps/acme/notes/secrets/remove"' in page and 'name="env" value="NOTES_DB_PASSWORD"' in page
-    assert post(secrets, "owner", "/apps/acme/notes/secrets/remove", env="NOPE").status_code == 400
-    response = post(secrets, "owner", "/apps/acme/notes/secrets/remove", env="NOTES_DB_PASSWORD")
+    assert post(secrets, "owner", "/apps/acme/notes/secrets/remove", env="NOPE", confirmed="yes").status_code == 400
+    response = post(secrets, "owner", "/apps/acme/notes/secrets/remove", env="NOTES_DB_PASSWORD", confirmed="yes")
     assert response.status_code == 303 and bindings(secrets)[0].final["secrets"] == []
 
 
 def test_no_value_and_no_password_reaches_a_page(secrets):
     add_and_merge(secrets)
+    pages = [secrets.client(who).get(path, params=params).text for who, path, params in (
+        ("owner", "/apps/acme/notes", {}), ("owner", "/apps/acme/notes", {"environment": "prod"}), ("admin", "/apps/acme/notes", {}),
+        ("owner", "/apps/acme/notes/secrets/new", {}), ("owner", "/apps/acme/notes/secrets/new", {"folder": "17"}),
+        ("owner", "/apps/acme/notes/secrets/new", {"folder": "17", "secret_id": "1044"}),
+        ("owner", "/apps/acme/notes/secrets/new", {"folder": "17", "secret_id": "1044", "field_slug": "passphrase", "env": "TLS_PASSPHRASE2"}))]
     add_secret(secrets, secret_id="1044", field_slug="passphrase", env="TLS_PASSPHRASE")
-    pages = [secrets.client(who).get("/apps/acme/notes", params=params).text for who in ("owner", "admin")
-             for params in ({}, {"environment": "prod"}, {"q": "notes"}, {"q": ""}, {"folder": "17"})]
     pages.append(add_secret(secrets, secret_id="2001").text)
     for text in pages:
         assert "&lt;mock&gt;" not in text and "<mock>" not in text and "itemValue" not in text and "mock-golden-road-eso" not in text
@@ -469,30 +448,16 @@ def test_no_value_and_no_password_reaches_a_page(secrets):
 def test_a_hostile_secret_name_is_escaped(portal):
     doc = json.loads(MOCK.read_text())
     doc["secrets"][0]["name"] = "<script>alert(1)</script>"
-    with_secret_server(portal, parse_mock(doc))
-    page = portal.client("owner").get("/apps/acme/notes", params={"q": ""}).text
-    assert "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    with_secret_server(portal, parse_mock(doc))   # the page half is in test_portal_secret_steps.py
     response = add_secret(portal)
     assert response.status_code == 400 and "can't be recorded in a binding" in html.unescape(response.text) and not bindings(portal)
 
 
 def test_without_a_verified_link_the_section_says_why(portal):
-    with_secret_server(portal, link=False)   # owner has only the seeded, admin-made link
-    page = portal.client("owner").get("/apps/acme/notes", params={"q": ""}).text
-    assert "Link your GitHub account (verified)" in html.unescape(page) and secret_rows(page) == set()
+    with_secret_server(portal, link=False)   # owner has only the seeded, admin-made link; the steps' note is tested there
     response = add_secret(portal)
     assert response.status_code == 400 and "Link your GitHub account (verified) first" in html.unescape(response.text)
     assert not bindings(portal)
-
-
-def test_a_secret_server_failure_is_a_plain_note(secrets, monkeypatch):
-    from portal.secretserver import Client, SecretServerError
-
-    def fail(self, *a, **kw):
-        raise SecretServerError("Secret Server failed (500) answering for /api/v1/secrets")
-    monkeypatch.setattr(Client, "search_first", fail)
-    page = secrets.client("owner").get("/apps/acme/notes", params={"q": ""})
-    assert page.status_code == 200 and "Secret Server could not answer: try again" in page.text and "(500)" not in page.text
 
 
 def test_the_security_process_link_comes_from_settings(portal):
@@ -502,10 +467,11 @@ def test_the_security_process_link_comes_from_settings(portal):
 
 def test_a_portal_admin_sees_the_secrets_but_can_t_search_or_add(secrets):
     add_and_merge(secrets)
-    page = secrets.client("admin").get("/apps/acme/notes", params={"q": ""}).text
-    assert "NOTES_DB_PASSWORD" in page and secret_rows(page) == set() and "/secrets/remove" not in page
+    page = secrets.client("admin").get("/apps/acme/notes").text
+    assert "NOTES_DB_PASSWORD" in page and "/secrets/new" not in page and "confirm_secret" not in page
     assert add_secret(secrets, who="admin", env="OTHER").status_code == 403
     assert post(secrets, "admin", "/apps/acme/notes/secrets/remove", env="NOTES_DB_PASSWORD").status_code == 403
+    assert secrets.client("admin").get("/apps/acme/notes/secrets/new").status_code == 403
 
 
 def test_strangers_get_404_on_the_secret_posts(secrets):
@@ -545,33 +511,14 @@ def search_calls(monkeypatch):
     return calls
 
 
-def test_secret_server_is_searched_only_when_a_search_is_submitted(secrets, monkeypatch):
-    calls = search_calls(monkeypatch)
-    page = secrets.client("owner").get("/apps/acme/notes").text
-    assert calls == [] and secret_rows(page) == set() and "Search to list the secrets you can see" in page
-    assert 'name="q"' in page and '<option value="17">' in page   # the form and the person's folders are still there
-    assert add_secret(secrets, env="PORT").status_code == 400 and calls == []   # an error re-render does not search
-    assert secrets.client("owner").get("/apps/acme/notes", params={"q": "x" * 101}).status_code == 400 and calls == []
-    secrets.client("owner").get("/apps/acme/notes", params={"q": "notes"})
-    assert calls == [{"text": "notes", "folder_id": None, "take": 20}]
-
-
-def test_one_page_of_at_most_20_results_is_shown(portal):
-    doc = json.loads(MOCK.read_text())
-    doc["secrets"] += [{"id": 3000 + i, "name": f"bulk-{i:02d}", "folderId": 17, "secretTemplateId": 6001, "shared_with": []}
-                       for i in range(30)]
-    with_secret_server(portal, parse_mock(doc))
-    page = portal.client("owner").get("/apps/acme/notes", params={"q": "bulk"}).text
-    assert page.count("Ask security to share it with") == 20 and "Only the first 20 are shown: narrow the search" in page
-    page = portal.client("owner").get("/apps/acme/notes", params={"q": "notes"}).text
-    assert "Only the first" not in page
-
-
 def test_secrets_work_without_the_directory(portal):
     with_secret_server(portal)   # adds the person's verified link
     portal.app.state.settings = make_settings(secret_server=load_mock())   # directory off, Secret Server on
-    page = portal.client("owner").get("/apps/acme/notes", params={"q": ""}).text
-    assert "Secrets (Delinea Secret Server)" in page and "Associate Azure Identity" not in page and secret_rows(page) == {1042, 1044, 1050}
+    page = portal.client("owner").get("/apps/acme/notes").text
+    assert "Secrets (Delinea Secret Server)" in page and "Associate Azure Identity" not in page
+    assert 'href="/apps/acme/notes/secrets/new?environment=test"' in page
+    steps = portal.client("owner").get("/apps/acme/notes/secrets/new", params={"folder": "17"}).text
+    assert {1042, 1044} <= secret_rows(steps)
     assert "Connections are not available on this portal" not in page
     for path, form in (("azure-identity", {"principal_id": "sp-notes"}), ("databricks", {"warehouse_id": "wh-notes"}),
                        ("remove", {"what": "databricks"})):
@@ -579,7 +526,7 @@ def test_secrets_work_without_the_directory(portal):
     add_and_merge(portal)
     assert bindings(portal)[0].final["secrets"][0]["env"] == "NOTES_DB_PASSWORD"
     assert "from Delinea Secret Server: notes-db / password" in portal.client("owner").get("/apps/acme/notes").text
-    assert post(portal, "owner", "/apps/acme/notes/secrets/remove", env="NOTES_DB_PASSWORD").status_code == 303
+    assert post(portal, "owner", "/apps/acme/notes/secrets/remove", env="NOTES_DB_PASSWORD", confirmed="yes").status_code == 303
     assert bindings(portal)[0].final["secrets"] == []
 
 
@@ -611,3 +558,125 @@ def test_an_identity_alone_still_shows_its_egress(portal):
     link_identity_and_merge(portal)
     page = portal.client("owner").get("/apps/acme/notes").text
     assert "Egress on 443 to: <span class=\"mono\">login.microsoftonline.com</span>" in page and "from Delinea Secret Server" not in page
+
+
+# ---- the reskin: cards and a confirmation before a removal (spec 2026-10-30 R6) ----
+
+def test_the_page_is_cards_with_the_registration_summary_and_the_tabs(portal):
+    text = portal.client("owner").get("/apps/acme/notes").text
+    assert '<p><a href="/requests">&larr; My requests</a></p>' in text and '<nav class="tabs" aria-label="Environment">' in text
+    assert text.count('<section class="card connection">') == 2   # the Azure identity and Databricks (no Secret Server here)
+    assert '<section class="card">\n<h3>What the container gets</h3>' in text
+
+
+def test_a_removal_asks_first_and_only_the_confirming_post_removes(portal):
+    link_identity_and_merge(portal)
+    page = portal.client("owner").get("/apps/acme/notes").text
+    assert 'href="/apps/acme/notes?environment=test&amp;confirm=azure-identity"' in page
+    assert 'action="/apps/acme/notes/remove"' not in page   # no removal form until it is confirmed
+    ask = portal.client("owner").get("/apps/acme/notes", params={"confirm": "azure-identity"})
+    assert ask.status_code == 200 and "Remove the Azure identity?" in ask.text
+    assert 'name="what" value="azure-identity"' in ask.text and 'name="confirmed" value="yes"' in ask.text
+    assert 'href="/apps/acme/notes?environment=test">Keep it</a>' in ask.text and len(bindings(portal)) == 1   # asking changes nothing
+    refused = post(portal, "owner", "/apps/acme/notes/remove", what="azure-identity")
+    assert refused.status_code == 400 and "Confirm the removal first" in refused.text and len(bindings(portal)) == 1
+    assert post(portal, "owner", "/apps/acme/notes/remove", what="azure-identity", confirmed="yes").status_code == 303
+    assert len(bindings(portal)) == 2
+
+
+@pytest.mark.parametrize("params", [{"confirm": "databricks"}, {"confirm": "everything"}, {"confirm_secret": "NOPE"}])
+def test_asking_to_remove_what_isn_t_there_is_a_400(portal, params):
+    link_identity_and_merge(portal)   # an identity, no Databricks, no secrets
+    response = portal.client("owner").get("/apps/acme/notes", params=params)
+    assert response.status_code == 400 and "There is nothing to remove." in response.text
+
+
+def test_while_a_change_is_pending_remove_is_disabled_with_the_reason(portal):
+    link_identity_and_merge(portal)
+    assert post(portal, "owner", "/apps/acme/notes/databricks", warehouse_id="wh-notes").status_code == 303   # pending now
+    page = portal.client("owner").get("/apps/acme/notes").text
+    assert '<button class="danger" type="button" disabled>Remove</button>' in page and "Changes are paused until it lands." in page
+    assert portal.client("owner").get("/apps/acme/notes", params={"confirm": "azure-identity"}).status_code == 409
+
+
+def test_only_the_repo_s_admin_is_asked(portal):
+    link_identity_and_merge(portal)
+    assert portal.client("admin").get("/apps/acme/notes", params={"confirm": "azure-identity"}).status_code == 403
+
+
+def test_the_confirmation_page_is_free_of_inline_style_and_script(portal):
+    from test_portal_csp_pages import problems
+    link_identity_and_merge(portal)
+    assert problems(portal.client("owner").get("/apps/acme/notes", params={"confirm": "azure-identity"}).text) == []
+
+
+def test_a_linked_connection_can_be_removed_after_its_tag_or_grant_is_gone(portal):
+    """Round 6 review: Remove doesn't depend on the directory still offering the principal or the warehouse."""
+    link_identity_and_merge(portal)
+    link_databricks_and_merge(portal)
+    doc = copy.deepcopy(FAKE_DIRECTORY)
+    doc["principals"][0]["tagged_repo_name"] = "elsewhere"   # sp-notes untagged
+    for w in doc["databricks"]:
+        w["granted_to"] = ["sp-other"]   # nothing granted to sp-notes any more
+    portal.app.state.settings = make_settings(directory=parse(doc))
+    page = portal.client("owner").get("/apps/acme/notes").text
+    assert 'href="/apps/acme/notes?environment=test&amp;confirm=azure-identity"' in page
+    assert 'href="/apps/acme/notes?environment=test&amp;confirm=databricks"' in page
+    assert "No service principal is tagged for this repository yet." not in page
+    assert "No other service principal is tagged for this repository" in page and "No other warehouse is granted" in page
+
+
+def test_the_identity_s_values_show_once(portal):
+    link_identity_and_merge(portal)
+    page = portal.client("owner").get("/apps/acme/notes").text
+    card = page[page.index("<h3>Associate Azure Identity</h3>"):page.index("<h3>Enable Databricks Connection</h3>")]
+    assert card.count("11111111-1111-4111-8111-111111111111") == 1 and card.count(">sp-notes<") == 2   # the facts list and the select
+    assert "Linked: <span" not in card and "Not verified with Azure: checked against the" in card
+
+
+def overdue_record(portal):
+    """acme/notes registered with a review date that has passed, and its open review_overdue item."""
+    import datetime as dt
+    from portal_fakes import T0
+    from portal.store.base import IntakeObserved
+    portal.store.replace_intake_observed([IntakeObserved("acme/notes", "c" * 40, "intake/v2", True, portal.people["owner"].id, "low", "public",
+                                                         "Stores notes.", dt.date(2026, 10, 1), None, None)], observed_at=T0)
+    portal.store.open_rereview_item(repo="acme/notes", reason="review_overdue", key="2026-10-01", now=T0)
+
+
+def test_an_open_review_date_shows_on_the_app_page_with_the_way_to_renew(portal):
+    """Spec 2026-10-31 R7: the owner sees open date reasons as a banner on the app page, with a link to change or renew."""
+    overdue_record(portal)
+    owner = portal.client("owner").get("/apps/acme/notes").text
+    assert ("<p class=\"callout warn\" role=\"status\">This app's registration was due for review on 2026-10-01. "
+            '<a href="/register?repo=acme/notes">Change or renew the registration</a>.</p>') in owner
+    admin = portal.client("admin").get("/apps/acme/notes").text   # a portal admin who isn't the repo's admin sees it, without the link
+    assert "was due for review on 2026-10-01. An admin of the repository can renew it." in admin and "/register?repo=" not in admin
+
+
+def test_a_registered_app_without_a_reason_still_links_to_change_or_renew(portal):
+    import datetime as dt
+    from portal_fakes import T0
+    from portal.store.base import IntakeObserved
+    portal.store.replace_intake_observed([IntakeObserved("acme/notes", "c" * 40, "intake/v2", True, portal.people["owner"].id, "low", "public",
+                                                         "Stores notes.", dt.date(2027, 10, 1), None, None)], observed_at=T0)
+    text = portal.client("owner").get("/apps/acme/notes").text
+    assert '<p><a href="/register?repo=acme/notes">Change or renew the registration</a></p>' in text and "callout warn" not in text
+
+
+def test_a_scorecard_item_is_not_the_owner_s_banner(portal):
+    """Owners act through a change request; a scorecard signal is the admins' to decide (spec R7)."""
+    from portal_fakes import T0
+    portal.store.add_rereview_event(doc={"schema": "re-review-event/v1", "repo": "acme/notes", "pr": 7, "head_sha": "a" * 40, "tree_sha": "b" * 40,
+                                         "scorecard_version": "0.5.1", "created": "2026-10-31T12:00:00Z", "level": "elevated",
+                                         "floor": "standard", "complete": True, "signals": []}, run_repo="acme/scorecard-factory", run_id=1, now=T0)
+    portal.store.open_rereview_item(repo="acme/notes", reason="scorecard_signal", key="a" * 40, now=T0, event=("a" * 40, ("T-17",)))
+    assert "due for review" not in portal.client("owner").get("/apps/acme/notes").text
+
+
+def test_an_app_registered_only_in_the_factory_says_so_not_that_it_has_no_registration(portal):
+    """Visual check of 0.5.1: the review banner beside "No portal registration" read as a contradiction."""
+    overdue_record(portal)
+    text = portal.client("owner").get("/apps/acme/notes").text
+    assert "Registered outside the portal (the factory's intake record); a change or renewal here replaces it." in text
+    assert "No portal registration" not in text

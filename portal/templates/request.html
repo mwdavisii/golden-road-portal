@@ -1,30 +1,37 @@
 {% extends "base.html" %}
 {% from "_evidence.html" import evidence_view %}
+{% from "_change.html" import change_view %}
+{% from "_classification.html" import classification_cards with context %}
 {% set active = "requests" %}
 {% block title %}Request - golden road{% endblock %}
 {% block main %}
+<p><a href="/requests">&larr; My requests</a></p>
 <span class="eyebrow">Registration request</span>
-<h1 class="mono">{{ req.repo }}</h1>
-{% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
-<p class="meta">State: <strong class="badge state-{{ req.state }}">{{ req.state }}</strong> Submitted {{ req.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
+<div class="card-head"><h1 class="mono">{{ req.repo }}</h1><span class="badge state-{{ req.state }}">{{ STATE_LABELS.get(req.state, req.state) }}</span></div>
+<ol class="timeline" aria-label="Progress">
+{% for s in steps %}<li class="step-{{ s.status }}"><span class="step-dot" aria-hidden="true">{% if s.status == "done" %}&#10003;{% elif s.status == "failed" %}&#10007;{% elif s.status == "now" %}&#9679;{% endif %}</span>
+<span class="step-label">{{ s.label }}</span><span class="step-state">{{ STEP_WORDS[s.status] }}</span>{% if s.at %}<time datetime="{{ s.at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ s.at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}</li>
+{% endfor %}
+</ol>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
 {% if req.state == "failed" and req.failure_reason %}<p class="error">It could not be recorded: {{ req.failure_reason }}. An admin will look at it.</p>{% endif %}
 {% if req.state == "sent_back" and req.decision_note %}
-<section class="card">
-<h2>Sent back</h2>
+<section class="callout warn">
+<h2>What the admin asked you to change</h2>
 <pre class="prose">{{ req.decision_note }}</pre>
 </section>
 {% endif %}
 <section>
+{{ change_view(change) }}
 <h2>Purpose</h2>
 <pre class="prose">{{ req.draft.get("purpose", "") }}</pre>
 <dl class="facts">
 <div><dt>Data classification</dt><dd>{{ req.draft.get("data_classification", "not given") }}</dd></div>
-<div><dt>Your proposed tier</dt><dd>{{ req.draft.get("proposed_tier", "not given") }}</dd></div>
 </dl>
 </section>
 <section>
 <h2>What the platform found</h2>
-{{ evidence_view(evidence, problem, claim, effective, mismatch) }}
+{{ evidence_view(evidence, problem, claim, effective, mismatch, stale=stale) }}
 {% if req.final %}
 <h3>Approved</h3>
 <dl class="facts">
@@ -40,14 +47,11 @@
 <h2>Change it and send it again</h2>
 <form method="post" action="/requests/{{ req.id }}">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<p><label>Purpose<br><textarea name="purpose" rows="6" cols="70" required minlength="10" maxlength="4000">{{ req.draft.get("purpose", "") }}</textarea></label></p>
-<div class="field-row">
-<p><label>Data classification
-<select name="data_classification">{% for c in classifications %}<option value="{{ c }}"{% if req.draft.get("data_classification") == c %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></label></p>
-<p><label>Proposed tier
-<select name="proposed_tier">{% for t in tiers %}<option value="{{ t }}"{% if req.draft.get("proposed_tier") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label></p>
-</div>
-<p class="actions"><button type="submit">Send again</button></p>
+<p class="field"><label for="purpose">Purpose</label>
+<textarea id="purpose" name="purpose" rows="5" required minlength="10" maxlength="4000" data-counter="purpose-count" data-min="10">{{ req.draft.get("purpose", "") }}</textarea>
+<span class="counter" id="purpose-count"></span></p>
+{{ classification_cards(req.draft.get("data_classification")) }}
+<p class="actions"><button class="gold" type="submit">Send again</button></p>
 </form>
 </section>
 {% endif %}

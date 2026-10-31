@@ -47,6 +47,10 @@ class BindingRefused(Exception):
     pass
 
 
+class SecretServerUnavailable(BindingRefused):
+    """Secret Server didn't answer: nothing about the choice was refused, so a page says so with a 503."""
+
+
 def _tagged(directory, org, repo, principal_id):
     return next((p for p in directory.principals_for(org, repo) if p.id == principal_id), None)
 
@@ -106,7 +110,7 @@ def _secret(secret_server, secret_user, secrets, choice) -> dict:
     except SecretServerError:
         failure = "Secret Server could not answer: try again."  # never the error's text: the person sees this
     if failure:
-        raise BindingRefused(failure)
+        raise SecretServerUnavailable(failure)
     if not SECRET_NAME.fullmatch(summary.name):
         raise BindingRefused("This secret's name can't be recorded in a binding: rename it in Secret Server (letters, digits, "
                              "spaces, . _ -).")

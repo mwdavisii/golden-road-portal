@@ -13,7 +13,7 @@
     "server": {"enum": ["uvicorn", "gunicorn"]},
     "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
     "health_path": {"type": "string", "pattern": "^/[A-Za-z0-9_./-]*$", "allOf": [{"$ref": "#/$defs/single_line"}]},
-    "data_classification": {"enum": ["public", "internal", "restricted", "phi"]},
+    "data_classification": {"enum": ["public", "confidential", "protected"]},
     "egress": {
       "type": "array",
       "items": {

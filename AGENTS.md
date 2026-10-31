@@ -7,6 +7,6 @@
 - Call models only through the platform gateway, never a model provider directly. `builder guide` names the gateway host.
 - Never make this repository public.
 - Ask the user about data classification, roles and egress. Never decide them yourself.
-- This app's data classification is `internal`. The list of models approved for `internal` data is not published yet: ask the platform team before you add a model.
+- This app's data classification is `confidential`. The list of models approved for `confidential` data is not published yet: ask the platform team before you add a model.
 - To package or update this app, use the golden-road skill. Install it from the golden-road landing page: <https://github.com/mwdavisii/golden-road-agents>.
 <!-- golden-road:end -->

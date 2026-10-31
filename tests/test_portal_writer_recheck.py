@@ -74,7 +74,7 @@ def with_override(req, ev, given, *, on_request=True):
     (lambda r, e: (r, None), "no_evidence"),
     (lambda r, e: (dc.replace(r, final={**r.final, "evidence_commit": "d" * 40}), e), "evidence_mismatch"),
     (lambda r, e: (r, dc.replace(e, floor_tier="high")), "evidence_mismatch"),
-    (lambda r, e: (r, dc.replace(e, floor_classification="phi")), "evidence_mismatch"),
+    (lambda r, e: (r, dc.replace(e, floor_classification="protected")), "evidence_mismatch"),
     (lambda r, e: (dc.replace(r, final={k: v for k, v in r.final.items() if k != "evidence_commit"}), e), "evidence_mismatch"),
     (lambda r, e: below(r, e), "below_floor"),
     (lambda r, e: with_override(*below(r, e), override(r, by="p_" + "e" * 32)), "override_invalid"),
@@ -440,3 +440,13 @@ def test_a_secret_server_that_is_not_the_mock_is_refused(portal):
         def client(self):
             raise AssertionError("never asked")
     assert recheck(req, scfg(secret_server=Other()), None, portal.store, T0) == ["no_secret_server"]
+
+
+def test_a_change_that_drops_the_scorecard_mark_is_refused(portal):
+    import dataclasses as dc
+    from portal_fakes import approved_change, record_view
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id, scorecard="central"))
+    evidence = portal.store.evidence_for(req.id, req.submission)
+    assert recheck(req, writer_config(), evidence) == []
+    dropped = dc.replace(req, final={k: v for k, v in req.final.items() if k != "scorecard"})
+    assert "scorecard_changed" in recheck(dropped, writer_config(), evidence)

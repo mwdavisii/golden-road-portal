@@ -25,7 +25,7 @@
       }
     ]
   },
-  "data_classification": "internal",
+  "data_classification": "confidential",
   "egress": [
     {
       "host": "api.github.com",
@@ -101,7 +101,15 @@
       "secret": false
     },
     {
+      "name": "PORTAL_CLASSIFICATION_POLICY_URL",
+      "secret": false
+    },
+    {
       "name": "PORTAL_REPO_ADMINS_STALE_AFTER",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_REREVIEW_STALE_DAYS",
       "secret": false
     }
   ],

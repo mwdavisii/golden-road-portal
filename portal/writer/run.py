@@ -8,7 +8,7 @@ The merge is pinned. The writer's pull request bypasses the review rule, so what
 stores the commit its last contents PUT returned (head_sha) and the base commit it branched from (base_sha), and merges only if
 the PR's head is still that commit, the PR targets the default branch, the PR changes exactly the allowlisted files, and the
 commits from the stored base to head are the writer's own, one per file. A registration adds its one intake record in the
-factory. A binding (spec 2026-10-29 GitOps deploy repo, correction 3) writes its environment's bindings.yaml and then its
+factory; a change replaces it in place, only if it is still the record the approver saw (spec 2026-10-31 C5). A binding (spec 2026-10-29 GitOps deploy repo, correction 3) writes its environment's bindings.yaml and then its
 composed.yaml in golden-road-deploy, both added or modified in place (an unlink rewrites bindings.yaml, never deletes it);
 composed.yaml is computed here with the portal's byte-identical copy of golden-road compose, so deploy-check's drift check
 passes, and it is left out only when it would not change. The merge request names head, so a push after the check can't ride
@@ -21,6 +21,7 @@ import re
 
 import yaml
 
+from ..collectors.repo_files import case_variants
 from ..compose import ComposeError, UniqueKeyLoader, compose
 from ..contracts import validate
 from ..github.client import GitHubError
@@ -30,8 +31,8 @@ from .allowlist import factory, intake_path, target_for, writer_merges
 from .recheck import recheck
 from .render import branch_name, content_for, pr_body, title
 
-# The status each file of a writer PR may show: a registration adds its record; a binding adds or updates its bindings.yaml and
-# composed.yaml in place (an unlink rewrites bindings.yaml, never deletes it).
+# The status each file of a writer PR may show: a registration adds its record (a change modifies it, _statuses); a binding adds or
+# updates its bindings.yaml and composed.yaml in place (an unlink rewrites bindings.yaml, never deletes it).
 STATUSES = {"registration": ("added",), "binding": ("added", "modified")}
 
 ACTIONS_APP_ID = 15368  # the GitHub Actions app: the source the factory's ruleset pins its required checks to
@@ -103,6 +104,8 @@ def _file(gh, repo, path, ref):
         if exc.status == 404:
             return None
         raise
+    if not isinstance(doc, dict) or doc.get("type", "file") != "file":  # a directory (a listing), a symlink or a submodule
+        raise Refused("not_a_file")
     try:
         raw = base64.b64decode(doc.get("content", "") or "", validate=False) if doc.get("encoding", "base64") == "base64" else b""
     except ValueError:  # undecodable content is simply not our record
@@ -227,6 +230,8 @@ def _finish(store, gh, cfg, target, req, merge_sha, now, merged_at=None) -> str:
     try:
         expected = _expected_at_merge(gh, target, req)
         found = {path: _file(gh, target.repo, path, merge_sha) for path in expected}
+    except Refused:
+        return _fail(store, req, "merged_file_differs", now)  # not a file at the merge commit: not what was written
     except (GitHubError, KeyError, TypeError, ValueError, AttributeError):
         return pending
     if any(f is not None and f[1] != expected[path] for path, f in found.items()):
@@ -240,7 +245,10 @@ def _finish(store, gh, cfg, target, req, merge_sha, now, merged_at=None) -> str:
 
 
 class Refused(Exception):
-    """A binding the writer can't write: its environment has no release pinned (not_deployed), or composing refused (compose_refused)."""
+    """What the writer refuses to write, by a reason written here: a path that isn't a file (not_a_file), a record in another spelling
+    (record_case_mismatch), a record that moved (record_changed; record_conflict when GitHub's PUT finds it), or is already there
+    (already_registered), a binding whose environment
+    has no release pinned (not_deployed), or composing refused (compose_refused)."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -288,15 +296,29 @@ def _factory_head(gh, org):
     return repo, _sha(gh.call("GET", f"/repos/{repo}/git/ref/heads/{_default_branch(gh, repo)}").json()["object"]["sha"])
 
 
-def _files_to_write(gh, cfg, req, target, base, base_sha, content):
-    """[(path, content, existing (blob sha, bytes) or None)] in write order. A registration writes its new intake record. A binding
+def _statuses(req, evidence):
+    """The status the writer's one commit gives the record: added for a first registration, modified for a change (spec 2026-10-31 C5)."""
+    if req.kind == "registration":
+        return ("modified",) if evidence is not None and evidence.record_sha else ("added",)
+    return STATUSES[req.kind]
+
+
+def _files_to_write(gh, cfg, req, target, base, base_sha, content, expected_sha=None):
+    """[(path, content, existing (blob sha, bytes) or None)] in write order. A registration writes its new intake record, and a change
+    (expected_sha: the blob its evidence saw) replaces exactly that one. A binding
     writes its bindings.yaml and then its composed.yaml, the latter only when it changes; first its app must be registered (the
     intake record in the factory) and deployed in the environment (release.yaml and base/manifests.yaml at base_sha)."""
     existing = _file(gh, target.repo, target.path, base_sha)  # read at the commit the branch starts from: the blob a PUT replaces
     if req.kind != "binding":
-        if existing is not None:
-            raise Refused(f"already_registered: {target.path} exists on {base}")
-        return [(target.path, content, None)]
+        if case_variants(gh, target.repo, target.path, base_sha):  # the record in another spelling: the scorecard reads only one
+            raise Refused("record_case_mismatch")
+        if expected_sha is None:  # a first registration: nothing may be there
+            if existing is not None:
+                raise Refused(f"already_registered: {target.path} exists on {base}")
+            return [(target.path, content, None)]
+        if existing is None or existing[0] != expected_sha:  # a change: exactly the record the approver saw, or nothing is written
+            raise Refused("record_changed")
+        return [(target.path, content, existing)]
     d = target.path.rsplit("/", 1)[0]
     release = _file(gh, target.repo, f"{d}/release.yaml", base_sha)
     manifests = _file(gh, target.repo, f"{d}/base/manifests.yaml", base_sha)
@@ -315,6 +337,7 @@ def _write(store, gh, cfg, req, now) -> str:
     problems = recheck(req, cfg, evidence, store, now)
     if problems:
         return _fail(store, req, "recheck: " + ", ".join(problems), now)
+    change = req.kind == "registration" and evidence is not None and evidence.record_sha is not None
     target, branch = target_for(cfg.org, req), branch_name(req.id)
     content = content_for(req).encode("utf-8")
     try:
@@ -330,7 +353,7 @@ def _write(store, gh, cfg, req, now) -> str:
             if _file(gh, repo, intake_path(req.repo), head) is None:
                 return _fail(store, req, "not_registered", now)
         try:
-            files = _files_to_write(gh, cfg, req, target, base, base_sha, content)
+            files = _files_to_write(gh, cfg, req, target, base, base_sha, content, evidence.record_sha if change else None)
         except Refused as exc:
             return _fail(store, req, exc.reason, now)
         try:
@@ -342,21 +365,26 @@ def _write(store, gh, cfg, req, now) -> str:
             # 422: the branch exists (an interrupted run, or someone got there first). It is ours only at the base commit we
             # branched from (nothing written yet) or at the writer's own commits.
             tip = _sha(gh.call("GET", f"/repos/{target.repo}/git/ref/heads/{branch}").json()["object"]["sha"])
-            done = 0 if tip == base_sha else _is_ours(gh, target, tip, base_sha, files, STATUSES[req.kind])
+            done = 0 if tip == base_sha else _is_ours(gh, target, tip, base_sha, files, _statuses(req, evidence))
             if done is None:
                 return _fail(store, req, "branch_not_ours", now)
         head = tip
         for path, data, existing in files[done:]:  # one contents-API commit per file, in order
-            body = {"message": title(req), "content": base64.b64encode(data).decode("ascii"), "branch": branch}
+            body = {"message": title(req, change), "content": base64.b64encode(data).decode("ascii"), "branch": branch}
             if existing is not None:
                 body["sha"] = _sha(existing[0])  # updated in place: the contents API needs the blob it replaces
-            head = _sha(gh.call("PUT", f"/repos/{target.repo}/contents/{path}", ok=(200, 201), json=body).json()["commit"]["sha"])
+            try:
+                head = _sha(gh.call("PUT", f"/repos/{target.repo}/contents/{path}", ok=(200, 201), json=body).json()["commit"]["sha"])
+            except GitHubError as exc:
+                if change and exc.status == 409:  # GitHub saw a conflict for the file it replaces (most often, it moved after the read
+                    return _fail(store, req, "record_conflict", now)  # above): nothing was written; the person asks again
+                raise
         owner = target.repo.split("/")[0]
         found = gh.call("GET", f"/repos/{target.repo}/pulls", params={"head": f"{owner}:{branch}", "state": "all"}).json()
         body = pr_body(req, store.get_person(req.requested_by), store.get_person(req.decided_by) if req.decided_by else None, target,
-                       platform_user=getattr(cfg.secret_server, "platform_user", None))
+                       platform_user=getattr(cfg.secret_server, "platform_user", None), current=evidence.record if change else None)
         pr = found[0] if found else gh.call("POST", f"/repos/{target.repo}/pulls", ok=(201,), json={
-            "title": title(req), "head": branch, "base": base, "maintainer_can_modify": False, "body": body}).json()
+            "title": title(req, change), "head": branch, "base": base, "maintainer_can_modify": False, "body": body}).json()
         if not _our_pr(pr, base, head, target.repo):
             return _fail(store, req, "pr_not_ours", now)
         number, url = int(pr["number"]), str(pr["html_url"])
@@ -371,6 +399,8 @@ def _write(store, gh, cfg, req, now) -> str:
                 pass
         store.mark_pr_open(request_id=req.id, branch=branch, pr_number=number, pr_url=url, head_sha=head, base_sha=base_sha, now=now)
         return f"{req.id}: pull request #{number} opened"
+    except Refused as exc:
+        return _fail(store, req, exc.reason, now)
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
         return _fail(store, req, _reason(exc), now)
 
@@ -408,7 +438,8 @@ def _advance(store, gh, cfg, req, now) -> str:
         current = _sha(gh.call("GET", f"/repos/{target.repo}/git/ref/heads/{default_branch}").json()["object"]["sha"])
         if current != req.base_sha or pr.get("mergeable_state") == "behind" or (pr.get("base") or {}).get("sha") not in (None, current):
             return fail("base_moved")
-        order, statuses = _order(target), STATUSES[req.kind]
+        evidence = store.evidence_for(req.id, req.submission) if req.kind == "registration" else None
+        order, statuses = _order(target), _statuses(req, evidence)
         # the commits from the base to head are ours, one per file (for a binding, composed.yaml is left out when unchanged) ...
         written = _chain_writes(_chain(gh, target.repo, req.head_sha, req.base_sha, len(order)), order, statuses)
         if written is None:
@@ -446,5 +477,7 @@ def _advance(store, gh, cfg, req, now) -> str:
                 return f"{req.id}: merge not allowed yet ({exc.status})"
             raise
         return _finish(store, gh, cfg, target, req, _sha(merged["sha"]), now)
+    except Refused as exc:
+        return fail(exc.reason)
     except (GitHubError, KeyError, TypeError, ValueError) as exc:
         return fail(_reason(exc))

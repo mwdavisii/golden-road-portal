@@ -4,20 +4,26 @@
 {% block main %}
 <span class="eyebrow">Admin</span>
 <h1>Audit log</h1>
+<p class="lead">Every change the portal made, newest first. Nothing here can be edited.</p>
 <div class="table-wrap">
-<table>
-<tr><th>When</th><th>Who</th><th>Action</th><th>Subject</th><th>Reason</th><th>Before</th><th>After</th></tr>
+<table class="audit">
+<colgroup><col class="when"><col class="who"><col class="action"><col class="subject"><col class="details"></colgroup>
+<thead><tr><th scope="col">When</th><th scope="col">Who</th><th scope="col">Action</th><th scope="col">Subject</th><th scope="col">Reason and change</th></tr></thead>
+<tbody>
 {% for e in entries %}
 <tr>
 <td class="when">{{ e.at.strftime("%Y-%m-%d %H:%M:%S") }}</td>
 <td>{{ e.actor_kind }}{% if e.actor_id %} <span class="mono">{{ e.actor_id }}</span>{% endif %}</td>
-<td><code>{{ e.action }}</code></td>
+<td class="action"><code>{% for part in e.action.split(".") %}{{ part }}{% if not loop.last %}.<wbr>{% endif %}{% endfor %}</code></td>
 <td>{{ e.subject_kind }} <span class="mono">{{ e.subject_id }}</span></td>
-<td>{{ e.reason }}</td>
-<td class="json">{{ e.before|tojson if e.before is not none else "" }}</td>
-<td class="json">{{ e.after|tojson if e.after is not none else "" }}</td>
+<td><details><summary>{{ e.reason|truncate(80) if e.reason else "Before and after" }}</summary>
+{% if e.reason %}<p>{{ e.reason }}</p>{% endif %}
+<p class="meta">Before</p><pre class="json">{{ e.before|tojson(indent=1) if e.before is not none else "none" }}</pre>
+<p class="meta">After</p><pre class="json">{{ e.after|tojson(indent=1) if e.after is not none else "none" }}</pre>
+</details></td>
 </tr>
 {% endfor %}
+</tbody>
 </table>
 </div>
 {% endblock %}

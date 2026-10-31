@@ -6,6 +6,7 @@ import json
 import re
 from urllib.parse import urlsplit
 
+from .classification import POLICY_LINK_MAX, policy_link_ok
 from .roles import ROLE_NAMES
 
 ORG = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
@@ -91,6 +92,8 @@ class Settings:
     data_process_url: str = ""  # where analytics' process for warehouse grants is described
     secret_server: object = None  # portal.secretserver_mock.MockSecretServer when PORTAL_SECRET_SERVER=mock; None hides app secrets
     secret_process_url: str = ""  # where security's process for sharing a secret with golden-road-eso is described
+    classification_policy_url: str = ""  # PORTAL_CLASSIFICATION_POLICY_URL: the data classification policy; empty hides the link
+    rereview_stale_days: int = 30  # PORTAL_REREVIEW_STALE_DAYS: an item open longer is flagged rereview_stale; 0 turns the flag off
 
     @property
     def origin(self) -> str:
@@ -172,6 +175,15 @@ class Settings:
                 raise SettingsError("PORTAL_REPO_ADMINS_STALE_AFTER must be from 60 seconds to 7 days")
             return stale
 
+        def days_ok(name):
+            def run(value):
+                from .rereview import BadSetting, parse_days
+                try:
+                    return parse_days(name, value)
+                except BadSetting as exc:
+                    raise SettingsError(str(exc)) from None
+            return run
+
         def directory_ok(value):
             if value == "":
                 return None
@@ -194,6 +206,12 @@ class Settings:
             except MockSecretServerError as exc:
                 raise SettingsError("PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid") from exc
 
+        def policy_ok(value):  # the one rule for the policy link, as configure.py and the builder apply it (contracts.classification)
+            if value and not policy_link_ok(value):
+                raise SettingsError(f"PORTAL_CLASSIFICATION_POLICY_URL must be an https URL with a host name, at most {POLICY_LINK_MAX} "
+                                    "characters, and no user info, spaces, quotes or brackets")
+            return value
+
         def link_ok(name):
             return lambda value: _https(name, value, query=True) if value else ""  # a wiki page link may need its query
 
@@ -213,7 +231,9 @@ class Settings:
             identity_process_url=get("PORTAL_IDENTITY_PROCESS_URL", link_ok("PORTAL_IDENTITY_PROCESS_URL"), ""),
             data_process_url=get("PORTAL_DATA_PROCESS_URL", link_ok("PORTAL_DATA_PROCESS_URL"), ""),
             secret_server=get("PORTAL_SECRET_SERVER", secret_server_ok, ""),
-            secret_process_url=get("PORTAL_SECRET_PROCESS_URL", link_ok("PORTAL_SECRET_PROCESS_URL"), ""))
+            secret_process_url=get("PORTAL_SECRET_PROCESS_URL", link_ok("PORTAL_SECRET_PROCESS_URL"), ""),
+            classification_policy_url=get("PORTAL_CLASSIFICATION_POLICY_URL", policy_ok, ""),
+            rereview_stale_days=get("PORTAL_REREVIEW_STALE_DAYS", days_ok("PORTAL_REREVIEW_STALE_DAYS"), ""))
         get("PORTAL_SECRET_SERVER_URL", no_secret_server_url, "")
         stale = get("PORTAL_REPO_ADMINS_STALE_AFTER", stale_ok, "600")
         if problems:

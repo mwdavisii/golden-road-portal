@@ -3,23 +3,27 @@
 {% block title %}My requests - golden road{% endblock %}
 {% block main %}
 <span class="eyebrow">Registration</span>
-<h1>My requests</h1>
+<div class="card-head"><h1>My requests</h1><a class="button" href="/register">Register an app</a></div>
 {% set app_names = apps|map(attribute="repo")|list %}
 {% if apps %}
-<section>
 <h2>My apps</h2>
-<p>The repositories you are an admin of, as the portal last saw them. An app's page shows its registration and its connections.</p>
-<ul>{% for a in apps %}<li><a class="mono" href="/apps/{{ a.repo }}">{{ a.repo }}</a></li>{% endfor %}</ul>
-</section>
+<p class="meta">The repositories you are an admin of, as the portal last saw them. An app's page shows its registration and its connections.</p>
+<ul class="apps">{% for a in apps %}<li><a href="/apps/{{ a.repo }}"><span class="mono">{{ a.repo }}</span><span class="more">Manage connections &rarr;</span></a></li>{% endfor %}</ul>
 {% endif %}
+<h2>Requests</h2>
+<nav class="chips" aria-label="Filter requests">{% for key, label in (("all", "All"), ("attention", "Needs attention"), ("merged", "Merged")) %}<a href="/requests?filter={{ key }}"{% if filter == key %} aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>
 {% if requests %}
 <div class="table-wrap">
-<table>
-<tr><th>Repository</th><th>Kind</th><th>State</th><th>Submitted</th></tr>
-{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}?environment={{ environment_of(r) }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections ({{ environment_of(r) }}){% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ r.state }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
+<table class="requests">
+<thead><tr><th scope="col">Repository</th><th scope="col">Kind</th><th scope="col">State</th><th scope="col">Submitted</th></tr></thead>
+<tbody>
+{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}?environment={{ environment_of(r) }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections ({{ environment_of(r) }}){% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ STATE_LABELS.get(r.state, r.state) }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
 {% endfor %}
+</tbody>
 </table>
 </div>
+{% elif any_requests %}
+<div class="empty"><p>No request matches this filter.</p></div>
 {% else %}
 <div class="empty"><p>You have not registered anything yet. <a href="/register">Register an app</a>.</p></div>
 {% endif %}

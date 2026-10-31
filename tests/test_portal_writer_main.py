@@ -30,7 +30,9 @@ def run(tmp_path, gh, store, env=None, argv=("--once",), key=None, **kw):
 
 def good_github():
     gh = recorded()
-    gh.routes.update(gh_for_write().routes)
+    write = gh_for_write()
+    gh.routes.update(write.routes)
+    gh.fallbacks += write.fallbacks
     gh.on("POST", "/app/installations/777/access_tokens", (201, {"token": "ghs_" + "w" * 36, "expires_at": "2099-01-01T00:00:00Z"}))
     return gh
 

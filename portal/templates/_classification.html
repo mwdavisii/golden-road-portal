@@ -1,0 +1,17 @@
+{# The classification picker (spec 2026-10-30 L3, R3): three radio cards with their one lines, and the policy link when one is set.
+   Real radio inputs inside their labels, in a fieldset with a legend: it works without JavaScript, and a screen reader reads a group.
+   The link is autoescaped inside a quoted href; settings only accepts an https link (classification.policy_link_ok). Import it
+   "with context" so it sees settings. #}
+{% macro classification_cards(chosen, floor=none) %}
+<fieldset class="choices">
+<legend>Data classification</legend>
+{% if settings.classification_policy_url %}<p class="hint"><a href="{{ settings.classification_policy_url }}" target="_blank" rel="noopener noreferrer">Read the data classification policy</a> (opens in a new tab).</p>{% endif %}
+<div class="choice-grid">
+{% for level, means in CLASSIFICATION_LEVELS %}
+<label class="choice"><input type="radio" name="data_classification" value="{{ level }}" required{% if chosen == level %} checked{% endif %}>
+<span class="choice-title">{{ level|capitalize }}{% if floor == level %} <span class="tag">floor</span>{% endif %}</span>
+<span class="choice-line">{{ means }}</span></label>
+{% endfor %}
+</div>
+</fieldset>
+{% endmacro %}

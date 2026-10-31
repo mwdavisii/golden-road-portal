@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 import yaml
-from portal_fakes import T0, FakeGitHub, approved_request, binding_request, fake_directory, transport, writer_config
+from portal_fakes import T0, FakeGitHub, approved_request, binding_request, fake_directory, intake_trees, transport, writer_config
 
 from portal.github.client import GitHub
 from portal.store.base import Conflict
@@ -28,6 +28,7 @@ def gh_for_write():
     gh.on("GET", R, (200, gh.fixture("repo_factory")))
     gh.on("GET", R + "/git/ref/heads/main", (200, gh.fixture("ref_main")))
     gh.on("GET", FILE, (404, {"message": "Not Found"}))
+    intake_trees(gh, "acme/scorecard-factory", BASE, [])  # the base commit's tree: no record in any spelling
     gh.on("POST", R + "/git/refs", (201, {"ref": "refs/heads/portal/request-x"}))
     gh.on("PUT", FILE, (201, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
     gh.on("GET", R + "/pulls", (200, []))
@@ -104,7 +105,8 @@ def test_an_approved_registration_becomes_a_pr_with_the_file_and_the_pinned_comm
     pr = json.loads(gh.called("POST", R + "/pulls")[0]["body"])
     assert pr["base"] == "main" and req.id in pr["body"] and portal.people["admin"].id in pr["body"]
     assert "Purpose and classification checked." in pr["body"]
-    assert {c["path"] for c in gh.calls} <= {R, R + "/git/ref/heads/main", FILE, R + "/git/refs", R + "/pulls"}, "only the allowlisted file"
+    # only the allowlisted file (and the base commit's root tree, read for another spelling of it)
+    assert {c["path"] for c in gh.calls} <= {R, R + "/git/ref/heads/main", FILE, R + f"/git/trees/{BASE}", R + "/git/refs", R + "/pulls"}
 
 
 def test_the_pr_merges_the_pinned_commit_once_the_required_check_passes(portal):
@@ -1310,3 +1312,110 @@ def test_test_bindings_and_registrations_still_merge_once_the_checks_pass(portal
     gh = advancing(req=reg)
     run_once(portal.store, client(gh), writer_config(), T0)
     assert portal.store.get_request(reg.id).state == "merged" and gh.called("PUT", R + "/pulls/12/merge")
+
+
+from portal_fakes import approved_change, record_view  # noqa: E402
+
+TOOLS = R + "/contents/intake/acme/tools.yaml"
+
+
+def gh_for_change(current_sha="c" * 40, found=True, listed=("tools.yaml",)):
+    gh = FakeGitHub()
+    intake_trees(gh, "acme/scorecard-factory", BASE, [f"intake/acme/{n}" for n in (listed if found else ())])
+    gh.on("GET", R, (200, gh.fixture("repo_factory")))
+    gh.on("GET", R + "/git/ref/heads/main", (200, gh.fixture("ref_main")))
+    gh.on("GET", TOOLS, (200, {"type": "file", "sha": current_sha, "encoding": "base64", "content": ""}) if found else (404, {"message": "Not Found"}))
+    gh.on("POST", R + "/git/refs", (201, {"ref": "refs/heads/portal/request-x"}))
+    gh.on("PUT", TOOLS, (200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
+    gh.on("GET", R + "/pulls", (200, []))
+    gh.on("POST", R + "/pulls", (201, gh.fixture("pull_created")))
+    return gh
+
+
+def test_a_change_replaces_the_record_the_approver_saw_in_place(portal):
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id))
+    gh = gh_for_change()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+    [put] = gh.called("PUT", TOOLS)
+    body = json.loads(put["body"])
+    assert body["sha"] == "c" * 40 and body["message"] == f"Change the registration of acme/tools (portal request {req.id})"
+    assert yaml.safe_load(base64.b64decode(body["content"])) == req.final
+    pr = json.loads(gh.called("POST", R + "/pulls")[0]["body"])
+    assert pr["title"].startswith("Change the registration of acme/tools") and "- Review by: `2026-11-15` → `2027-10-23`" in pr["body"]
+
+
+@pytest.mark.parametrize("sha, found", [("d" * 40, True), ("c" * 40, False)])
+def test_a_record_that_moved_or_went_fails_record_changed_and_writes_nothing(portal, sha, found):
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id))
+    gh = gh_for_change(sha, found)
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "record_changed"
+    assert not gh.called("POST", R + "/git/refs") and not gh.called("PUT", TOOLS)
+
+
+def test_a_v1_record_is_replaced_by_a_complete_v2(portal):
+    current = record_view("platform-team", schema="intake/v1", by_portal=False)
+    del current["review_by"]
+    req = approved_change(portal.store, portal.people, T0, record=current)
+    gh = gh_for_change()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    written = yaml.safe_load(base64.b64decode(json.loads(gh.called("PUT", TOOLS)[0]["body"])["content"]))
+    assert written["schema"] == "intake/v2" and written["owner"] == written["registered_by"] == portal.people["owner"].id
+    assert (written["approved_by"], written["request"]) == (portal.people["admin"].id, req.id)
+    assert "- Record: `intake/v1` → `intake/v2`" in json.loads(gh.called("POST", R + "/pulls")[0]["body"])["body"]
+
+
+def test_a_change_by_another_repo_admin_makes_them_the_owner(portal):
+    req = approved_change(portal.store, portal.people, T0, record=record_view("p_" + "7" * 32))
+    gh = gh_for_change()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    written = yaml.safe_load(base64.b64decode(json.loads(gh.called("PUT", TOOLS)[0]["body"])["content"]))
+    assert written["owner"] == portal.people["owner"].id
+    assert f"- Owner: `{'p_' + '7' * 32}` → `{portal.people['owner'].id}`" in json.loads(gh.called("POST", R + "/pulls")[0]["body"])["body"]
+
+
+@pytest.mark.parametrize("status, outcome", [("modified", ("merged", None)), ("added", ("failed", "pr_commit_not_ours"))])
+def test_a_change_s_pr_must_modify_the_record(portal, status, outcome):
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id))
+    run_once(portal.store, client(gh_for_change()), writer_config(), T0)
+    req = portal.store.get_request(req.id)
+    commit = {**FakeGitHub.fixture("commit_head"), "files": [{"filename": "intake/acme/tools.yaml", "status": status}]}
+    gh = advancing(commit=commit, files=[{"filename": "intake/acme/tools.yaml", "status": status, "additions": 3, "deletions": 3}], req=req)
+    gh.on("GET", TOOLS, landed(req))
+    run_once(portal.store, client(gh), writer_config(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == outcome
+
+
+# ---- more cases ----
+
+def test_a_change_s_put_github_refuses_with_a_conflict_is_record_conflict(portal):
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id))
+    gh = gh_for_change()
+    gh.routes[("PUT", "api.github.com", TOOLS)] = [(409, {"message": "sha does not match"})]
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "record_conflict"
+
+
+def test_a_change_whose_record_has_another_spelling_too_writes_nothing(portal):
+    req = approved_change(portal.store, portal.people, T0, record=record_view(portal.people["owner"].id))
+    gh = gh_for_change(listed=("tools.yaml", "Tools.yaml"))
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "record_case_mismatch" and not gh.called("PUT", TOOLS)
+
+
+def test_a_first_registration_meeting_a_record_in_another_case_writes_nothing(portal):
+    req = approved_request(portal.store, portal.people, T0)
+    gh = gh_for_write()
+    intake_trees(gh, "acme/scorecard-factory", BASE, ["intake/ACME/notes.yaml"])
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "record_case_mismatch" and not gh.called("PUT", FILE)
+
+
+def test_a_directory_where_the_record_goes_is_refused_by_name(portal):
+    req = approved_request(portal.store, portal.people, T0)
+    gh = gh_for_write()
+    gh.routes[("GET", "api.github.com", FILE)] = [(200, [{"name": "x.yaml", "type": "file"}])]
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "not_a_file" and not gh.called("PUT", FILE)

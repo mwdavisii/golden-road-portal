@@ -16,7 +16,7 @@ spec:
       labels:
         app.kubernetes.io/name: golden-road-portal
         app.kubernetes.io/managed-by: golden-road-builder
-        platform/data-classification: internal
+        platform/data-classification: confidential
     spec:
       serviceAccountName: golden-road-portal
       automountServiceAccountToken: false
@@ -124,11 +124,23 @@ spec:
               name: golden-road-portal-config
               key: PORTAL_SECRET_PROCESS_URL
               optional: true
+        - name: PORTAL_CLASSIFICATION_POLICY_URL
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_CLASSIFICATION_POLICY_URL
+              optional: true
         - name: PORTAL_REPO_ADMINS_STALE_AFTER
           valueFrom:
             configMapKeyRef:
               name: golden-road-portal-config
               key: PORTAL_REPO_ADMINS_STALE_AFTER
+              optional: true
+        - name: PORTAL_REREVIEW_STALE_DAYS
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_REREVIEW_STALE_DAYS
               optional: true
         resources:
           requests:

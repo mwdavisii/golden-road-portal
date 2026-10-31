@@ -1,23 +1,23 @@
 {
   "blocks": {
-    "AGENTS.md": "456d1c864d5fa330313d179c41ee8ce602b908217f1fa550bb26c26d1c90fad0",
+    "AGENTS.md": "793bf2339ff29d717e0df7cbd6afffff06edbe844c6f1a3bf177c0833066844f",
     "CLAUDE.md": "80335c8c80902767fd3e773e3411f3e25b118b411de6e71de97616c818b5f1b7"
   },
-  "builder_version": "0.4.2",
+  "builder_version": "0.5.1",
   "files": {
     ".dockerignore": "16db3544cb06ccea08c36be035d48d045628f77baf1fc24f23f8472896d68ede",
-    "Dockerfile": "669de18ad0dfe16621dc74720b9785624bb608eee6400facd011785646cdc621",
+    "Dockerfile": "e89c4e410a59ea47f43591d78699840d7274bc31f8bb37a7e7cd6601d7a4b2b3",
     "_platform/__init__.py": "44d60d96d8ea7bf72f6d79c09aa40f1a0257b59c788efae75c91796356efed77",
     "_platform/authz-policy.json": "bb368722ab6b01a4dfe6d487194e9bac05442e5765ec728225db2165d3e81188",
     "_platform/authz.py": "8d9b934260887fad674d58e3da6ec7b2f351ad6752140647ad674ea60e90df5e",
     "_platform/entry.py": "e8f40863d33142f513c038762ad6fedfc81d39694fa4e815b62b8e5945e64e06",
     "deploy/base/cilium-egress.yaml": "8f0a668be9827827b5bccd410ff3ff4537945334d6c9a9ac170e5a7e0932282f",
-    "deploy/base/deployment.yaml": "5bf497dfb834b34ae4732cf88df4c1ae363054ca970991cc6e6ee00dd9773d31",
+    "deploy/base/deployment.yaml": "5b6200e8f5a0167a5ff258fa91b9b9fd9aea2e03db7c34fff0c1815efbe2d2db",
     "deploy/base/kustomization.yaml": "02631caa8e959121188c9e01c8b927f4f126a5e4503ef34ed3a2fe790325938f",
     "deploy/base/networkpolicy.yaml": "3e351924532efbdfb3abfdac33097a4459a3f40ff66e667c6ab68b49611bb24c",
     "deploy/base/service.yaml": "7df87b5ae7381229a23da0d8e010b41b21584bf0765c80e1607e972bbf87309c",
     "deploy/base/serviceaccount.yaml": "e6b2adfa6600f9c608c3633253859eb593391eab9d78f366ee9dfde42f764298"
   },
-  "platform_config_sha256": "5bf7b47117094779ac40af2fc059f5344b654e69c2f5a7768d31d265fa4fb5c7",
-  "spec_sha256": "ed819f6a18904c022e3c50770b0f627406bc48da8d3fbbfb8d3f25169ea879f6"
+  "platform_config_sha256": "9e66d7cf73f65da944abfb6cb4350c05997bc2e56d48be12f272554878446086",
+  "spec_sha256": "ca83d0f352f51ed5c47bbf007e3d6581816c663ff9eb681dd2f94490beb4f1be"
 }

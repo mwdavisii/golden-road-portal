@@ -1,6 +1,6 @@
 """The floor rules (spec E3): security's config/registration.yaml in the factory, read from the factory's default branch at one
 commit. The loader accepts exactly what the scorecard's loader accepts (a test keeps the two in step): safe YAML, no duplicate
-keys, no implicit timestamps, then the registration-rules/v1 schema and the ordering of classification_tier."""
+keys, no implicit timestamps, no anchors or aliases, then the registration-rules/v1 schema and the ordering of classification_tier."""
 
 import yaml
 
@@ -20,8 +20,15 @@ class RulesProblem(Exception):
         self.code = code
 
 
-class _Loader(yaml.SafeLoader):
-    """SafeLoader without implicit timestamps and without duplicate keys."""
+class StrictLoader(yaml.SafeLoader):
+    """SafeLoader without implicit timestamps, without duplicate keys, and without anchors or aliases (the scorecard's loader refuses
+    them too): a few hundred bytes of aliases expand to a document no walk over it finishes, so they are refused before it is built."""
+
+    def compose_node(self, parent, index):
+        event = self.peek_event()
+        if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
+            raise yaml.YAMLError("anchors or aliases")
+        return super().compose_node(parent, index)
 
 
 def _construct_mapping(loader, node, deep=False):
@@ -37,8 +44,8 @@ def _construct_mapping(loader, node, deep=False):
     return yaml.SafeLoader.construct_mapping(loader, node, deep)
 
 
-_Loader.construct_mapping = _construct_mapping
-_Loader.yaml_implicit_resolvers = {
+StrictLoader.construct_mapping = _construct_mapping
+StrictLoader.yaml_implicit_resolvers = {
     key: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:timestamp"]
     for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
@@ -48,7 +55,7 @@ def parse_rules(raw: bytes) -> dict:
     if len(raw) > CAP:  # the scorecard's loader refuses the same size
         raise RulesProblem("rules_unreadable")
     try:
-        doc = yaml.load(raw.decode("utf-8"), Loader=_Loader)  # noqa: S506 - _Loader is a SafeLoader
+        doc = yaml.load(raw.decode("utf-8"), Loader=StrictLoader)  # noqa: S506 - StrictLoader is a SafeLoader
     except (UnicodeDecodeError, yaml.YAMLError, RecursionError):
         raise RulesProblem("rules_invalid") from None
     if rules_problems(doc):
