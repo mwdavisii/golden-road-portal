@@ -548,7 +548,7 @@ def test_the_web_reads_the_collector_s_progress_and_never_writes_it(pg_db):
         c.execute("DELETE FROM rereview_pending_event")
     with conn_as(pg_db, "portal_web") as c:
         for table in ("rereview_watermark", "rereview_failed_run", "rereview_pending_event"):
-            c.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table)))
+            c.execute(sql.Composed([sql.SQL("SELECT count(*) FROM "), sql.Identifier(table)]))
         with pytest.raises(errors.InsufficientPrivilege):
             c.execute("INSERT INTO rereview_pending_event (source, run_repo, run_id, repo, doc, seen_at) VALUES ('central', 'acme/f', 6, "
                       "'acme/x', '{}', now())")

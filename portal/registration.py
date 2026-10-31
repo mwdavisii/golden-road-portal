@@ -11,7 +11,7 @@ from .floor import CLASSIFICATIONS, TIERS, below_floor
 NO_EVIDENCE = "The platform hasn't computed this repo's evidence yet: approving waits for it."
 STALE_EVIDENCE = ("The platform's evidence for this request names a retired classification level: send it back, and the platform "
                   "computes it again when it is submitted again.")
-REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")  # bounded, as GitHub bounds names
 
 
 def add_months(day: dt.date, months: int) -> dt.date:

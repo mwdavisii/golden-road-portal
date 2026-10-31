@@ -14,7 +14,7 @@ from .render import page
 
 router = APIRouter()
 EMPTY = {"repo": "", "purpose": "", "data_classification": ""}
-REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")  # bounded, as GitHub bounds names
 
 
 def evidence_context(store, req) -> dict:
@@ -107,7 +107,7 @@ def register_page(request, principal, status=200, form=None, errors=(), chosen="
             form = {**EMPTY, "repo": repo}
             if change is not None and change.problem is None:
                 form.update(purpose=change.purpose, data_classification=change.data_classification)
-    back = "/register" + (f"?repo={chosen}" if REPO.fullmatch(chosen or "") else "")  # where sign-in comes back to
+    back = "/register" + (f"?repo={chosen}" if len(chosen or "") <= 201 and REPO.fullmatch(chosen or "") else "")  # where sign-in comes back to
     return page(request, "register.html", status, repos=repos, form=form or EMPTY, errors=notes, change=change, back=back)
 
 

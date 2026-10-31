@@ -16,7 +16,7 @@ STYLE_ATTR = re.compile(r"<[a-zA-Z][^>]*\sstyle\s*=", re.S)
 HANDLER = re.compile(r"<[a-zA-Z][^>]*\son[a-z]+\s*=", re.S)
 STYLE_TAG = re.compile(r"<style\b", re.I)
 JS_URL = re.compile(r"""(href|src|action)\s*=\s*["']?\s*javascript:""", re.I)
-SCRIPT = re.compile(r"<script\b([^>]*)>(.*?)</script\s*>", re.I | re.S)
+SCRIPT = re.compile(r"<script\b([^>]*)>(.*?)</script\b[^>]*>", re.I | re.S)
 
 
 JINJA = re.compile(r"{{.*?}}|{%.*?%}|{#.*?#}", re.S)
@@ -33,7 +33,7 @@ def problems(html: str) -> list[str]:
         found.append("a javascript: URL")
     for opened in SCRIPT_OPEN.finditer(html):
         rest = html[opened.end():]
-        closed = re.match(r"(.*?)</script\s*>", rest, re.I | re.S)
+        closed = re.match(r"(.*?)</script\b[^>]*>", rest, re.I | re.S)
         src = re.search(r'\bsrc="/static/([A-Za-z0-9_.-]+)"', opened.group(1))
         if closed is None or closed.group(1).strip() or not src:
             found.append("an inline script")
