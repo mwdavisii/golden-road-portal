@@ -11,8 +11,11 @@ commits from the stored base to head are the writer's own, one per file. A regis
 factory; a change replaces it in place, only if it is still the record the approver saw (spec 2026-10-31 C5). A binding (spec 2026-10-29 GitOps deploy repo, correction 3) writes its environment's bindings.yaml and then its
 composed.yaml in golden-road-deploy, both added or modified in place (an unlink rewrites bindings.yaml, never deletes it);
 composed.yaml is computed here with the portal's byte-identical copy of golden-road compose, so deploy-check's drift check
-passes, and it is left out only when it would not change. The merge request names head, so a push after the check can't ride
-along."""
+passes, and it is left out only when it would not change. A binding with mcp (spec 2026-10-31 M6) also writes its
+cloudflare-access.yaml, compose's cloudflare_access, when it changes; the writer never deletes it (the last server removed keeps the
+key with servers [], so the file stays), and a binding without mcp whose base already has one is refused. A binding's skills are
+read from the skills catalog at their pins, so its ConfigMap is deploy-check's. The merge request names head, so a push after the
+check can't ride along."""
 
 import base64
 import datetime as dt
@@ -22,7 +25,7 @@ import re
 import yaml
 
 from ..collectors.repo_files import case_variants
-from ..compose import ComposeError, UniqueKeyLoader, compose
+from ..compose import ComposeError, UniqueKeyLoader, cloudflare_access, compose
 from ..contracts import validate
 from ..github.client import GitHubError
 from ..github.shapes import BRANCH, SHA
@@ -32,7 +35,7 @@ from .recheck import recheck
 from .render import branch_name, content_for, pr_body, title
 
 # The status each file of a writer PR may show: a registration adds its record (a change modifies it, _statuses); a binding adds or
-# updates its bindings.yaml and composed.yaml in place (an unlink rewrites bindings.yaml, never deletes it).
+# updates its bindings.yaml, composed.yaml and cloudflare-access.yaml in place (an unlink rewrites bindings.yaml, never deletes it).
 STATUSES = {"registration": ("added",), "binding": ("added", "modified")}
 
 ACTIONS_APP_ID = 15368  # the GitHub Actions app: the source the factory's ruleset pins its required checks to
@@ -143,14 +146,20 @@ def _chain(gh, repo, head, base_sha, limit):
 
 
 def _chain_writes(commits, order, statuses):
-    """The chain writes order's files one commit each, in order (a prefix of them: a binding whose composed.yaml is unchanged
-    writes only bindings.yaml). Returns how many, or None."""
+    """The chain writes some of order's files, one commit each, in order, starting with order[0] (an ordered subsequence: a binding
+    writes bindings.yaml, then composed.yaml and cloudflare-access.yaml only when each changes). Returns the paths written, in
+    order, or None."""
     if commits is None or not 1 <= len(commits) <= len(order):
         return None
-    for commit, path in zip(commits, order):
-        if not _only_these(commit.get("files"), {path: statuses}):
+    written, at = [], 0
+    for commit in commits:
+        files = commit.get("files") if isinstance(commit, dict) else None
+        index = next((i for i in range(at, len(order)) if _only_these(files, {order[i]: statuses})), None)
+        if index is None or (not written and index != 0):
             return None
-    return len(commits)
+        written.append(order[index])
+        at = index + 1
+    return written
 
 
 def _is_ours(gh, target, tip, base_sha, files, statuses):
@@ -158,9 +167,10 @@ def _is_ours(gh, target, tip, base_sha, files, statuses):
     a chain of single-parent commits on the base we branched from, each adding (or, for a binding, modifying) exactly the next
     file with exactly the content we would write. None when the branch holds anything else."""
     order = [path for path, _, _ in files]
-    done = _chain_writes(_chain(gh, target.repo, tip, base_sha, len(order)), order, statuses)
-    if done is None:
+    written = _chain_writes(_chain(gh, target.repo, tip, base_sha, len(order)), order, statuses)
+    if written is None or written != order[:len(written)]:  # a resume picks up exactly where the plan left off, never skipping a file
         return None
+    done = len(written)
     for path, content, _ in files[:done]:
         found = _file(gh, target.repo, path, tip)
         if found is None or found[1] != content:
@@ -211,12 +221,14 @@ def _merged_at(pr):
 
 def _expected_at_merge(gh, target, req):
     """{path: the bytes it must read at the merge commit}: the record we wrote, and for a binding the composed.yaml of the commit the
-    PR was opened with (immutable, and what deploy-check passed). Raises on a GitHub error; a composed.yaml missing at that commit
+    PR was opened with (immutable, and what deploy-check passed), and its cloudflare-access.yaml too when the binding has mcp
+    (written by the PR or already there: either way deploy-check passed it). Raises on a GitHub error; a file missing at that commit
     is expected as b"" so it never matches."""
     expected = {target.path: content_for(req).encode("utf-8")}
-    if target.also is not None:
-        found = _file(gh, target.repo, target.also, req.head_sha)
-        expected[target.also] = b"" if found is None else found[1]
+    generated = [target.also] + ([target.access] if target.access is not None and "mcp" in (req.final or {}) else [])
+    for path in generated if target.also is not None else []:
+        found = _file(gh, target.repo, path, req.head_sha)
+        expected[path] = b"" if found is None else found[1]
     return expected
 
 
@@ -248,7 +260,8 @@ class Refused(Exception):
     """What the writer refuses to write, by a reason written here: a path that isn't a file (not_a_file), a record in another spelling
     (record_case_mismatch), a record that moved (record_changed; record_conflict when GitHub's PUT finds it), or is already there
     (already_registered), a binding whose environment
-    has no release pinned (not_deployed), or composing refused (compose_refused)."""
+    has no release pinned (not_deployed), composing refused (compose_refused), or a cloudflare-access.yaml beside a binding with no
+    mcp (access_file_without_mcp: the writer never deletes a file)."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -267,11 +280,41 @@ def _one_yaml_object(raw: bytes):
     return docs[0]
 
 
-def composed_for(request, release_raw: bytes, manifests_raw: bytes, binding_raw: bytes) -> bytes:
+def _binding_read_back(binding_raw: bytes) -> dict:
+    """bindings.yaml as deploy-check reads it: at most MAX_BINDING_BYTES, one YAML object, a valid binding/v2. Raises ValueError."""
+    if len(binding_raw) > MAX_BINDING_BYTES:
+        raise ValueError("bindings.yaml too large")
+    binding = _one_yaml_object(binding_raw)
+    if validate("binding.v2", binding):
+        raise ValueError("not a binding/v2")
+    return binding
+
+
+def _skills_for(binding, catalog):
+    """{name: {path: text}} for the binding's pinned skills, read from the catalog at each pin (deploy-verify's _skills_for, on the
+    same bytes), or None when it pins none. Raises ValueError for no catalog, another catalog's pin, a skill not in the catalog at
+    its commit, or one its skill.yaml there doesn't allow in the environment."""
+    pins = binding.get("skills") or []
+    if not pins:
+        return None
+    if catalog is None:
+        raise ValueError("no skills catalog")
+    files = {}
+    for pin in pins:
+        skill = catalog.skill(pin["name"], pin["commit"]) if pin["verified_by"] == catalog.name else None
+        if skill is None or binding["environment"] not in skill.environments:
+            raise ValueError("a skill the catalog doesn't hold for this environment")
+        files[pin["name"]] = skill.files
+    return files
+
+
+def composed_for(request, release_raw: bytes, manifests_raw: bytes, binding_raw: bytes, skills_catalog=None) -> bytes:
     """The environment's composed.yaml as `golden-road compose` writes it from release.yaml, base/manifests.yaml and the bindings.yaml
     the writer writes (binding_raw, read back as deploy-check reads it), byte for byte: portal/compose.py is golden_road/compose.py.
     release.yaml must be a valid deploy-release/v1 for exactly the request's repo and environment, and the manifests must be its
-    manifests_sha256. Raises Refused("compose_refused") on anything golden-road compose would refuse."""
+    manifests_sha256. The binding's skills are read from skills_catalog at their pins (the portal's catalog is the same bytes as the
+    one deploy-verify reads). Raises Refused("compose_refused") on anything golden-road compose would refuse, a skill the catalog
+    doesn't hold, and an owner with no MCP token name."""
     environment = request.draft["environment"]
     try:
         release = _one_yaml_object(release_raw)
@@ -280,14 +323,24 @@ def composed_for(request, release_raw: bytes, manifests_raw: bytes, binding_raw:
             raise ValueError("not this environment's release")
         if len(manifests_raw) > MAX_FILE_BYTES or hashlib.sha256(manifests_raw).hexdigest() != release["manifests_sha256"]:
             raise ValueError("not the release's manifests")
-        if len(binding_raw) > MAX_BINDING_BYTES:
-            raise ValueError("bindings.yaml too large")
-        binding = _one_yaml_object(binding_raw)
-        if validate("binding.v2", binding) or binding["repo"] != release["repo"] or binding["environment"] != environment:
+        binding = _binding_read_back(binding_raw)
+        if binding["repo"] != release["repo"] or binding["environment"] != environment:
             raise ValueError("not this environment's binding")
-        return compose(manifests_raw.decode("utf-8"), release["image"], binding, namespace=release["namespace"]).encode("utf-8")
+        return compose(manifests_raw.decode("utf-8"), release["image"], binding, namespace=release["namespace"],
+                       skills=_skills_for(binding, skills_catalog)).encode("utf-8")
     except (ComposeError, ValueError, KeyError, TypeError, yaml.YAMLError, RecursionError):  # UnicodeDecodeError is a ValueError
         raise Refused("compose_refused") from None
+
+
+def access_for(binding_raw: bytes) -> bytes | None:
+    """The environment's cloudflare-access.yaml as `golden-road compose` writes it from the bindings.yaml the writer writes (read back
+    as composed_for reads it), or None for a binding without mcp. Raises Refused("compose_refused") on anything compose would refuse,
+    an owner with no MCP token name among them."""
+    try:
+        text = cloudflare_access(_binding_read_back(binding_raw))
+    except (ComposeError, ValueError, KeyError, TypeError, yaml.YAMLError, RecursionError):
+        raise Refused("compose_refused") from None
+    return None if text is None else text.encode("utf-8")
 
 
 def _factory_head(gh, org):
@@ -307,7 +360,9 @@ def _files_to_write(gh, cfg, req, target, base, base_sha, content, expected_sha=
     """[(path, content, existing (blob sha, bytes) or None)] in write order. A registration writes its new intake record, and a change
     (expected_sha: the blob its evidence saw) replaces exactly that one. A binding
     writes its bindings.yaml and then its composed.yaml, the latter only when it changes; first its app must be registered (the
-    intake record in the factory) and deployed in the environment (release.yaml and base/manifests.yaml at base_sha)."""
+    intake record in the factory) and deployed in the environment (release.yaml and base/manifests.yaml at base_sha). Then its
+    cloudflare-access.yaml, when the binding has mcp and the file changes; never deleted, so a binding without mcp whose base has
+    one is refused."""
     existing = _file(gh, target.repo, target.path, base_sha)  # read at the commit the branch starts from: the blob a PUT replaces
     if req.kind != "binding":
         if case_variants(gh, target.repo, target.path, base_sha):  # the record in another spelling: the scorecard reads only one
@@ -324,11 +379,18 @@ def _files_to_write(gh, cfg, req, target, base, base_sha, content, expected_sha=
     manifests = _file(gh, target.repo, f"{d}/base/manifests.yaml", base_sha)
     if release is None or manifests is None:
         raise Refused("not_deployed")
-    composed = composed_for(req, release[1], manifests[1], content)
+    composed = composed_for(req, release[1], manifests[1], content, cfg.skills_catalog)
+    access = access_for(content)
     current = _file(gh, target.repo, target.also, base_sha)
     files = [(target.path, content, existing)]
     if current is None or current[1] != composed:
         files.append((target.also, composed, current))
+    current_access = _file(gh, target.repo, target.access, base_sha)
+    if access is None:
+        if current_access is not None:
+            raise Refused("access_file_without_mcp")
+    elif current_access is None or current_access[1] != access:
+        files.append((target.access, access, current_access))
     return files
 
 
@@ -382,7 +444,8 @@ def _write(store, gh, cfg, req, now) -> str:
         owner = target.repo.split("/")[0]
         found = gh.call("GET", f"/repos/{target.repo}/pulls", params={"head": f"{owner}:{branch}", "state": "all"}).json()
         body = pr_body(req, store.get_person(req.requested_by), store.get_person(req.decided_by) if req.decided_by else None, target,
-                       platform_user=getattr(cfg.secret_server, "platform_user", None), current=evidence.record if change else None)
+                       platform_user=getattr(cfg.secret_server, "platform_user", None), current=evidence.record if change else None,
+                       writes_access=any(path == target.access for path, _, _ in files))
         pr = found[0] if found else gh.call("POST", f"/repos/{target.repo}/pulls", ok=(201,), json={
             "title": title(req, change), "head": branch, "base": base, "maintainer_can_modify": False, "body": body}).json()
         if not _our_pr(pr, base, head, target.repo):
@@ -405,8 +468,10 @@ def _write(store, gh, cfg, req, now) -> str:
         return _fail(store, req, _reason(exc), now)
 
 
-def _order(target):
-    return [target.path] + ([target.also] if target.also else [])
+def _order(target, req):
+    """The files a PR may write, in order: a binding's cloudflare-access.yaml only when it has mcp (else the writer never writes it)."""
+    access = target.access if "mcp" in (req.final or {}) else None
+    return [p for p in (target.path, target.also, access) if p]
 
 
 def _advance(store, gh, cfg, req, now) -> str:
@@ -439,14 +504,15 @@ def _advance(store, gh, cfg, req, now) -> str:
         if current != req.base_sha or pr.get("mergeable_state") == "behind" or (pr.get("base") or {}).get("sha") not in (None, current):
             return fail("base_moved")
         evidence = store.evidence_for(req.id, req.submission) if req.kind == "registration" else None
-        order, statuses = _order(target), _statuses(req, evidence)
-        # the commits from the base to head are ours, one per file (for a binding, composed.yaml is left out when unchanged) ...
+        order, statuses = _order(target, req), _statuses(req, evidence)
+        # the commits from the base to head are ours, one per file (for a binding, composed.yaml and cloudflare-access.yaml are left
+        # out when unchanged) ...
         written = _chain_writes(_chain(gh, target.repo, req.head_sha, req.base_sha, len(order)), order, statuses)
         if written is None:
             return fail("pr_commit_not_ours")
         # ... and the PR shows exactly the files they wrote, nothing else
         files = list(gh.paginate(f"/repos/{target.repo}/pulls/{req.pr_number}/files"))
-        if not _only_these(files, {p: statuses for p in order[:written]}):
+        if not _only_these(files, {p: statuses for p in written}):
             return fail("pr_files_unexpected")
         conclusions = {}
         for name in cfg.required_checks[target.repo]:

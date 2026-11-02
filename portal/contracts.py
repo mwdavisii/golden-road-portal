@@ -57,14 +57,16 @@ def _bad_instants(name: str, document) -> list[str]:
     return errors
 
 
-# JSON Schema can't say "unique by one key", so these are checked here: each name is a list of objects whose key must not repeat.
-UNIQUE_KEYS = {"binding.v2": (("secrets", "env", "secrets: env names must be unique"),)}
+# JSON Schema can't say "unique by one key", so these are checked here: each (dotted) name is a list of objects whose key must not repeat.
+UNIQUE_KEYS = {"binding.v2": (("secrets", "env", "secrets: env names must be unique"),
+                              ("mcp.servers", "server_id", "mcp.servers: server ids must be unique"),
+                              ("skills", "name", "skills: names must be unique"))}
 
 
 def _repeats(name: str, document) -> list[str]:
     errors = []
     for field, key, message in UNIQUE_KEYS.get(name, ()):
-        items = document.get(field) if isinstance(document, dict) else None
+        items = _at(document, field)
         keys = [i.get(key) for i in items if isinstance(i, dict)] if isinstance(items, list) else []
         if len(keys) != len(set(map(repr, keys))):
             errors.append(message)

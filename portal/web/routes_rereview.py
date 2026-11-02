@@ -22,7 +22,8 @@ OUT_OF_DATE = "The page was out of date: look at the item again and close it fro
 CLOSE_CONFLICT = {"not_found": (404, "No such item."), "closed": (409, "That item was already closed."),
                   "own_app": (403, OWN_APP),
                   "item_changed": (409, "A scorecard event joined this item after you opened the page: read it, then close the item again.")}
-PART_WORDS = {"repo_admins": "repo admins", "evidence": "registration evidence", "intake": "intake records", "events": "scorecard events"}
+PART_WORDS = {"repo_admins": "repo admins", "evidence": "registration evidence", "intake": "intake records", "events": "scorecard events",
+              "cmdb": "ServiceNow CMDB"}
 DEFAULT_INTERVAL = 300  # the collector's default PORTAL_COLLECT_INTERVAL, until it has recorded its own
 REGISTERED = ("approved", "writing", "pr_open", "merged")
 
@@ -53,6 +54,21 @@ PROBLEM_WORDS = {"invalid": "is not a valid intake record (the scorecard refuses
                                   "extra one in the factory"}
 
 
+# The cmdb part's problems (spec 2026-10-31), in words written here
+CMDB_WORDS = {"cmdb_unreachable": "ServiceNow didn't answer: the collector retries on the next pass",
+              "cmdb_owner_unknown": "an owner's email matches no ServiceNow user",
+              "cmdb_refused": "ServiceNow refused a CI: see its reconciliation rules"}
+
+
+def cmdb_problems(store, sources) -> tuple[list, list]:
+    """(the cmdb problems to say, in CMDB_WORDS's order; the CMDB records whose last attempt failed, by repo). A problem is said when
+    the part's last pass named it or a repo's last attempt ended in it: one pass names one problem, and several repos can fail apart."""
+    failing = [r for r in store.cmdb_records() if r.last_error]
+    status = sources.get("cmdb")
+    found = {r.last_error for r in failing} | ({status.problem} if status and status.problem in CMDB_WORDS else set())
+    return [(p, CMDB_WORDS[p]) for p in CMDB_WORDS if p in found], failing
+
+
 def rereview_page(request, principal, status=200, errors=()):
     state = request.app.state
     store, now, days = state.store, state.clock(), state.settings.rereview_stale_days
@@ -70,11 +86,13 @@ def rereview_page(request, principal, status=200, errors=()):
     parts = [{"name": PART_WORDS[name], "status": s, "checked": _ago(now - s.checked_at),
               "worked": _ago(now - s.last_ok_at) if s.last_ok_at else None,
               "stopped": s.last_ok_at is None or now - s.last_ok_at > dt.timedelta(seconds=3 * interval)}
-             for name, s in sorted(sources.items(), key=lambda kv: list(PART_WORDS).index(kv[0])) if name in PART_WORDS]
+             for name, s in sorted((kv for kv in sources.items() if kv[0] in PART_WORDS), key=lambda kv: list(PART_WORDS).index(kv[0]))]
+    cmdb, cmdb_failing = cmdb_problems(store, sources)
     runs = [{"repo": w.repo, "run_id": w.run_id, "age": _ago(now - w.updated_at), "rechecked": len(store.failed_runs(w.repo))}
             for w in store.rereview_watermarks()]
     return page(request, "admin_rereview.html", status, items=entries, errors=list(errors), stale_days=days,
                 stale_count=sum(1 for e in entries if e["stale"]), sources=sources, problem_words=PROBLEM_WORDS, parts=parts, runs=runs,
+                cmdb_problems=cmdb, cmdb_failing=cmdb_failing,
                 pending=len(store.pending_events()), skipped=sum(n for outcome, n in counts.items() if outcome not in ("event", "duplicate")),
                 outside=[o for o in observed.values() if o.schema == "intake/v1"], unreadable=[o for o in observed.values() if o.problem])
 

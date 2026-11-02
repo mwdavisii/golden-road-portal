@@ -1,0 +1,22 @@
+{
+  "schema": "mock-skills-catalog/v1",
+  "repo": "example-org/golden-road-skills",
+  "main": "6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+  "commits": {
+    "2c7d1e9f0a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d": {"skills": {
+      "incident-triage": {
+        "skill.yaml": "schema: skill/v1\nname: incident-triage\ndescription: Triage an incident report into severity, owner and next step.\nenvironments: [test, prod]\naudience: everyone\n",
+        "SKILL.md": "# Incident triage\n\nRead the report. Decide the severity (1 to 4), the owning team and the next step. Say what you could not tell.\n"}}},
+    "6b1f0c2d9e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c": {"skills": {
+      "incident-triage": {
+        "skill.yaml": "schema: skill/v1\nname: incident-triage\ndescription: Triage an incident report into severity, owner and next step.\nenvironments: [test, prod]\naudience: everyone\n",
+        "SKILL.md": "# Incident triage\n\nRead the report. Decide the severity (1 to 4), the owning team and the next step. Say what you could not tell. For severity 1, follow checklists/sev1.md.\n",
+        "checklists/sev1.md": "# Severity 1\n\n1. Page the owning team.\n2. Open the incident channel.\n3. Write the first update within 15 minutes.\n"},
+      "release-notes": {
+        "skill.yaml": "schema: skill/v1\nname: release-notes\ndescription: Draft release notes from merged pull request titles.\nenvironments: [test]\naudience: everyone\n",
+        "SKILL.md": "# Release notes\n\nGroup the merged pull requests by area and write one plain sentence for each change a user would notice.\n"},
+      "finance-close": {
+        "skill.yaml": "schema: skill/v1\nname: finance-close\ndescription: Check a month-end close checklist.\nenvironments: [prod]\naudience: [finance-analysts]\n",
+        "SKILL.md": "# Month-end close\n\nWalk the checklist in order and report each item as done, open or blocked.\n"}}}
+  }
+}

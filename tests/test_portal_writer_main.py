@@ -203,3 +203,40 @@ def test_a_mock_secret_server_that_does_not_load_stops_the_writer(tmp_path, monk
 def test_a_bad_secret_server_setting_stops_the_writer_with_its_name(portal, tmp_path):
     code, err = run(tmp_path, FakeGitHub(), portal.store, env={"PORTAL_SECRET_SERVER": "delinea"})
     assert code == 2 and "PORTAL_SECRET_SERVER" in err and "delinea" not in err
+
+
+# ---- MCP servers and skills: the writer reads PORTAL_CLOUDFLARE, the two gateways and PORTAL_SKILLS_CATALOG as the web does ----
+
+def test_the_writer_loads_the_mock_cloudflare_and_the_gateways_when_asked(tmp_path):
+    from portal.cloudflare_mock import MockCloudflare
+    from portal.settings import SettingsError
+    cfg = load_with(tmp_path)
+    assert cfg.cloudflare is None and cfg.skills_catalog is None
+    assert cfg.mcp_gateways == {"test": "mcp-test.example.com", "prod": "mcp.example.com"}
+    cfg = load_with(tmp_path, PORTAL_CLOUDFLARE="mock", PORTAL_MCP_GATEWAY_PROD="mcp.acme.example")
+    assert isinstance(cfg.cloudflare, MockCloudflare)
+    assert cfg.mcp_gateways == {"test": "mcp-test.example.com", "prod": "mcp.acme.example"} == cfg.cloudflare.gateways
+    for env, name in (({"PORTAL_CLOUDFLARE": "real"}, "PORTAL_CLOUDFLARE"), ({"PORTAL_MCP_GATEWAY_TEST": "not a host"}, "PORTAL_MCP_GATEWAY_TEST"),
+                      ({"PORTAL_MCP_GATEWAY_TEST": "mcp.example.com"}, "PORTAL_MCP_GATEWAY_PROD"),
+                      ({"PORTAL_CLOUDFLARE": "mock", "PORTAL_CLOUDFLARE_ACCOUNT_ID": "f" * 32}, "PORTAL_CLOUDFLARE_ACCOUNT_ID"),
+                      ({"PORTAL_SKILLS_CATALOG": "git"}, "PORTAL_SKILLS_CATALOG")):
+        with pytest.raises(SettingsError, match=name):
+            load_with(tmp_path, **env)
+
+
+def test_the_writer_loads_the_mock_skills_catalog_when_asked(tmp_path, monkeypatch):
+    from portal import skills_catalog
+    from portal.settings import SettingsError
+    assert isinstance(load_with(tmp_path, PORTAL_SKILLS_CATALOG="mock").skills_catalog, skills_catalog.MockSkillsCatalog)
+    monkeypatch.setattr(skills_catalog, "MOCK", tmp_path / "missing.json")
+    with pytest.raises(SettingsError, match="PORTAL_SKILLS_CATALOG is mock, but the mock skills catalog is not valid"):
+        load_with(tmp_path, PORTAL_SKILLS_CATALOG="mock")
+
+
+@pytest.mark.parametrize("env, name", [({"PORTAL_CLOUDFLARE": "cloudflare"}, "PORTAL_CLOUDFLARE"),
+                                       ({"PORTAL_MCP_GATEWAY_PROD": "bad host"}, "PORTAL_MCP_GATEWAY_PROD"),
+                                       ({"PORTAL_CLOUDFLARE_ACCOUNT_ID": "f" * 32}, "PORTAL_CLOUDFLARE_ACCOUNT_ID"),
+                                       ({"PORTAL_SKILLS_CATALOG": "git"}, "PORTAL_SKILLS_CATALOG")])
+def test_a_bad_mcp_or_skills_setting_stops_the_writer_with_its_name(portal, tmp_path, env, name):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
+    assert code == 2 and name in err and next(iter(env.values())) not in err

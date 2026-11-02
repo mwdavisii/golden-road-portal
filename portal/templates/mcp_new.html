@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}Add an MCP server - {{ repo }} - golden road{% endblock %}
+{% block main %}
+<p><a href="{{ app_href }}">&larr; {{ repo }}</a></p>
+<span class="eyebrow">Add an MCP server{% if environment %} &middot; {{ environment }}{% endif %}</span>
+<h1>{{ STEPS[shown.step - 1] }}</h1>
+<ol class="stepper" aria-label="Steps">
+{% for label in STEPS %}{% set n = loop.index %}<li class="{{ 'step-done' if n < shown.step else 'step-now' if n == shown.step else 'step-todo' }}"{% if n == shown.step %} aria-current="step"{% endif %}><span class="step-dot" aria-hidden="true">{% if n < shown.step %}&#10003;{% else %}{{ n }}{% endif %}</span>{{ label }}{% if n < shown.step %}<span class="visually-hidden"> (done)</span>{% endif %}</li>
+{% endfor %}
+</ol>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+{% if note %}
+<p class="callout info">{{ note }}</p>
+{% elif shown.step == 1 %}
+<form method="get" action="{{ base }}/mcp/new" class="form-card">
+<fieldset class="choices">
+<legend>Which environment's gateway?</legend>
+<p class="hint">Each environment has one shared Cloudflare MCP gateway; an app reaches its servers through it.</p>
+<div class="choice-list">
+{% for env, host in shown.environments %}<label class="choice"><input type="radio" name="environment" value="{{ env }}" required{% if env == tab %} checked{% endif %}><span class="choice-title">{{ env }}</span><span class="choice-line mono">{{ host }}</span></label>
+{% endfor %}
+</div>
+</fieldset>
+<p class="actions"><button type="submit">Next</button><a class="button secondary" href="{{ app_href }}">Cancel</a></p>
+</form>
+{% elif shown.step == 2 %}
+<p class="meta">On the {{ environment }} gateway, <span class="mono">{{ shown.gateway }}</span>. <a href="{{ base }}/mcp/new?tab={{ environment }}">Choose another environment</a></p>
+{% if shown.no_email %}<p class="callout info">Your sign-in has no email address, so Cloudflare can't tell which servers you may use.</p>{% endif %}
+<form method="get" action="{{ base }}/mcp/new" class="form-card">
+<input type="hidden" name="environment" value="{{ environment }}">
+<fieldset class="choices">
+<legend>Server</legend>
+<p class="hint">The servers on this gateway that Cloudflare lets you use. A server that isn't here must first be added to the gateway{% if settings.mcp_process_url %} (<a href="{{ settings.mcp_process_url }}" rel="noopener noreferrer">how to ask for a server on the gateway</a>){% endif %}.</p>
+<div class="choice-list">
+{% for s in shown.servers %}{% if s.usable %}<label class="choice"><input type="radio" name="server_id" value="{{ s.server_id }}" required><span class="choice-title">{{ s.name }}</span><span class="choice-line">{{ s.description }}{% if s.tools %} Tools: <span class="mono">{{ s.tools|join(", ") }}</span>{% endif %}</span><span class="badge state-merged">Available</span></label>
+{% else %}<div class="choice unavailable"><span class="choice-title">{{ s.name }}</span><span class="choice-line">{{ s.description }} {{ s.reason }}</span><span class="badge">{% if s.bound %}Added{% else %}Not available{% endif %}</span></div>
+{% endif %}{% else %}<p class="empty">No server on this gateway is one you may use.</p>
+{% endfor %}
+</div>
+</fieldset>
+<p class="actions"><button type="submit"{% if not shown.servers|selectattr("usable")|list %} disabled{% endif %}>Next</button><a class="button secondary" href="{{ base }}/mcp/new?tab={{ environment }}">Back</a></p>
+</form>
+{% else %}
+<p class="meta">Check the server before you save. Nothing here is secret: only ids, names and the token's name.</p>
+<dl class="review">
+<dt>Environment</dt><dd>{{ environment }}</dd>
+<dt>Gateway</dt><dd class="mono">{{ shown.gateway }}</dd>
+<dt>Server</dt><dd>{{ shown.added.name }} (<span class="mono">{{ shown.added.server_id }}</span>)</dd>
+<dt class="arrives">MCP_URL</dt><dd class="arrives mono">{{ shown.url }}</dd>
+<dt class="arrives">MCP_SERVERS</dt><dd class="arrives mono">{{ shown.servers_after }}</dd>
+<dt class="arrives">CF_ACCESS_CLIENT_ID</dt><dd class="arrives">from Secret Server: the app's Cloudflare token</dd>
+<dt class="arrives">CF_ACCESS_CLIENT_SECRET</dt><dd class="arrives">from Secret Server: the app's Cloudflare token</dd>
+</dl>
+<form method="post" action="{{ base }}/mcp">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
+<input type="hidden" name="server_id" value="{{ shown.added.server_id }}">
+<p class="meta">Saving opens a change for the writer to record in golden-road-deploy. The platform then adds the app's Cloudflare service token (<span class="mono">{{ shown.token }}</span>) to the server's policy; the portal never sees the token.</p>
+<p class="actions"><button type="submit">Save the server</button><a class="button secondary" href="{{ base }}/mcp/new?environment={{ environment }}">Back</a></p>
+</form>
+{% endif %}
+{% endblock %}

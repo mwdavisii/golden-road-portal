@@ -450,3 +450,212 @@ def test_a_change_that_drops_the_scorecard_mark_is_refused(portal):
     assert recheck(req, writer_config(), evidence) == []
     dropped = dc.replace(req, final={k: v for k, v in req.final.items() if k != "scorecard"})
     assert "scorecard_changed" in recheck(dropped, writer_config(), evidence)
+
+
+# MCP servers and skills (spec 2026-10-31): each server still on the environment's gateway, ready and usable with a service token;
+# the gateway the one the writer's settings name; each skill still in the catalog at its pin, approved for the environment, and
+# within the caps. The person's own view (Cloudflare's per-user policy, a skill's audience) can't be rechecked: no person here.
+
+from portal.cloudflare import CloudflareError, Client as CloudflareClient  # noqa: E402
+from portal.cloudflare_mock import MOCK as CF_MOCK  # noqa: E402
+from portal.skills_catalog import MOCK as CATALOG_MOCK, MockSkillsCatalog, Skill, load_mock as load_catalog  # noqa: E402
+from portal_fakes import mock_cloudflare  # noqa: E402
+from portal.writer.recheck import _mcp_problems, _skill_problems  # noqa: E402
+
+MAIN = json.loads(CATALOG_MOCK.read_text(encoding="utf-8"))["main"]
+OLD = next(c for c in json.loads(CATALOG_MOCK.read_text(encoding="utf-8"))["commits"] if c != MAIN)
+
+
+def cf_with(change):
+    doc = json.loads(CF_MOCK.read_text(encoding="utf-8"))
+    change(doc)
+    return mock_cloudflare(doc=doc)
+
+
+def portal_of(doc, environment="test"):
+    return next(p for p in doc["portals"] if p["environment"] == environment)
+
+
+def notes_of(doc):
+    return next(s for s in portal_of(doc)["servers"] if s["server_id"] == "notes")
+
+
+def catalog_with(tmp_path, change):
+    doc = json.loads(CATALOG_MOCK.read_text(encoding="utf-8"))
+    change(doc)
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return load_catalog(path)
+
+
+def mcfg(**changes):
+    return writer_config(**{"cloudflare": mock_cloudflare(), "skills_catalog": load_catalog(), **changes})
+
+
+def mcp_and_skills(portal, **kw):
+    return binding_request(portal.store, portal.people, T0, identity=False, mcp=["notes"], skills=[("incident-triage", MAIN)], **kw)
+
+
+def test_a_binding_with_only_mcp_servers_and_skills_rechecks_clean_without_a_directory(portal):
+    req = mcp_and_skills(portal)
+    assert "azure_identity" not in req.final and req.final["mcp"]["servers"][0]["server_id"] == "notes"
+    assert recheck(req, mcfg(), None, portal.store, T0) == []
+
+
+@pytest.mark.parametrize("environment", ["test", "prod"])
+def test_a_binding_with_an_identity_mcp_servers_and_skills_rechecks_clean(portal, environment):
+    req = binding_request(portal.store, portal.people, T0, environment=environment, mcp=["notes"], skills=[("incident-triage", MAIN)])
+    assert recheck(req, mcfg(directory=fake_directory()), None, portal.store, T0) == []
+
+
+def test_a_binding_without_mcp_or_skills_needs_neither_cloudflare_nor_the_catalog(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    assert recheck(req, bcfg(), None, portal.store, T0) == []
+
+
+def rename_test_gateway(doc):
+    portal_of(doc)["hostname"] = "mcp-elsewhere.example.com"
+
+
+@pytest.mark.parametrize("change, problem", [
+    (lambda d: notes_of(d).update(status="error"), "mcp_server_not_ready"),
+    (lambda d: portal_of(d)["servers"].remove(notes_of(d)), "mcp_server_gone"),
+    (lambda d: notes_of(d).update(on_behalf=True), "mcp_server_user_auth"),
+    (rename_test_gateway, "mcp_gateway_gone"),
+], ids=["not-ready", "removed", "on-behalf", "gateway-renamed"])
+def test_an_mcp_server_that_changed_in_cloudflare_is_refused(portal, change, problem):
+    req = mcp_and_skills(portal)
+    assert recheck(req, mcfg(cloudflare=cf_with(change)), None, portal.store, T0) == [problem]
+
+
+def test_a_binding_with_mcp_servers_and_no_cloudflare_is_refused(portal):
+    req = mcp_and_skills(portal)
+    assert recheck(req, mcfg(cloudflare=None), None, portal.store, T0) == ["no_cloudflare"]
+
+
+def test_a_cloudflare_that_is_not_the_mock_is_refused(portal):
+    """Only the mock is wired (MOCK ONLY): a real account's token isn't, so anything else fails closed."""
+    class Other:
+        name = "cloudflare"
+
+        def client(self):
+            raise AssertionError("never asked")
+    req = mcp_and_skills(portal)
+    assert recheck(req, mcfg(cloudflare=Other()), None, portal.store, T0) == ["no_cloudflare"]
+
+
+def test_an_mcp_server_checked_by_another_cloudflare_is_mcp_verified_elsewhere(portal):
+    """binding/v2 allows only mock-cloudflare, so recheck stops at the schema first; the MCP check holds on its own too."""
+    req = mcp_and_skills(portal)
+    final = {**req.final, "mcp": {**req.final["mcp"], "servers": [{**s, "verified_by": "cloudflare"} for s in req.final["mcp"]["servers"]]}}
+    assert _mcp_problems(mcfg(), final) == ["mcp_verified_elsewhere"]
+    assert recheck(with_final(req, final), mcfg(), None, portal.store, T0) == ["schema_invalid"]
+
+
+@pytest.mark.parametrize("servers", [True, False], ids=["with-servers", "servers-empty"])
+def test_a_gateway_that_is_not_the_writer_s_for_the_environment_is_mcp_gateway_mismatch(portal, servers):
+    """As deploy-verify holds mcp.gateway to platform.json's, servers [] included: a portal and a platform config that disagree fail
+    here, never silently at deploy-check."""
+    req = mcp_and_skills(portal)
+    final = req.final if servers else {**req.final, "mcp": {"gateway": req.final["mcp"]["gateway"], "servers": []}}
+    moved = mcfg(mcp_gateways={"test": "mcp-new.example.com", "prod": "mcp.example.com"})
+    assert recheck(with_final(req, final), moved, None, portal.store, T0) == ["mcp_gateway_mismatch"]
+
+
+def test_the_request_that_clears_a_moved_gateway_is_never_refused(portal):
+    """Batch 4: a confirmed Remove off a moved gateway writes {gateway: <the new host>, servers: []}. It names no server, so Cloudflare
+    isn't asked (it may not even list the new gateway yet), and its gateway is the writer's."""
+    req = mcp_and_skills(portal)
+    cleared = {**req.final, "mcp": {"gateway": "mcp-new.example.com", "servers": []}}
+    moved = mcfg(mcp_gateways={"test": "mcp-new.example.com", "prod": "mcp.example.com"}, cloudflare=None)
+    assert recheck(with_final(req, cleared), moved, None, portal.store, T0) == []
+
+
+@pytest.mark.parametrize("method", ["gateway", "_page"])
+def test_cloudflare_failing_is_cloudflare_unavailable_and_never_its_text(portal, monkeypatch, method):
+    req = mcp_and_skills(portal)
+
+    def fail(self, *a, **kw):
+        raise CloudflareError("Cloudflare answered 500 with Bearer mock-cloudflare-token")
+    monkeypatch.setattr(CloudflareClient, method, fail)
+    problems = recheck(req, mcfg(), None, portal.store, T0)
+    assert problems == ["cloudflare_unavailable"] and not any("Bearer" in p or "500" in p for p in problems)
+
+
+def test_the_cloudflare_client_is_closed_after_the_recheck(portal, monkeypatch):
+    req = mcp_and_skills(portal)
+    closed = []
+    real_close = CloudflareClient.close
+    monkeypatch.setattr(CloudflareClient, "close", lambda self: (closed.append(self), real_close(self)))
+    assert recheck(req, mcfg(), None, portal.store, T0) == [] and len(closed) == 1
+
+
+@pytest.mark.parametrize("repo", ["acme_x/notes", "-acme/notes", "acme-/notes", "ac--me/notes", "a" * 40 + "/notes"])
+def test_an_owner_that_is_not_a_github_owner_is_refused_since_it_has_no_token_name(repo):
+    """Spec M5: the token's name is one app's only for a GitHub owner, so the writer refuses any other, servers [] included."""
+    final = {"schema": "binding/v2", "repo": repo, "environment": "test", "mcp": {"gateway": "mcp-test.example.com", "servers": []}}
+    assert _mcp_problems(mcfg(), final) == ["mcp_owner_invalid"]
+    assert _mcp_problems(mcfg(), {**final, "repo": "Acme/Notes"}) == [], "GitHub names are case-insensitive: the name is lower case"
+
+
+def test_skills_with_no_catalog_are_refused(portal):
+    req = mcp_and_skills(portal)
+    assert recheck(req, mcfg(skills_catalog=None), None, portal.store, T0) == ["no_skills_catalog"]
+
+
+def test_a_skill_checked_by_another_catalog_is_skill_verified_elsewhere(portal):
+    req = mcp_and_skills(portal)
+    final = {**req.final, "skills": [{**s, "verified_by": "skills-catalog"} for s in req.final["skills"]]}
+    assert _skill_problems(mcfg(), final) == ["skill_verified_elsewhere"]
+    assert recheck(with_final(req, final), mcfg(), None, portal.store, T0) == ["schema_invalid"]
+
+
+def test_a_skill_gone_from_the_catalog_at_its_commit_is_refused(portal, tmp_path):
+    req = mcp_and_skills(portal)
+    catalog = catalog_with(tmp_path, lambda d: d["commits"][MAIN]["skills"].pop("incident-triage"))
+    assert recheck(req, mcfg(skills_catalog=catalog), None, portal.store, T0) == ["skill_gone"]
+
+
+def test_a_skill_pinned_to_an_older_commit_is_read_at_that_commit(portal, tmp_path):
+    req = binding_request(portal.store, portal.people, T0, identity=False, skills=[("incident-triage", OLD)])
+    assert recheck(req, mcfg(), None, portal.store, T0) == []
+    catalog = catalog_with(tmp_path, lambda d: d["commits"][OLD]["skills"].pop("incident-triage"))
+    assert recheck(req, mcfg(skills_catalog=catalog), None, portal.store, T0) == ["skill_gone"]
+
+
+def test_a_skill_no_longer_approved_for_the_environment_is_refused(portal, tmp_path):
+    req = mcp_and_skills(portal)
+
+    def prod_only(doc):
+        files = doc["commits"][MAIN]["skills"]["incident-triage"]
+        files["skill.yaml"] = files["skill.yaml"].replace("environments: [test, prod]", "environments: [prod]")
+    assert recheck(req, mcfg(skills_catalog=catalog_with(tmp_path, prod_only)), None, portal.store, T0) == ["skill_environment"]
+
+
+def big_catalog(**files_by_name):
+    """A catalog built past load_mock's checks: a skill whose files break the caps (load_mock refuses such a catalog whole)."""
+    skills = {name: Skill(name, "Too big.", ("test", "prod"), "everyone", files) for name, files in files_by_name.items()}
+    return MockSkillsCatalog("example-org/golden-road-skills", MAIN, {MAIN: skills})
+
+
+def test_a_skill_over_the_caps_is_skill_too_large(portal):
+    req = mcp_and_skills(portal)
+    over = big_catalog(**{"incident-triage": {"SKILL.md": "x" * (256 * 1024 + 1)}})
+    assert recheck(req, mcfg(skills_catalog=over), None, portal.store, T0) == ["skill_too_large"]
+
+
+def test_skills_over_the_environment_s_cap_together_are_skill_too_large():
+    """Each skill under 256 KiB, together over 512 KiB: the one ConfigMap can't hold them."""
+    third = "x" * (200 * 1024)
+    catalog = big_catalog(**{name: {"SKILL.md": third} for name in ("a-skill", "b-skill", "c-skill")})
+    final = {"schema": "binding/v2", "repo": "acme/notes", "environment": "test",
+             "skills": [{"name": n, "commit": MAIN, "verified_by": catalog.name} for n in ("a-skill", "b-skill", "c-skill")]}
+    assert _skill_problems(mcfg(skills_catalog=catalog), final) == ["skill_too_large"]
+    assert _skill_problems(mcfg(skills_catalog=catalog), {**final, "skills": final["skills"][:2]}) == []
+
+
+def test_an_mcp_and_a_skill_problem_are_both_named(portal, tmp_path):
+    req = mcp_and_skills(portal)
+    cfg = mcfg(cloudflare=cf_with(lambda d: notes_of(d).update(status="error")),
+               skills_catalog=catalog_with(tmp_path, lambda d: d["commits"][MAIN]["skills"].pop("incident-triage")))
+    assert recheck(req, cfg, None, portal.store, T0) == ["mcp_server_not_ready", "skill_gone"]

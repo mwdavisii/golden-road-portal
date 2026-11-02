@@ -13,6 +13,10 @@ ORG = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
 CLAIM = re.compile(r"[A-Za-z0-9_:.-]{1,64}")
 ALGORITHMS = frozenset({"RS256", "PS256", "ES256"})  # never none or an HMAC algorithm
+# builder.config's GATEWAY: deploy-verify holds bindings.yaml's mcp.gateway to platform.json's host, checked the same way
+GATEWAY = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+DEFAULT_GATEWAYS = {"test": "mcp-test.example.com", "prod": "mcp.example.com"}  # platform.json's placeholders
+GATEWAY_SETTINGS = {"test": "PORTAL_MCP_GATEWAY_TEST", "prod": "PORTAL_MCP_GATEWAY_PROD"}
 
 
 class SettingsError(Exception):
@@ -51,6 +55,120 @@ def no_secret_server_url(value: str) -> None:
     if value:
         raise SettingsError("PORTAL_SECRET_SERVER_URL is for a real Secret Server, which this portal does not have yet; leave it "
                             "unset (PORTAL_SECRET_SERVER=mock needs no URL)")
+
+
+def mcp_gateway(name: str, value: str, default: str) -> str:
+    """One environment's shared Cloudflare MCP gateway host (PORTAL_MCP_GATEWAY_TEST or _PROD): empty is its default, platform.json's
+    placeholder. It must be the host configure.py recorded in platform.json's mcp_gateways, or deploy-check fails the binding."""
+    value = (value or default).lower()
+    if len(value) > 253 or not GATEWAY.fullmatch(value):
+        raise SettingsError(f"{name} is not a host name (the environment's shared Cloudflare MCP gateway, as in platform.json)")
+    return value
+
+
+def distinct_gateways(gateways: dict) -> None:
+    """Each environment has its own gateway, as platform.json's mcp_gateways must. The problem is PORTAL_MCP_GATEWAY_PROD's."""
+    if gateways["test"] == gateways["prod"]:
+        raise SettingsError("PORTAL_MCP_GATEWAY_TEST and PORTAL_MCP_GATEWAY_PROD must differ: each environment has its own gateway")
+
+
+def mcp_gateways_from(env) -> dict:
+    """{"test": host, "prod": host} from PORTAL_MCP_GATEWAY_TEST and _PROD, each empty for its default. Shared by the web and the
+    writer."""
+    gateways = {e: mcp_gateway(name, env.get(name, ""), DEFAULT_GATEWAYS[e]) for e, name in GATEWAY_SETTINGS.items()}
+    distinct_gateways(gateways)
+    return gateways
+
+
+def cloudflare_from(value: str, gateways: dict):
+    """PORTAL_CLOUDFLARE: unset is None (the app page has no MCP servers), mock is portal.cloudflare_mock serving these gateway hosts.
+    Shared by the web and the writer."""
+    if value == "":
+        return None
+    if value != "mock":
+        raise SettingsError("PORTAL_CLOUDFLARE must be mock or unset (the only Cloudflare there is is the mock)")
+    from .cloudflare_mock import MockCloudflareError, load_mock
+    try:
+        return load_mock(gateways=gateways)
+    except MockCloudflareError:
+        raise SettingsError("PORTAL_CLOUDFLARE is mock, but the mock Cloudflare is not valid") from None
+
+
+def no_cloudflare_account(value: str) -> None:
+    """PORTAL_CLOUDFLARE_ACCOUNT_ID is the setting for a real Cloudflare account. There is only the mock, so it must stay unset: set,
+    it would look as if a real account were in use. Shared by the web and the writer."""
+    if value:
+        raise SettingsError("PORTAL_CLOUDFLARE_ACCOUNT_ID is for a real Cloudflare account, which this portal does not have yet; "
+                            "leave it unset (PORTAL_CLOUDFLARE=mock needs no account)")
+
+
+def no_servicenow_url(value: str) -> None:
+    """PORTAL_SERVICENOW_URL is the setting for a real ServiceNow instance. There is only the mock, so it must stay unset: set, it
+    would look as if a real instance were in use. Shared by the web and the collector."""
+    if value:
+        raise SettingsError("PORTAL_SERVICENOW_URL is for a real ServiceNow instance, which this portal does not have yet; leave it "
+                            "unset (PORTAL_SERVICENOW=mock needs no URL)")
+
+
+def servicenow_from(value: str):
+    """PORTAL_SERVICENOW: unset is None (no CMDB sync, no CMDB card), mock is portal.servicenow_mock over mock_servicenow.json.
+    Shared by the web and the collector."""
+    if value == "":
+        return None
+    if value != "mock":
+        raise SettingsError("PORTAL_SERVICENOW must be mock or unset (the only ServiceNow there is is the mock)")
+    from .servicenow_mock import MockServiceNowError, load_mock
+    try:
+        return load_mock()
+    except MockServiceNowError:
+        raise SettingsError("PORTAL_SERVICENOW is mock, but the mock ServiceNow is not valid") from None
+
+
+def servicenow_on(value: str) -> bool:
+    """PORTAL_SERVICENOW for the web: mock or unset, as the collector reads it. The web never calls ServiceNow; on, it shows what the
+    collector recorded (the app page's CMDB card, the timeline's step)."""
+    if value not in ("", "mock"):
+        raise SettingsError("PORTAL_SERVICENOW must be mock or unset (the only ServiceNow there is is the mock)")
+    return value == "mock"
+
+
+DEFAULT_ORG_NAME = "the organization"
+ORG_NAME_MAX = 100
+
+
+def org_name_ok(value: str) -> str:
+    """PORTAL_ORG_NAME: the organization's name in the ownership notice ("If you leave {org} ..."). One line of 1 to 100 characters
+    with no control characters; empty is "the organization"."""
+    if value == "":
+        return DEFAULT_ORG_NAME
+    if not value.strip() or len(value) > ORG_NAME_MAX or any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c in "\u2028\u2029" for c in value):
+        raise SettingsError(f"PORTAL_ORG_NAME must be one line of 1 to {ORG_NAME_MAX} characters with no control characters")
+    return value.strip()
+
+
+def grace_days_ok(value: str) -> int:
+    """PORTAL_LIFECYCLE_GRACE_DAYS: the days the ownership notice gives an owner to confirm, or to name a new owner, before the app is
+    decommissioned. Empty is 30. 0 hides the day count ("in time"); it never means "no time" (no budgets)."""
+    from .rereview import MAX_DAYS, BadSetting, parse_days
+    try:
+        return parse_days("PORTAL_LIFECYCLE_GRACE_DAYS", value)
+    except BadSetting:
+        raise SettingsError(f"PORTAL_LIFECYCLE_GRACE_DAYS must be a whole number of days from 0 to {MAX_DAYS} (0 leaves the day count "
+                            "out of the ownership notice; it never means no time)") from None
+
+
+def skills_catalog_from(value: str):
+    """PORTAL_SKILLS_CATALOG: unset is None (the app page has no skills), mock is portal/mock_skills_catalog.json, the fixture
+    deploy-verify reads. Shared by the web and the writer."""
+    if value == "":
+        return None
+    if value != "mock":
+        raise SettingsError("PORTAL_SKILLS_CATALOG must be mock or unset (the only skills catalog there is is the mock)")
+    from .skills_catalog import SkillsCatalogError, load_mock
+    try:
+        return load_mock()
+    except SkillsCatalogError:
+        raise SettingsError("PORTAL_SKILLS_CATALOG is mock, but the mock skills catalog is not valid") from None
 
 
 def parse_role_groups(text: str) -> dict:
@@ -94,6 +212,13 @@ class Settings:
     secret_process_url: str = ""  # where security's process for sharing a secret with golden-road-eso is described
     classification_policy_url: str = ""  # PORTAL_CLASSIFICATION_POLICY_URL: the data classification policy; empty hides the link
     rereview_stale_days: int = 30  # PORTAL_REREVIEW_STALE_DAYS: an item open longer is flagged rereview_stale; 0 turns the flag off
+    cloudflare: object = None  # portal.cloudflare_mock.MockCloudflare when PORTAL_CLOUDFLARE=mock; None hides the app's MCP servers
+    mcp_gateways: dict = dc.field(default_factory=lambda: dict(DEFAULT_GATEWAYS))  # PORTAL_MCP_GATEWAY_TEST/_PROD: {env: host}
+    mcp_process_url: str = ""  # where the platform's process for adding an MCP server to a gateway is described
+    skills_catalog: object = None  # portal.skills_catalog.MockSkillsCatalog when PORTAL_SKILLS_CATALOG=mock; None hides app skills
+    servicenow: bool = False  # PORTAL_SERVICENOW=mock: show the collector's CMDB records (the app page's card, the timeline's step)
+    org_name: str = DEFAULT_ORG_NAME  # PORTAL_ORG_NAME: named in the ownership notice
+    lifecycle_grace_days: int = 30  # PORTAL_LIFECYCLE_GRACE_DAYS: the notice's day count; 0 hides it (never "no time")
 
     @property
     def origin(self) -> str:
@@ -235,6 +360,19 @@ class Settings:
             classification_policy_url=get("PORTAL_CLASSIFICATION_POLICY_URL", policy_ok, ""),
             rereview_stale_days=get("PORTAL_REREVIEW_STALE_DAYS", days_ok("PORTAL_REREVIEW_STALE_DAYS"), ""))
         get("PORTAL_SECRET_SERVER_URL", no_secret_server_url, "")
+        gateways = {e: get(name, lambda v, name=name, e=e: mcp_gateway(name, v, DEFAULT_GATEWAYS[e]), "")
+                    for e, name in GATEWAY_SETTINGS.items()}
+        if None not in gateways.values():
+            get("PORTAL_MCP_GATEWAY_PROD", lambda _: distinct_gateways(gateways), "")
+        # with a bad gateway the mock still loads on the placeholders, so a bad PORTAL_CLOUDFLARE is named too (startup stops anyway)
+        good_gateways = gateways if not {"PORTAL_MCP_GATEWAY_TEST", "PORTAL_MCP_GATEWAY_PROD"} & set(problems) else DEFAULT_GATEWAYS
+        values.update(cloudflare=get("PORTAL_CLOUDFLARE", lambda v: cloudflare_from(v, good_gateways), ""), mcp_gateways=gateways,
+                      mcp_process_url=get("PORTAL_MCP_PROCESS_URL", link_ok("PORTAL_MCP_PROCESS_URL"), ""),
+                      skills_catalog=get("PORTAL_SKILLS_CATALOG", skills_catalog_from, ""))
+        get("PORTAL_CLOUDFLARE_ACCOUNT_ID", no_cloudflare_account, "")
+        values.update(servicenow=get("PORTAL_SERVICENOW", servicenow_on, ""), org_name=get("PORTAL_ORG_NAME", org_name_ok, ""),
+                      lifecycle_grace_days=get("PORTAL_LIFECYCLE_GRACE_DAYS", grace_days_ok, ""))
+        get("PORTAL_SERVICENOW_URL", no_servicenow_url, "")
         stale = get("PORTAL_REPO_ADMINS_STALE_AFTER", stale_ok, "600")
         if problems:
             return None, problems

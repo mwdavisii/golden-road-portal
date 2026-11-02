@@ -161,6 +161,7 @@ class Request:
     base_sha: str | None = None  # the default branch's commit it branched from
     submission: int = 1  # counts up each time a sent-back request is resubmitted; the platform's evidence is per submission
     floor_override: dict | None = None  # {by, at, reason}: the approver's written reason for approving below the floor
+    ownership_acknowledged_at: dt.datetime | None = None  # a registration's "I understand what owning this app means" (0011); None before
 
 
 @dc.dataclass(frozen=True)
@@ -264,7 +265,8 @@ SIGNAL_ID = re.compile(r"T-[1-9][0-9]{0,2}|builder-bumped|egress-removed|resourc
 # Each collector part's status: intake and events with their own problems, every part with "failed" (it raised)
 STATUS_PROBLEMS = {"repo_admins": ("failed",), "evidence": ("failed",), "intake": ("factory_unreadable", "failed"),
                    "events": ("actions_unreadable", "factory_unreadable", "factory_not_main", "artifact_host_refused", "github_busy",
-                              "failed")}
+                              "failed"),
+                   "cmdb": ("cmdb_unreachable", "cmdb_owner_unknown", "cmdb_refused", "failed")}
 SOURCES = ("central", "per-app")  # where an event came from: the factory's central review, or an app's own run (stored once per source)
 MIN_NOTE, MAX_NOTE = 10, 1000
 MAX_MATCHED = 40  # an event carries at most 40 signals (re-review-event/v1)
@@ -331,7 +333,7 @@ class RereviewItem:
 
 @dc.dataclass(frozen=True)
 class RereviewStatus:
-    source: str  # a collector part: repo_admins, evidence, intake or events
+    source: str  # a collector part: repo_admins, evidence, intake, events or cmdb
     problem: str | None
     counts: dict
     checked_at: dt.datetime
@@ -413,11 +415,48 @@ def check_status(source, problem, counts) -> None:
         raise ValueError("a source status names its source, one of its problems or none, and whole-number counts")
 
 
+CMDB_ERRORS = ("cmdb_unreachable", "cmdb_owner_unknown", "cmdb_refused")
+CMDB_OPERATIONS = ("INSERT", "UPDATE", "NO_CHANGE")
+SYS_ID = re.compile(r"[0-9a-f]{32}")
+CI_NUMBER = re.compile(r"[A-Z]{2,8}[0-9]{4,12}")
+HASH = re.compile(r"[0-9a-f]{64}")
+
+
+@dc.dataclass(frozen=True)
+class CmdbRecord:
+    """An intake record as the collector last synced it to ServiceNow (a cache: the intake file in git is the truth, spec N1)."""
+    repo: str
+    sys_id: str | None
+    number: str | None
+    fields_hash: str | None  # of the last good sync
+    last_operation: str | None
+    last_synced_at: dt.datetime | None
+    last_error: str | None  # one of CMDB_ERRORS, or None after a good sync
+    last_error_at: dt.datetime | None
+
+
+def _matches(pattern, value) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def check_cmdb_sync(repo, sys_id, number, fields_hash, operation) -> None:
+    """A good sync names its repo, the CI's sys_id and number, the fields hash and the operation (migration 0011's checks)."""
+    if not (_matches(REPO_NAME, repo) and _matches(SYS_ID, sys_id) and _matches(CI_NUMBER, number) and _matches(HASH, fields_hash)
+            and operation in CMDB_OPERATIONS):
+        raise ValueError("a CMDB sync names its repo, the CI's sys_id and number, the fields hash and the operation")
+
+
+def check_cmdb_error(repo, error) -> None:
+    if not _matches(REPO_NAME, repo) or error not in CMDB_ERRORS:
+        raise ValueError("a CMDB error names its repo and one of the known errors")
+
+
 class Store(Protocol):
     def sign_in(self, *, issuer, subject, display_name, email, groups, roles, now, max_age) -> tuple[Person, str, str]: ...
     def get_session(self, token, *, now, idle) -> Session | None: ...
     def end_session(self, token) -> None: ...
     def get_person(self, person_id) -> Person | None: ...
+    def person_email(self, person_id) -> str | None: ...  # the collector's one read of person (0011 grants it id and email)
     def list_people(self) -> list[Person]: ...
     def put_login_state(self, token, state, *, expires_at) -> None: ...
     def take_login_state(self, token, *, kind, now) -> LoginState | None: ...
@@ -430,7 +469,7 @@ class Store(Protocol):
     def admin_repos_by_login(self, logins) -> list[RepoAdmin]: ...
     def admin_repos_of_person(self, person_id) -> list[RepoAdmin]: ...  # through the person's active links: by user ID, else by login
     def observed_repo(self, repo) -> str | None: ...  # the collector's name of a repo, matched case-insensitively, or None
-    def create_registration(self, *, person_id, draft, now) -> Request: ...
+    def create_registration(self, *, person_id, draft, now, ownership_acknowledged_at=None) -> Request: ...
     def create_binding(self, *, request_id, person_id, final, now, current=None) -> Request: ...  # approved, no decision (B1); audits current as before
     def get_request(self, request_id) -> Request | None: ...
     def requests_by(self, person_id) -> list[Request]: ...
@@ -476,3 +515,7 @@ class Store(Protocol):
     def clear_stuck_run(self, *, repo, run_id) -> None: ...
     def drop_failed_run(self, *, repo, run_id) -> None: ...
     def rereview_status(self) -> dict[str, RereviewStatus]: ...
+    def record_cmdb_sync(self, *, repo, sys_id, number, fields_hash, operation, now) -> None: ...  # clears last_error
+    def record_cmdb_error(self, *, repo, error, now) -> None: ...  # keeps the CI's sys_id, number and hash
+    def cmdb_records(self) -> list[CmdbRecord]: ...  # by lower(repo)
+    def cmdb_record(self, repo) -> CmdbRecord | None: ...  # any case

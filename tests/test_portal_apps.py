@@ -680,3 +680,101 @@ def test_an_app_registered_only_in_the_factory_says_so_not_that_it_has_no_regist
     text = portal.client("owner").get("/apps/acme/notes").text
     assert "Registered outside the portal (the factory's intake record); a change or renewal here replaces it." in text
     assert "No portal registration" not in text
+
+
+# ---- The CMDB card (spec 2026-10-31 "What owning the app means"): once the sync succeeded, the notice with the number, at the top ----
+
+NUMBER = "APM0001001"
+
+
+def cmdb_synced(portal, schema="intake/v2", owner=None, servicenow=True, number=NUMBER, **settings):
+    """acme/notes's intake record as the collector read it, and synced to ServiceNow with `number` (none: not synced)."""
+    import datetime as dt
+    from portal_fakes import T0
+    from portal.store.base import IntakeObserved
+    v2 = schema == "intake/v2"
+    portal.store.replace_intake_observed([IntakeObserved(
+        "acme/notes", "c" * 40, schema, v2, (owner or portal.people["owner"].id) if v2 else "platform-team", "low", "public", "Stores notes.",
+        dt.date(2027, 10, 23) if v2 else None, None, None)], observed_at=T0)
+    if number:
+        portal.store.record_cmdb_sync(repo="acme/notes", sys_id="c" * 32, number=number, fields_hash="f" * 64, operation="INSERT", now=T0)
+    portal.app.state.settings = make_settings(directory=portal.settings.directory, servicenow=servicenow, **settings)
+
+
+def card(text):
+    start = text.index('<section class="card ownership"')
+    return text[start:text.index("</section>", start)]
+
+
+def test_the_cmdb_card_is_the_first_card_under_the_title_with_the_number_and_the_review_date(portal):
+    cmdb_synced(portal)
+    text = portal.client("owner").get("/apps/acme/notes").text
+    shown = card(text)
+    assert f'Your app is registered in ServiceNow (<span class="mono">{NUMBER}</span>).' in shown and "You are its owner. That means:" in shown
+    assert 'still in use (next by <time datetime="2027-10-23">2027-10-23</time>). If you don\'t confirm within 30 days' in shown
+    assert "If you leave the organization or move to another department" in shown
+    title = text.index('<h1 class="mono">acme/notes</h1>')
+    assert title < text.index('<section class="card ownership"') < text.index('<h2 class="visually-hidden">Registration</h2>')
+    assert text.count('class="card ownership"') == 1
+
+
+def test_the_card_needs_servicenow(portal):
+    cmdb_synced(portal, servicenow=False)
+    assert 'class="card ownership"' not in portal.client("owner").get("/apps/acme/notes").text
+
+
+def test_the_card_needs_a_number(portal):
+    cmdb_synced(portal, number=None)
+    portal.store.record_cmdb_error(repo="acme/notes", error="cmdb_unreachable", now=portal.clock())
+    text = portal.client("owner").get("/apps/acme/notes").text
+    assert 'class="card ownership"' not in text and "ServiceNow has no user" not in text
+
+
+def test_the_card_follows_the_settings(portal):
+    cmdb_synced(portal, org_name="Example Org", lifecycle_grace_days=0)
+    shown = card(portal.client("owner").get("/apps/acme/notes").text)
+    assert "If you leave Example Org or move" in shown and "in time" in shown and "days" not in shown
+
+
+def test_an_owner_unknown_to_servicenow_is_said(portal):
+    cmdb_synced(portal, number=None)
+    portal.store.record_cmdb_error(repo="acme/notes", error="cmdb_owner_unknown", now=portal.clock())
+    text = portal.client("owner").get("/apps/acme/notes").text
+    assert ('<p class="callout warn" role="status">ServiceNow has no user with the owner\'s email, so this app isn\'t registered there '
+            "yet.</p>") in html.unescape(text)
+    assert 'class="card ownership"' not in text
+
+
+def test_a_synced_app_whose_owner_is_now_unknown_keeps_its_card_and_says_so(portal):
+    cmdb_synced(portal)
+    portal.store.record_cmdb_error(repo="acme/notes", error="cmdb_owner_unknown", now=portal.clock())
+    text = html.unescape(portal.client("owner").get("/apps/acme/notes").text)
+    assert NUMBER in text and "ServiceNow has no user with the owner's email, so its owner there isn't updated yet." in text
+
+
+def test_a_v1_record_s_card_says_no_owner_of_record(portal):
+    cmdb_synced(portal, schema="intake/v1")
+    shown = card(portal.client("owner").get("/apps/acme/notes").text)
+    assert "No owner of record" in shown and "You are its owner" not in shown and "This app is registered in ServiceNow" in shown
+    assert "next by" not in shown   # a v1 record has no review date
+
+
+def test_another_viewer_sees_whose_app_it_is(portal):
+    cmdb_synced(portal)
+    shown = card(portal.client("admin").get("/apps/acme/notes").text)
+    assert f"Its owner is {portal.people['owner'].display_name}." in shown and "You are its owner" not in shown
+
+
+@pytest.mark.parametrize("problem", ["invalid", "case_mismatch"])
+def test_the_card_ignores_an_intake_record_the_collector_can_t_use(portal, problem):
+    """The collector skips a record with a problem, so the card names no owner and no review date from it."""
+    from portal_fakes import T0
+    from portal.store.base import IntakeObserved
+    cmdb_synced(portal)
+    portal.store.replace_intake_observed([IntakeObserved("acme/notes", "d" * 40, None, False, portal.people["owner"].id, "low", "public",
+                                                         "Stores notes.", __import__("datetime").date(2027, 10, 23), None, problem)],
+                                         observed_at=T0)
+    shown = html.unescape(card(portal.client("owner").get("/apps/acme/notes").text))
+    assert "is registered in ServiceNow" in shown and NUMBER in shown
+    assert "The registration record can't be read right now." in shown
+    assert "You are its owner" not in shown and "Its owner is" not in shown and "No owner of record" not in shown and "next by" not in shown

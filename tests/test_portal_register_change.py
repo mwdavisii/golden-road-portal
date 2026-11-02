@@ -55,7 +55,8 @@ def test_a_record_that_can_t_be_read_shows_the_change_page_without_pre_filling(p
 def test_a_change_is_submitted_as_a_registration_request(portal):
     observe(portal)
     response = portal.client("owner").post("/register", data={"csrf_token": portal.csrfs["owner"], "repo": "acme/tools", "purpose": PURPOSE,
-                                                               "data_classification": "confidential"})
+                                                               "data_classification": "confidential",
+                                                               "ownership_acknowledged": "yes"})
     assert response.status_code == 303
     [req] = [r for r in portal.store.requests_by(portal.people["owner"].id) if r.repo == "acme/tools"]
     assert (req.kind, req.state, req.draft["purpose"]) == ("registration", "pending", PURPOSE)
@@ -64,7 +65,8 @@ def test_a_change_is_submitted_as_a_registration_request(portal):
 def test_one_open_request_per_repo_whether_first_or_change(portal):
     observe(portal, repo="acme/notes")   # acme/notes already has the seeded pending request
     response = portal.client("owner").post("/register", data={"csrf_token": portal.csrfs["owner"], "repo": "acme/notes", "purpose": PURPOSE,
-                                                               "data_classification": "public"})
+                                                               "data_classification": "public",
+                                                               "ownership_acknowledged": "yes"})
     assert response.status_code == 409 and "That repository already has an open registration." in response.text
     assert "<h1>Change or renew the registration</h1>" in response.text
 
@@ -181,3 +183,20 @@ def test_a_hostile_record_is_shown_as_text_everywhere(portal):
 def test_someone_neither_the_requester_nor_an_admin_can_t_see_a_change(portal):
     req = pending_change(portal, record_view(portal.people["owner"].id))
     assert portal.client("other").get(f"/requests/{req.id}").status_code == 404
+
+
+def test_a_change_or_renewal_shows_what_owning_the_app_means_again(portal):
+    observe(portal)
+    text = portal.client("owner").get("/register?repo=acme/tools").text
+    assert "<h1>Change or renew the registration</h1>" in text and '<section class="card ownership"' in text
+    assert "If you leave the organization or move to another department" in text and "within 30 days" in text
+    assert 'name="ownership_acknowledged" value="yes" required' in text
+
+
+def test_a_change_without_the_acknowledgement_is_refused(portal):
+    observe(portal)
+    response = portal.client("owner").post("/register", data={"csrf_token": portal.csrfs["owner"], "repo": "acme/tools", "purpose": PURPOSE,
+                                                               "data_classification": "confidential"})
+    assert response.status_code == 400 and "Confirm that you understand what owning this app means." in response.text
+    assert "<h1>Change or renew the registration</h1>" in response.text
+    assert [r.repo for r in portal.store.requests_by(portal.people["owner"].id)] == ["acme/notes"]

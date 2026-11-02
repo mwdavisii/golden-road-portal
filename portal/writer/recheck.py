@@ -1,14 +1,20 @@
 """The writer trusts nothing it reads from the database (Security, writer): every claimed request is checked again. A registration
 against its approval and the platform's evidence; a binding (which nobody approves) against the directory, its secrets against
-Secret Server as the platform's account, and the requester's admin rights on the repo as the collector last saw them."""
+Secret Server as the platform's account, its MCP servers against Cloudflare and its skills against the catalog (spec 2026-10-31),
+and the requester's admin rights on the repo as the collector last saw them."""
 
 from .. import env_names
 from ..binding_record import MOCK_PASSWORD, MOCK_SERVER
+from ..bindings import mcp_token_name
+from ..cloudflare import CloudflareError
+from ..cloudflare_mock import MockCloudflare
+from ..compose import ComposeError, skills_config_map
 from ..contracts import validate
 from ..secretserver import SecretServerError
 from ..floor import below_floor
 from ..roles import roles_for
-from .allowlist import COMPOSED_SCHEMA, ENVIRONMENTS, allowed, target_for
+from ..skills_catalog import MockSkillsCatalog
+from .allowlist import ACCESS_SCHEMA, COMPOSED_SCHEMA, ENVIRONMENTS, allowed, target_for
 
 
 def _floor_problems(request, final, evidence) -> list[str]:
@@ -46,12 +52,15 @@ def recheck(request, cfg, evidence, store=None, now=None) -> list[str]:
 
 def _path_problems(request, cfg) -> list[str]:
     """Every file the request would write is on the allowlist, with the schema it is written as: a registration's intake record,
-    or a binding's bindings.yaml and its environment's composed.yaml, and nothing else."""
+    or a binding's bindings.yaml, its environment's composed.yaml and cloudflare-access.yaml, and nothing else."""
     target = target_for(cfg.org, request)
     if target is None or allowed(cfg.org, target.repo, target.path) != target.schema:
         return ["path_not_allowlisted"]
-    if (request.kind == "binding") != (target.also is not None) or (
-            target.also is not None and allowed(cfg.org, target.repo, target.also) != COMPOSED_SCHEMA):
+    binding = request.kind == "binding"
+    if binding != (target.also is not None) or binding != (target.access is not None):
+        return ["path_not_allowlisted"]
+    if binding and (allowed(cfg.org, target.repo, target.also) != COMPOSED_SCHEMA
+                    or allowed(cfg.org, target.repo, target.access) != ACCESS_SCHEMA):
         return ["path_not_allowlisted"]
     return []
 
@@ -145,6 +154,90 @@ def _secret_problems(cfg, final) -> list[str]:
     return problems + [p for p in ("secret_not_shared", "secret_field_gone") if p in found]
 
 
+def _mcp_problems(cfg, final) -> list[str]:
+    """The binding's mcp (spec 2026-10-31 M1 to M5), whenever it has the key, servers [] included: the owner is a GitHub owner (else
+    the app has no token name of its own), and the gateway is the writer's PORTAL_MCP_GATEWAY_<ENV>, as deploy-verify holds it to
+    platform.json's. Then each server, through Cloudflare's list as the platform's API token sees it now: the gateway is still
+    there, and each server still on it, ready, and not one that acts as each signed-in person (a service token can't use it).
+
+    A binding with servers [] names nothing to look up, so Cloudflare isn't asked: the request that clears a moved gateway (batch 4)
+    is never refused for want of Cloudflare. The person's own view (the per-user policy, M8) can't be re-checked here: the writer
+    has no person, so the web checked it on submit (a recorded gap, as with Delinea).
+
+    Only the mock is wired (MOCK ONLY): anything else is no_cloudflare. A server checked by another Cloudflare is
+    mcp_verified_elsewhere. A Cloudflare error is cloudflare_unavailable, never its text."""
+    mcp = final.get("mcp")
+    if mcp is None:
+        return []
+    try:
+        mcp_token_name(final["repo"], final["environment"])
+    except ValueError:
+        return ["mcp_owner_invalid"]
+    if mcp["gateway"] != (cfg.mcp_gateways or {}).get(final["environment"]):
+        return ["mcp_gateway_mismatch"]
+    servers = mcp.get("servers") or []
+    if not servers:
+        return []
+    cloudflare = cfg.cloudflare
+    if cloudflare is None or getattr(cloudflare, "name", None) != MockCloudflare.name:
+        return ["no_cloudflare"]
+    if any(s["verified_by"] != cloudflare.name for s in servers):
+        return ["mcp_verified_elsewhere"]
+    failed = False
+    try:
+        with cloudflare.client() as client:
+            gateway = client.gateway(mcp["gateway"])
+    except CloudflareError:
+        failed = True  # never the error's text: it lands in the request's failure reason
+    if failed:
+        return ["cloudflare_unavailable"]
+    if gateway is None:
+        return ["mcp_gateway_gone"]
+    found, now = set(), {s.server_id: s for s in gateway.servers}
+    for s in servers:
+        server = now.get(s["server_id"])
+        if server is None:
+            found.add("mcp_server_gone")
+        elif server.status != "ready":
+            found.add("mcp_server_not_ready")
+        elif server.on_behalf:
+            found.add("mcp_server_user_auth")
+    return [p for p in ("mcp_server_gone", "mcp_server_not_ready", "mcp_server_user_auth") if p in found]
+
+
+def _skill_problems(cfg, final) -> list[str]:
+    """The binding's skills (spec 2026-10-31 S1 to S5), against the catalog the writer builds the ConfigMap from: each still in the
+    catalog at its pinned commit, its skill.yaml there still listing the environment, and the environment's skills together within
+    the caps (compose.skills_config_map's, which deploy-verify applies too). A skill's audience can't be re-checked here: the writer
+    has no person, so the web checked it on submit.
+
+    Only the mock is wired (MOCK ONLY): anything else is no_skills_catalog. A skill checked by another catalog is
+    skill_verified_elsewhere."""
+    pins = final.get("skills") or []
+    if not pins:
+        return []
+    catalog = cfg.skills_catalog
+    if catalog is None or getattr(catalog, "name", None) != MockSkillsCatalog.name:
+        return ["no_skills_catalog"]
+    if any(p["verified_by"] != catalog.name for p in pins):
+        return ["skill_verified_elsewhere"]
+    found, files = set(), {}
+    for pin in pins:
+        skill = catalog.skill(pin["name"], pin["commit"])
+        if skill is None:
+            found.add("skill_gone")
+        elif final["environment"] not in skill.environments:
+            found.add("skill_environment")
+        else:
+            files[pin["name"]] = skill.files
+    if not found:
+        try:
+            skills_config_map("app", files)
+        except ComposeError:
+            found.add("skill_too_large")
+    return [p for p in ("skill_gone", "skill_environment", "skill_too_large") if p in found]
+
+
 def _binding(request, cfg, store, now) -> list[str]:
     problems = []
     if request.decided_by or request.decided_at or request.decision_groups:
@@ -158,6 +251,8 @@ def _binding(request, cfg, store, now) -> list[str]:
         problems.append("record_mismatch")
     problems += _directory_problems(request, cfg, final)
     problems += _secret_problems(cfg, final)
+    problems += _mcp_problems(cfg, final)
+    problems += _skill_problems(cfg, final)
     if not _still_admin(request, cfg, store, now):
         problems.append("requester_not_admin")
     return problems

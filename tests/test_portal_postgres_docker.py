@@ -75,9 +75,11 @@ def test_the_collector_role_sees_repo_admins_and_nothing_else(pg_db):
     with as_role(pg_db, "portal_collector") as conn:
         conn.execute("DELETE FROM repo_admin")
         conn.execute("INSERT INTO repo_admin VALUES ('acme/notes', 'pat', 1001, 'github', now())")
-        for table in ("person", "session", "audit_log", "identity_link", "login_state"):
+        for table in ("session", "audit_log", "identity_link", "login_state"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(sql.Composed([sql.SQL("SELECT 1 FROM "), sql.Identifier(table)]))
+        with pytest.raises(errors.InsufficientPrivilege):  # of person, only id and email (0011: the CMDB part finds the owner's user)
+            conn.execute("SELECT display_name FROM person")
 
 
 def test_each_process_role_can_do_its_work_through_the_store(pg_db):

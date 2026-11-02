@@ -69,13 +69,14 @@ class FakeIdP:
         self.key, self.kid = new_rsa_key(), "test-key-1"
         self.codes, self.override, self.token_factory = {}, {}, None
 
-    def authorize(self, url, *, sub, groups, name="Pat Example", email="pat@example.test"):
+    def authorize(self, url, *, sub, groups, name="Pat Example", email="pat@example.test", email_verified=True):
         """What the browser does at the authorization endpoint: returns the code the provider redirects back with."""
         q = parse_qs(urlsplit(url).query)
         assert q["response_type"] == ["code"] and q["code_challenge_method"] == ["S256"] and q["client_id"] == [self.client_id]
         code = secrets.token_urlsafe(16)
         self.codes[code] = {"challenge": q["code_challenge"][0], "redirect_uri": q["redirect_uri"][0], "nonce": q["nonce"][0],
-                            "claims": {"sub": sub, "groups": groups, "name": name, "email": email}}
+                            "claims": {"sub": sub, "groups": groups, "name": name, "email": email,
+                                       **({} if email_verified is None else {"email_verified": email_verified})}}
         return code
 
     def id_token(self, claims, *, alg="RS256", key=None, kid=None):
@@ -214,11 +215,24 @@ def approved_request(store, people, now, repo="acme/notes", claim=True):
     return store.claim_approved(now=now) if claim else store.get_request(req.id)
 
 
+def mock_cloudflare(email="owner@example.test", doc=None):
+    """The mock Cloudflare (mock_cloudflare.json, or `doc`) with the policy's mwdavisii@example.com given to `email`: the portal
+    fixture's owner signs in as owner@example.test, as the secrets tests swap the Secret Server login."""
+    from portal.cloudflare_mock import MOCK, parse
+    doc = json.loads(MOCK.read_text(encoding="utf-8")) if doc is None else doc
+    for user in doc["users"]:
+        if user["email"] == "mwdavisii@example.com":
+            user["email"] = email
+    return parse(doc)
+
+
 def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None, environment="test", identity=True,
-                    secrets=()):
+                    secrets=(), mcp=(), skills=()):
     """A binding by owner (an admin of acme/notes as seeded) for one environment: sp-notes unless identity is False, wh-notes unless
-    databricks (or identity) is False, and each of `secrets` ((secret id, field slug, env) picked by the mock user mwdavisii in the
-    mock Secret Server), built the way the app page builds it, then claimed by the writer (state writing)."""
+    databricks (or identity) is False, each of `secrets` ((secret id, field slug, env) picked by the mock user mwdavisii in the
+    mock Secret Server), each of `mcp` (a server id on the mock Cloudflare's gateway, picked by owner@example.test) and each of
+    `skills` ((name, commit): picked from the mock catalog at its main, then pinned at `commit`), built the way the app page builds
+    it, then claimed by the writer (state writing)."""
     from portal.binding_record import next_binding
     from portal.ids import new_id
     rid = new_id("r")
@@ -231,6 +245,17 @@ def binding_request(store, people, now, repo="acme/notes", databricks=True, curr
         for secret_id, slug, env in secrets:
             doc = next_binding(current=doc, **common, add_secret={"secret_id": secret_id, "field_slug": slug, "env": env},
                                secret_server=server, secret_user="mwdavisii")
+    if mcp:
+        cloudflare = mock_cloudflare()
+        for server_id in mcp:
+            doc = next_binding(current=doc, **common, add_mcp=server_id, cloudflare=cloudflare, mcp_gateway=cloudflare.gateways[environment],
+                               person_email=people["owner"].email)
+    if skills:
+        from portal.skills_catalog import load_mock as load_catalog
+        catalog = load_catalog()
+        for name, commit in skills:
+            doc = next_binding(current=doc, **common, add_skill=name, skills_catalog=catalog)
+            doc["skills"] = [{**s, "commit": commit} if s["name"] == name else s for s in doc["skills"]]
     if identity:
         doc = next_binding(current=doc, **common, principal_id="sp-notes")
     if identity and databricks:

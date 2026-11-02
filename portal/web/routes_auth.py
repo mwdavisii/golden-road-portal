@@ -76,7 +76,9 @@ def callback(request: Request, code: str = "", state: str = "", principal=PUBLIC
     old = request.cookies.get(SESSION_COOKIE)
     if old:
         store.end_session(old)
-    email = claims.get("email") if isinstance(claims.get("email"), str) else None
+    # Only an email the identity provider says it verified is kept (final review of 0.6.0): it decides which MCP servers the person
+    # may pick (the mock's per-user policy) and whose ServiceNow user owns their apps' CIs, so a self-asserted one must count as none.
+    email = claims.get("email") if isinstance(claims.get("email"), str) and claims.get("email_verified") is True else None
     _, session_token, _ = store.sign_in(issuer=s.oidc_issuer, subject=claims["sub"], display_name=oidc.display_name(claims), email=email,
                                         groups=groups, roles=roles_for(groups, s.role_groups), now=now, max_age=s.session_max)
     response = RedirectResponse(login_state.next_path, status_code=303)

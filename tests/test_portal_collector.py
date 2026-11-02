@@ -221,3 +221,77 @@ def test_each_part_records_its_status_and_the_interval_so_the_page_can_tell_a_st
     assert code == 1 and status["repo_admins"].problem is None and status["repo_admins"].counts == {"interval_seconds": 120}
     assert status["evidence"].problem == "failed" and status["evidence"].last_ok_at is None
 
+
+
+# ---- 0.6.0: the CMDB part (PORTAL_SERVICENOW) ----
+
+def _cmdb_run(tmp_path, monkeypatch, env_changes):
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+    from portal.store.base import IntakeObserved
+    from portal.store.memory import MemoryStore
+    store = MemoryStore()
+    store.close = lambda: None
+    owner, _, _ = store.sign_in(issuer="https://idp.example.test", subject="o", display_name="O", email="mwdavisii@example.com", groups=[],
+                                roles=[], now=T0, max_age=__import__("datetime").timedelta(hours=8))
+    store.replace_intake_observed([IntakeObserved("acme/notes", "c" * 40, "intake/v2", True, owner.id, "low", "public", "Stores notes.",
+                                                  __import__("datetime").date(2027, 10, 31), None, None)], observed_at=T0)
+    store.record_cmdb_sync(repo="acme/old", sys_id="d" * 32, number="APM0001007", fields_hash="f" * 64, operation="INSERT", now=T0)
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: store)
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, **k: 0)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 1, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    code, err = run_main(["--once"], {k: v for k, v in {**env_with(tmp_path), **env_changes}.items() if v is not None})
+    return code, err, store
+
+
+def test_with_the_mock_service_now_the_cmdb_part_runs_after_intake(tmp_path, monkeypatch):
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and "collectors: cmdb: 1 synced, 0 unchanged" in err
+    assert err.index("collectors: intake:") < err.index("collectors: cmdb:")
+    notes = store.cmdb_record("acme/notes")
+    assert notes.number == "APM0001008" and notes.last_error is None   # the mock was seeded from the store: the next number
+    assert store.rereview_status()["cmdb"].problem is None
+
+
+def test_an_unknown_owner_is_in_the_cmdb_line(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    monkeypatch.setattr(entry, "collect_cmdb", lambda store, servicenow, **k: {"synced": 2, "unchanged": 3, "owner_unknown": 1, "refused": 0,
+                                                                                  "unreachable": 0, "problem": "cmdb_owner_unknown"})
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and "collectors: cmdb: 2 synced, 3 unchanged (1 owner unknown)" in err
+
+
+def test_service_now_down_is_in_the_cmdb_line(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    monkeypatch.setattr(entry, "collect_cmdb", lambda store, servicenow, **k: {"synced": 0, "unchanged": 0, "owner_unknown": 0, "refused": 1,
+                                                                                  "unreachable": 1, "problem": "cmdb_unreachable"})
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and "collectors: cmdb: 0 synced, 0 unchanged (1 refused) (cmdb_unreachable: will retry)" in err
+
+
+def test_without_service_now_the_cmdb_part_does_not_run(tmp_path, monkeypatch):
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, {})
+    assert code == 0 and "cmdb" not in err and "cmdb" not in store.rereview_status() and store.cmdb_record("acme/notes") is None
+
+
+@pytest.mark.parametrize("changes, name", [({"PORTAL_SERVICENOW": "real"}, "PORTAL_SERVICENOW"),
+                                           ({"PORTAL_SERVICENOW": "mock", "PORTAL_SERVICENOW_URL": "https://x.service-now.com"},
+                                            "PORTAL_SERVICENOW_URL"),
+                                           ({"PORTAL_SERVICENOW_URL": "https://x.service-now.com"}, "PORTAL_SERVICENOW_URL")])
+def test_a_real_service_now_is_refused_with_the_setting_s_name(tmp_path, monkeypatch, changes, name):
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, changes)
+    assert code == 2 and name in err and "x.service-now.com" not in err and "cmdb" not in store.rereview_status()
+
+
+def test_a_cmdb_part_that_raises_is_failed_and_the_pass_goes_on(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+
+    def boom(store, servicenow, **k):
+        raise RuntimeError("the instance's own words")
+    monkeypatch.setattr(entry, "collect_cmdb", boom)
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 1 and "collectors: cmdb failed: RuntimeError" in err and "own words" not in err
+    assert store.rereview_status()["cmdb"].problem == "failed" and "collectors: re-review events:" in err

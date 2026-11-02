@@ -21,7 +21,8 @@ def test_a_connection_request_shows_its_toast_once(portal):
 def test_a_registration_and_a_decision_show_theirs(portal):
     owner = portal.client("owner")
     response = owner.post("/register", data={"csrf_token": portal.csrfs["owner"], "repo": "acme/tools",
-                                             "purpose": "Builds internal tools; no email.", "data_classification": "public"})
+                                             "purpose": "Builds internal tools; no email.", "data_classification": "public",
+                                             "ownership_acknowledged": "yes"})
     assert "Registration submitted for review" in owner.get(response.headers["location"]).text
     admin = portal.client("admin")
     response = admin.post(f"/admin/requests/{portal.seeds['request']}/send-back",

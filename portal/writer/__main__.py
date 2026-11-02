@@ -19,7 +19,8 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from ..github.appauth import InstallationToken, app_jwt
 from ..github.client import GitHub
-from ..settings import ORG, SettingsError, github_bases, no_secret_server_url, parse_role_groups
+from ..settings import (ORG, SettingsError, cloudflare_from, github_bases, mcp_gateways_from, no_cloudflare_account, no_secret_server_url,
+                        parse_role_groups, skills_catalog_from)
 from .bypass import check_bypass
 from .config import WriterConfig
 from .run import run_once
@@ -114,6 +115,14 @@ def _secret_server(env):
         raise SettingsError("PORTAL_SECRET_SERVER is mock, but the mock Secret Server is not valid") from None
 
 
+def _cloudflare(env):
+    """PORTAL_CLOUDFLARE and the two gateways, as the web reads them: (unset or the mock serving those hosts, {env: host}).
+    PORTAL_CLOUDFLARE_ACCOUNT_ID must stay unset: there is no real Cloudflare account."""
+    no_cloudflare_account(env.get("PORTAL_CLOUDFLARE_ACCOUNT_ID", ""))
+    gateways = mcp_gateways_from(env)
+    return cloudflare_from(env.get("PORTAL_CLOUDFLARE", ""), gateways), gateways
+
+
 def _load(env):
     host = _need(env, "PORTAL_GITHUB_HOST").lower()
     org = _need(env, "PORTAL_ORG")
@@ -125,9 +134,11 @@ def _load(env):
     url = _need(env, "PORTAL_DATABASE_URL")
     key = _key(_need(env, "PORTAL_WRITE_APP_KEY_FILE"))
     stale = dt.timedelta(seconds=_int(env, "PORTAL_REPO_ADMINS_STALE_AFTER", 60, 7 * 86400, default=600))  # the web's limit and default
+    cloudflare, gateways = _cloudflare(env)
     cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, factory_checks=_checks(env), deploy_checks=_deploy_checks(env),
                        directory=_directory(env), secret_server=_secret_server(env),
-                       repo_admins_stale_after=stale)
+                       repo_admins_stale_after=stale, cloudflare=cloudflare, mcp_gateways=gateways,
+                       skills_catalog=skills_catalog_from(env.get("PORTAL_SKILLS_CATALOG", "")))
     return cfg, key, installation, github_bases(host)[1], url, interval
 
 

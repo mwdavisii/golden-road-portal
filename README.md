@@ -51,6 +51,14 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_SECRET_PROCESS_URL` | Optional; an `https://` page that says how to ask security to share a secret with the platform account `golden-road-eso` (linked on the app page) |
 | `PORTAL_CLASSIFICATION_POLICY_URL` | Optional; an `https://` page with the data classification policy, linked (new tab) on the register, resubmit and approval forms. Empty or unset hides the link. |
 | `PORTAL_REREVIEW_STALE_DAYS` | Optional; days after which an open re-review item is flagged stale on the Re-review page (0 to 36500, default 30; `0` turns the flag off) |
+| `PORTAL_CLOUDFLARE` | Optional; `mock` turns on each app's MCP servers from the shared Cloudflare MCP gateways (`portal/mock_cloudflare.json`); unset, the app page shows none. The writer must get the same value |
+| `PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD` | Optional; each environment's gateway host, the same as `platform.json`'s `mcp_gateways` (`configure.py --mcp-gateway-test`, `--mcp-gateway-prod`). Empty is the placeholder, `mcp-test.example.com` or `mcp.example.com`; the two must differ. The writer must get the same values |
+| `PORTAL_MCP_PROCESS_URL` | Optional; an `https://` page that says how to ask for a server to be added to a gateway (linked on the app page) |
+| `PORTAL_SKILLS_CATALOG` | Optional; `mock` turns on each app's skills from the platform's catalog (`portal/mock_skills_catalog.json`); unset, the app page shows none. The writer must get the same value |
+| `PORTAL_SERVICENOW` | Optional; `mock` shows the collector's CMDB records (the app page's card, the request's Registered in ServiceNow step). The collector reads it too |
+| `PORTAL_ORG_NAME` | Optional; the organization's name in the ownership notice (one line, 1 to 100 characters; empty is "the organization") |
+| `PORTAL_LIFECYCLE_GRACE_DAYS` | Optional; the days the ownership notice gives (0 to 36500, default 30; `0` leaves the day count out, it never means "no time") |
+| `PORTAL_CLOUDFLARE_ACCOUNT_ID`, `PORTAL_SERVICENOW_URL` | Must stay unset: they are for a real Cloudflare account and a real ServiceNow instance, which there are none of yet. Set, each process that reads them stops (the web both, the writer the account id, the collector the URL) |
 | `PORTAL_SECRET_SERVER_URL` | Must stay unset: it is for a real Secret Server, which there is none of yet. Set, the portal stops (web and writer) |
 
 Anything missing or malformed stops the process at startup.
@@ -68,6 +76,8 @@ Anything missing or malformed stops the process at startup.
 | `PORTAL_WRITER_DEPLOY_REQUIRED_CHECKS` | Optional; the same for `golden-road-deploy`: `deploy-check` is always required; others can be added |
 | `PORTAL_DIRECTORY` | Optional; as for the web (`mock` or unset). Every binding is re-checked against it before it is written; unset, bindings fail with `no_directory` |
 | `PORTAL_SECRET_SERVER` | Optional; as for the web (`mock` or unset; `PORTAL_SECRET_SERVER_URL` must stay unset). A binding's secrets are re-checked against it before they are written |
+| `PORTAL_CLOUDFLARE`, `PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD` | Optional; as for the web. A binding's MCP servers are re-checked against them before they are written |
+| `PORTAL_SKILLS_CATALOG` | Optional; as for the web. A binding's skills are re-checked against it, and the skills ConfigMap is built from it |
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; the web's setting, and it must be the same value (the homelab kit passes both processes the one config map key; empty is the default, 600). A binding's requester must have been seen as the repo's admin within it, or it fails with `requester_not_admin` |
 
 It checks the write App's bypass before the first pass and again before every pass, and writes nothing in a pass whose check finds a
@@ -119,7 +129,7 @@ bindings per environment (one open request per kind, repo and environment; the i
 (below): the record a change replaces on its evidence, the collector's caches (`intake_observed`, `rereview_run`, `rereview_event`,
 `rereview_failed_run`, `rereview_watermark`, `rereview_source`) and the re-review items. Only `portal_collector` writes the caches
 and opens items; `portal_web` may only close an item, never for an app the closer owns; the collector's audit entries are `system`
-ones about items only, each written once.
+ones about items only, each written once. `0011` is the CMDB record and the ownership acknowledgement (below).
 
 Migrations are forward-only: there are no down migrations. After `0006` an older image still handles registrations, but its
 writer fails every binding request it claims (it knows only registrations). Don't roll the image back once bindings exist; if you
@@ -191,6 +201,66 @@ artifact after the reusable workflow wrote it: an accepted risk, which central m
 each pass; a run still going after a day, or one that failed, is re-checked by id. Every run is recorded once with its outcome, and
 anything that fails is counted on the page, never shown. The page also shows each collector part's last good pass (flagged after three
 missed intervals), each run source's watermark and what waits.
+
+## MCP servers, skills and the CMDB record (0.6.0, mock)
+
+Mock only: nothing here calls Cloudflare, ServiceNow or a skills repo. Each client is written against the real API and served by an
+`httpx.MockTransport` over a fixture.
+
+**MCP servers.** With `PORTAL_CLOUDFLARE=mock` the app page has an MCP servers section per environment. Each environment has one
+shared Cloudflare MCP gateway (`PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD`). `portal/cloudflare.py` makes one request,
+`GET /accounts/{id}/access/ai-controls/mcp/portals?search=<hostname>&page=<n>&per_page=100`, with an API token that has MCP Portals
+Read, and pages until `result_info.total_pages`. A gateway is matched by its exact hostname; a server is offered only when its
+status is `ready`. A server with `on_behalf` (each person's own sign-in) is shown greyed: an app can't use it. Which servers a
+person may use is not in Cloudflare's list: the per-user policy is the mock's (`mock_cloudflare.json`'s `users`, keyed by the
+person's sign-in email). The real version must evaluate the person against each server's Access policies; that is a recorded gap.
+A sign-in with no email sees no servers. The portal keeps a sign-in's email only when the ID token says `email_verified: true`, so
+a self-asserted email decides neither the MCP servers a person may pick nor the CMDB owner. The steps are Environment, Server, Review; the submit re-checks each one, at most 20
+servers per environment. Remove asks first.
+
+**Skills.** With `PORTAL_SKILLS_CATALOG=mock` the app page has a skills section. The catalog is `portal/mock_skills_catalog.json`,
+byte for byte the fixture `golden-road deploy-verify` reads (`src/golden_road/data/mock_skills_catalog.json`), so the writer and
+deploy-check build the same skills ConfigMap. A person may pick a skill whose `skill.yaml` lists the environment and whose audience
+is `everyone` or one of their sign-in groups. A skill is pinned to the catalog's `main` commit; Update moves it to the current one
+(a new request) and Remove asks first. At most 20 skills, 64 files and 256 KiB per skill, and 512 KiB per environment.
+
+**What a binding generates.** In `golden-road-deploy`, for an environment with MCP servers: `MCP_URL`, `MCP_SERVERS`, egress to
+the gateway on 443, and `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` in the environment's `ExternalSecret`, read from
+Secret Server at `/golden-road/mcp-tokens/cf-mcp-<owner>--<repo>-<env>`. For skills: the `<app>-skills` ConfigMap, mounted
+read-only at `/skills`, and `SKILLS_DIR=/skills`. And a third file beside `composed.yaml`, `cloudflare-access.yaml`: the desired
+state a platform job would reconcile into Cloudflare (the token and the servers whose policy names it). It is never applied, and it
+stays with `servers: []` after the last server is removed.
+
+**The writer.** A binding's pull request writes `bindings.yaml`, then `composed.yaml` if it changes, then `cloudflare-access.yaml`
+if it changes; it never deletes one. Before it writes, it re-checks the MCP servers (`mcp_owner_invalid`, `mcp_gateway_mismatch`,
+`no_cloudflare`, `mcp_verified_elsewhere`, `cloudflare_unavailable`, `mcp_gateway_gone`, `mcp_server_gone`, `mcp_server_not_ready`,
+`mcp_server_user_auth`) and the skills (`no_skills_catalog`, `skill_verified_elsewhere`, `skill_gone`, `skill_environment`,
+`skill_too_large`). A binding without `mcp` whose base has a `cloudflare-access.yaml` fails `access_file_without_mcp`. The
+person's own view (the per-user policy, a skill's audience) can't be re-checked here: the writer has no person, so the web checks
+it on submit.
+
+**The CMDB record.** With `PORTAL_SERVICENOW=mock` the collector has a fifth part, after intake. Each pass it sends each intake
+record that is new, changed since its last good sync, or whose last attempt failed, to ServiceNow as a `cmdb_ci_business_app`,
+identified by `correlation_id` (`github:<owner>/<repo>`, lower case). `portal/servicenow.py` makes three requests:
+`GET /api/now/table/sys_user` (the owner's user, by email: exactly one, or `cmdb_owner_unknown`),
+`POST /api/now/identifyreconcile?sysparm_data_source=golden_road` (create or update the CI) and
+`GET /api/now/table/cmdb_ci_business_app/<sys_id>` (its number, `APM0001001` and on in the mock). An `intake/v2` record whose
+owner is unknown is not sent: a CI with no owner is an orphaned app. An `intake/v1` record is sent without `owned_by`. The
+purpose is cut at 1000 characters for `short_description`. The problems are `cmdb_unreachable` (ServiceNow didn't answer; the
+rest wait for the next pass), `cmdb_owner_unknown` and `cmdb_refused` (an item came back with errors), each shown on the
+Re-review page with the repos whose last attempt failed. The log line is `collectors: cmdb: N synced, M unchanged`. Nothing
+changes the owner in ServiceNow from the portal, and nothing retires a CI.
+
+**What owning the app means.** One template, `_ownership.html`: patching, validation, leaving, with `PORTAL_ORG_NAME` and
+`PORTAL_LIFECYCLE_GRACE_DAYS`. The register form shows it with a required checkbox, "I understand what owning this app means"; a
+submission without it is refused and nothing is stored. The approval screen shows when it was acknowledged ("Not recorded" for a
+request from before 0.6.0). Once the collector has a CI number, the app page shows it as a card, and the request's timeline gains
+the step Registered in ServiceNow. Mock only: nothing suspends, asks, tasks or decommissions.
+
+Migration `0011` adds `cmdb_record` (repo, `sys_id`, number, the synced fields' hash, the last good sync and the last error; only
+`portal_collector` writes it, the web reads it), `request.ownership_acknowledged_at` (NULL for every request before it; registrations
+only; never changed after the insert), the `cmdb` part on `rereview_source`, and the collector's read of a person's email. It is
+forward-only, as `0010` is.
 
 ## Development
 

@@ -581,8 +581,8 @@ from portal.compose import compose  # noqa: E402
 
 D = "/repos/acme/golden-road-deploy"
 ENV_DIR = "apps/acme/notes/test"
-BPATH, CPATH = f"{ENV_DIR}/bindings.yaml", f"{ENV_DIR}/composed.yaml"
-BFILE, CFILE = f"{D}/contents/{BPATH}", f"{D}/contents/{CPATH}"
+BPATH, CPATH, APATH = f"{ENV_DIR}/bindings.yaml", f"{ENV_DIR}/composed.yaml", f"{ENV_DIR}/cloudflare-access.yaml"
+BFILE, CFILE, AFILE = f"{D}/contents/{BPATH}", f"{D}/contents/{CPATH}", f"{D}/contents/{APATH}"
 RELFILE, MANFILE = f"{D}/contents/{ENV_DIR}/release.yaml", f"{D}/contents/{ENV_DIR}/base/manifests.yaml"
 OLD_BLOB, OLD_COMPOSED_BLOB, MID = "e" * 40, "d" * 40, "4" * 40   # MID: the branch's first commit (bindings.yaml)
 IMAGE = "ghcr.io/acme/notes@sha256:" + "b" * 64
@@ -622,10 +622,14 @@ def file_answer(raw, sha="f" * 40):
 NOT_FOUND = (404, {"message": "Not Found"})
 
 
-def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), release=None, manifests=None):
+OLD_ACCESS_BLOB = "a" * 40
+
+
+def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), release=None, manifests=None, existing_access=None):
     """GitHub for the writer's first pass on a binding: the repo's intake record is in the factory (unless `intake` says otherwise),
-    the environment has a release pinned (release.yaml and base/manifests.yaml, unless a test changes them), and no bindings.yaml
-    or composed.yaml yet, or `existing` / `existing_composed` (bytes) at OLD_BLOB / OLD_COMPOSED_BLOB."""
+    the environment has a release pinned (release.yaml and base/manifests.yaml, unless a test changes them), and no bindings.yaml,
+    composed.yaml or cloudflare-access.yaml yet, or `existing` / `existing_composed` / `existing_access` (bytes) at OLD_BLOB /
+    OLD_COMPOSED_BLOB / OLD_ACCESS_BLOB."""
     gh = FakeGitHub()
     gh.on("GET", R, (200, gh.fixture("repo_factory")))
     gh.on("GET", R + "/git/ref/heads/main", (200, gh.fixture("ref_main")))
@@ -636,9 +640,11 @@ def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), rel
     gh.on("GET", MANFILE, manifests or file_answer(MANIFESTS))
     gh.on("GET", BFILE, NOT_FOUND if existing is None else file_answer(existing, OLD_BLOB))
     gh.on("GET", CFILE, NOT_FOUND if existing_composed is None else file_answer(existing_composed, OLD_COMPOSED_BLOB))
+    gh.on("GET", AFILE, NOT_FOUND if existing_access is None else file_answer(existing_access, OLD_ACCESS_BLOB))
     gh.on("POST", D + "/git/refs", (201, {"ref": "refs/heads/portal/request-x"}))
     gh.on("PUT", BFILE, (201 if existing is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": MID}}))
     gh.on("PUT", CFILE, (201 if existing_composed is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
+    gh.on("PUT", AFILE, (201 if existing_access is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
     gh.on("GET", D + "/pulls", (200, []))
     gh.on("POST", D + "/pulls", (201, as_deploy(gh.fixture("pull_created"))))
     gh.on("PATCH", D + "/pulls/12", (200, {}))  # an adopted PR gets the current body
@@ -649,7 +655,8 @@ def commit(sha, parent, path, status="added"):
     return (200, {"sha": sha, "parents": [{"sha": parent}], "files": [{"filename": path, "status": status}]})
 
 
-def badvancing(req, status="added", files=None, landed=None, chain=None, head_composed=None, main=BASE, pull=None, checks="check_runs_success"):
+def badvancing(req, status="added", files=None, landed=None, chain=None, head_composed=None, main=BASE, pull=None, checks="check_runs_success",
+               head_access=None):
     """GitHub when the writer comes back to a binding's PR: both files `status` (in the request's environment), written as MID
     (bindings.yaml) then HEAD (composed.yaml) on BASE, the check passed, the merge works, and both files land as written."""
     bpath, cpath = (path.replace("/test/", f"/{req.final['environment']}/") for path in (BPATH, CPATH))
@@ -671,6 +678,10 @@ def badvancing(req, status="added", files=None, landed=None, chain=None, head_co
     gh.on("GET", f"{D}/contents/{bpath}", landed.get(bpath, file_answer(binding_yaml(req.final, req.id).encode())))
     gh.on("GET", f"{D}/contents/{cpath}", lambda request: httpx.Response(200, json=file_answer(
         landed.get(cpath, want_composed) if request.url.params.get("ref") == "3" * 40 else want_composed)[1]))
+    if head_access is not None:  # a binding with mcp: its cloudflare-access.yaml at head, and at the merge commit unless `landed` says
+        apath = APATH.replace("/test/", f"/{req.final['environment']}/")
+        gh.on("GET", f"{D}/contents/{apath}", lambda request: httpx.Response(200, json=file_answer(
+            landed.get(apath, head_access) if request.url.params.get("ref") == "3" * 40 else head_access)[1]))
     return gh
 
 
@@ -694,7 +705,8 @@ def test_a_first_binding_writes_bindings_then_composed_in_the_deploy_repo_and_me
     pr = json.loads(gh.called("POST", D + "/pulls")[0]["body"])
     assert pr["title"] == f"Connections for acme/notes (test) (portal request {req.id})" and "`sp-notes`" in pr["body"]
     assert {c["path"] for c in gh.calls} <= {R, R + "/git/ref/heads/main", FILE, D, D + "/git/ref/heads/main", RELFILE, MANFILE, BFILE, CFILE,
-                                             D + "/git/refs", D + "/pulls"}, "only the two files are written"
+                                             AFILE, D + "/git/refs", D + "/pulls"}, "only the two files are written"
+    assert not gh.called("PUT", AFILE) and gh.called("GET", AFILE)[0]["query"]["ref"] == BASE, "no mcp: the access file is only read"
     assert not gh.called("PUT", FILE) and gh.called("GET", FILE)[0]["query"]["ref"] == BASE, "the intake record is only read, in the factory"
     for path in (RELFILE, MANFILE, BFILE, CFILE):
         assert gh.called("GET", path)[0]["query"]["ref"] == BASE, f"{path} is read at the base commit"
@@ -707,7 +719,7 @@ def test_a_first_binding_writes_bindings_then_composed_in_the_deploy_repo_and_me
         assert gh.called("GET", path)[-1]["query"]["ref"] == "3" * 40, f"{path} is confirmed at the merge commit"
 
 
-PROD = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "REL": RELFILE, "MAN": MANFILE}.items()}
+PROD = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "A": AFILE, "REL": RELFILE, "MAN": MANFILE}.items()}
 PROD_RELEASE = release_doc(environment="prod", namespace="notes-prod", release="prod-20261029130000-abcdef1")
 
 
@@ -718,6 +730,7 @@ def pgh_for_write():
     gh.on("GET", PROD["MAN"], file_answer(MANIFESTS))
     gh.on("GET", PROD["B"], NOT_FOUND)
     gh.on("GET", PROD["C"], NOT_FOUND)
+    gh.on("GET", PROD["A"], NOT_FOUND)
     gh.on("PUT", PROD["B"], (201, {"commit": {"sha": MID}}))
     gh.on("PUT", PROD["C"], (201, {"commit": {"sha": HEAD}}))
     return gh
@@ -1419,3 +1432,267 @@ def test_a_directory_where_the_record_goes_is_refused_by_name(portal):
     gh.routes[("GET", "api.github.com", FILE)] = [(200, [{"name": "x.yaml", "type": "file"}])]
     run_once(portal.store, client(gh), writer_config(), T0)
     assert portal.store.get_request(req.id).failure_reason == "not_a_file" and not gh.called("PUT", FILE)
+
+
+# MCP servers and skills (spec 2026-10-31): a binding's third file, cloudflare-access.yaml, and its skills ConfigMap from the catalog.
+
+from portal.compose import cloudflare_access  # noqa: E402
+from portal.skills_catalog import MOCK as CATALOG_MOCK, load_mock as load_catalog  # noqa: E402
+from portal_fakes import mock_cloudflare  # noqa: E402
+from portal.writer.run import Refused, _chain_writes, access_for, composed_for  # noqa: E402
+
+MAIN = json.loads(CATALOG_MOCK.read_text(encoding="utf-8"))["main"]
+MID2 = "6" * 40  # a three-file branch: bindings.yaml (MID), composed.yaml (MID2), cloudflare-access.yaml (HEAD)
+
+
+def mcfg(**changes):
+    return bcfg(**{"cloudflare": mock_cloudflare(), "skills_catalog": load_catalog(), **changes})
+
+
+def skill_files(req):
+    catalog = load_catalog()
+    return {s["name"]: catalog.skill(s["name"], s["commit"]).files for s in req.final.get("skills") or []} or None
+
+
+def mcomposed(req):
+    """composed.yaml as golden-road compose writes it, with the binding's skills read from the catalog at their pins."""
+    rel = release_doc()
+    return compose(MANIFESTS.decode(), rel["image"], yaml.safe_load(binding_yaml(req.final, req.id)), namespace=rel["namespace"],
+                   skills=skill_files(req)).encode()
+
+
+def access(req):
+    return cloudflare_access(yaml.safe_load(binding_yaml(req.final, req.id))).encode()
+
+
+def three_writes(gh):
+    gh.routes[("PUT", "api.github.com", CFILE)] = [(201, {"commit": {"sha": MID2}})]
+    gh.routes[("PUT", "api.github.com", AFILE)] = [(201, {"commit": {"sha": HEAD}})]
+    return gh
+
+
+THREE = {HEAD: commit(HEAD, MID2, APATH), MID2: commit(MID2, MID, CPATH), MID: commit(MID, BASE, BPATH)}
+THREE_FILES = [{"filename": p, "status": "added"} for p in (BPATH, CPATH, APATH)]
+
+
+def test_a_binding_that_adds_notes_writes_bindings_composed_and_cloudflare_access_and_merges(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    gh = three_writes(bgh_for_write())
+    run_once(portal.store, client(gh), mcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.head_sha) == ("pr_open", HEAD), after.failure_reason
+    assert [path for path, _ in puts(gh)] == [BFILE, CFILE, AFILE], "three commits, in order"
+    (_, b), (_, c), (_, a) = puts(gh)
+    assert base64.b64decode(c["content"]) == mcomposed(req) and base64.b64decode(a["content"]) == access(req)
+    written = yaml.safe_load(base64.b64decode(a["content"]))
+    assert written["servers"] == ["notes"] and written["token"]["secret_path"] == "/golden-road/mcp-tokens/cf-mcp-acme--notes-test"
+    assert b"MCP_URL" in base64.b64decode(c["content"]) and b"CF_ACCESS_CLIENT_ID" in base64.b64decode(c["content"])
+    body = json.loads(gh.called("POST", D + "/pulls")[0]["body"])["body"]
+    assert "MCP servers on `mcp-test.example.com`: `notes`" in body and "cloudflare-access.yaml" in body
+    gh = badvancing(req, files=THREE_FILES, chain=THREE, head_composed=mcomposed(req), head_access=access(req))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged", portal.store.get_request(req.id).failure_reason
+    assert gh.called("GET", AFILE)[-1]["query"]["ref"] == "3" * 40, "the access file is confirmed at the merge commit"
+
+
+def test_a_skills_only_change_writes_bindings_and_composed_and_merges(portal):
+    req = binding_request(portal.store, portal.people, T0, identity=False, skills=[("incident-triage", MAIN)])
+    gh = bgh_for_write()
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open", portal.store.get_request(req.id).failure_reason
+    assert [path for path, _ in puts(gh)] == [BFILE, CFILE]
+    text = base64.b64decode(puts(gh)[1][1]["content"])
+    assert text == mcomposed(req) and b"incident-triage__checklists__sev1.md" in text and b"SKILLS_DIR" in text
+    assert "Skills: `incident-triage` at `" + MAIN[:12] + "`" in json.loads(gh.called("POST", D + "/pulls")[0]["body"])["body"]
+    run_once(portal.store, client(badvancing(req, head_composed=mcomposed(req))), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged"
+
+
+def test_an_identity_change_on_a_binding_with_mcp_leaves_cloudflare_access_alone(portal):
+    """The access file depends only on mcp: an identity change rewrites bindings and composed, and the access file stays as it is
+    (and is still confirmed at the merge commit)."""
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    gh = bgh_for_write(existing=b"# an older binding\n", existing_composed=b"# older\n", existing_access=access(req))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+    assert [path for path, _ in puts(gh)] == [BFILE, CFILE] and "cloudflare-access.yaml" not in json.loads(
+        gh.called("POST", D + "/pulls")[0]["body"])["body"]
+    gh = badvancing(req, "modified", head_composed=mcomposed(req), head_access=access(req))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged", portal.store.get_request(req.id).failure_reason
+
+
+def test_a_binding_whose_composed_yaml_is_unchanged_and_access_changes_writes_bindings_then_access(portal):
+    """An ordered subsequence: bindings.yaml first, then the next files that change, in order."""
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    gh = bgh_for_write(existing=b"# an older binding\n", existing_composed=mcomposed(req), existing_access=b"# older access\n")
+    gh.routes[("PUT", "api.github.com", BFILE)] = [(200, {"commit": {"sha": MID}})]
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert [path for path, _ in puts(gh)] == [BFILE, AFILE] and puts(gh)[1][1]["sha"] == OLD_ACCESS_BLOB
+    files = [{"filename": BPATH, "status": "modified"}, {"filename": APATH, "status": "modified"}]
+    chain = {HEAD: commit(HEAD, MID, APATH, "modified"), MID: commit(MID, BASE, BPATH, "modified")}
+    run_once(portal.store, client(badvancing(req, "modified", files=files, chain=chain, head_composed=mcomposed(req),
+                                             head_access=access(req))), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "merged", portal.store.get_request(req.id).failure_reason
+
+
+def test_an_adopted_branch_that_skips_a_changed_composed_yaml_is_not_ours(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    gh = three_writes(bgh_for_write())
+    crashed(gh, req, HEAD)
+    gh.on("GET", D + f"/commits/{HEAD}", commit(HEAD, MID, APATH))
+    gh.on("GET", D + f"/commits/{MID}", commit(MID, BASE, BPATH))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "branch_not_ours" and not puts(gh)
+
+
+def test_an_interrupted_three_file_write_resumes_with_the_access_file(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    gh = three_writes(bgh_for_write())
+    crashed(gh, req, MID2)
+    gh.on("GET", D + f"/commits/{MID2}", commit(MID2, MID, CPATH))
+    gh.on("GET", D + f"/commits/{MID}", commit(MID, BASE, BPATH))
+    gh.routes[("GET", "api.github.com", BFILE)] = [NOT_FOUND, file_answer(binding_yaml(req.final, req.id).encode())]
+    gh.routes[("GET", "api.github.com", CFILE)] = [NOT_FOUND, file_answer(mcomposed(req))]
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert (portal.store.get_request(req.id).state, portal.store.get_request(req.id).head_sha) == ("pr_open", HEAD)
+    assert [path for path, _ in puts(gh)] == [AFILE]
+
+
+@pytest.mark.parametrize("chain", [
+    {HEAD: commit(HEAD, MID, CPATH), MID: commit(MID, BASE, APATH)},                 # access before composed, no bindings
+    {HEAD: commit(HEAD, MID2, CPATH), MID2: commit(MID2, MID, APATH), MID: commit(MID, BASE, BPATH)},   # the wrong order
+    {HEAD: commit(HEAD, BASE, APATH)},                                               # access alone
+], ids=["no-bindings", "order", "access-only"])
+def test_a_three_file_pr_whose_commits_are_not_in_order_is_never_merged(portal, chain):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    run_once(portal.store, client(three_writes(bgh_for_write())), mcfg(), T0)
+    gh = badvancing(req, files=THREE_FILES, chain=chain, head_composed=mcomposed(req), head_access=access(req))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "pr_commit_not_ours") and not gh.called("PUT", D + "/pulls/12/merge")
+
+
+def test_a_three_file_pr_that_shows_only_two_of_its_files_is_never_merged(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    run_once(portal.store, client(three_writes(bgh_for_write())), mcfg(), T0)
+    gh = badvancing(req, files=THREE_FILES[:2], chain=THREE, head_composed=mcomposed(req), head_access=access(req))
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "pr_files_unexpected"
+
+
+def test_a_merged_binding_whose_access_file_reads_otherwise_at_the_merge_commit_is_failed(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    run_once(portal.store, client(three_writes(bgh_for_write())), mcfg(), T0)
+    gh = badvancing(req, files=THREE_FILES, chain=THREE, head_composed=mcomposed(req), head_access=access(req),
+                    landed={APATH: access(req) + b"# extra\n"})
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "merged_file_differs"
+
+
+def test_a_binding_without_mcp_whose_base_has_an_access_file_is_refused_and_nothing_is_written(portal):
+    """The writer never deletes a file, and deploy-check refuses an access file beside a binding with no mcp: only a hand edit makes
+    that state, and the writer says so rather than open a PR that can't pass."""
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing_access=b"schema: cloudflare-access/v1\n")
+    run_once(portal.store, client(gh), mcfg(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "access_file_without_mcp")
+    assert not puts(gh) and not gh.called("POST", D + "/git/refs") and not gh.called("DELETE", AFILE)
+
+
+def test_a_binding_with_mcp_servers_emptied_keeps_its_access_file_with_no_servers(portal):
+    """The last server removed: the key stays with servers [], so cloudflare-access.yaml is rewritten, never deleted."""
+    first = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    portal.store.mark_failed(request_id=first.id, reason="test: make room for the next change", now=T0)
+    from portal.binding_record import next_binding
+    from portal.ids import new_id
+    rid = new_id("r")
+    doc = next_binding(current=first.final, repo="acme/notes", org="acme", directory=fake_directory(), person_id=portal.people["owner"].id,
+                       request_id=rid, now=T0, environment="test", remove_mcp="notes", mcp_gateway="mcp-test.example.com")
+    portal.store.create_binding(request_id=rid, person_id=portal.people["owner"].id, final=doc, now=T0, current=first.final)
+    req = portal.store.claim_approved(now=T0)
+    gh = bgh_for_write(existing=binding_yaml(first.final, first.id).encode(), existing_composed=mcomposed(first), existing_access=access(first))
+    gh.routes[("PUT", "api.github.com", CFILE)] = [(200, {"commit": {"sha": MID2}})]
+    gh.routes[("PUT", "api.github.com", AFILE)] = [(200, {"commit": {"sha": HEAD}})]
+    run_once(portal.store, client(gh), mcfg(), T0)
+    assert portal.store.get_request(req.id).state == "pr_open", portal.store.get_request(req.id).failure_reason
+    assert [path for path, _ in puts(gh)] == [BFILE, CFILE, AFILE] and not gh.called("DELETE", AFILE)
+    assert yaml.safe_load(base64.b64decode(puts(gh)[2][1]["content"]))["servers"] == []
+    assert b"MCP_URL" not in base64.b64decode(puts(gh)[1][1]["content"])
+
+
+def test_skills_without_a_catalog_or_with_a_missing_pin_are_compose_refused():
+    from types import SimpleNamespace
+    req = SimpleNamespace(repo="acme/notes", draft={"environment": "test"})
+    base = {"schema": "binding/v2", "repo": "acme/notes", "environment": "test", "linked_by": "p_" + "a" * 32,
+            "linked_at": "2026-10-29T15:00:00Z", "request": "r_" + "b" * 32}
+    pinned = yaml.safe_dump({**base, "skills": [{"name": "incident-triage", "commit": MAIN, "verified_by": "mock-skills-catalog"}]}).encode()
+    assert b"incident-triage__SKILL.md" in composed_for(req, release_yaml(), MANIFESTS, pinned, load_catalog())
+    for catalog, raw in ((None, pinned), (load_catalog(), pinned.replace(MAIN.encode(), b"0" * 40)),
+                         (load_catalog(), pinned.replace(b"incident-triage", b"no-such-skill"))):
+        with pytest.raises(Refused, match="compose_refused"):
+            composed_for(req, release_yaml(), MANIFESTS, raw, catalog)
+
+
+@pytest.mark.parametrize("repo", ["acme_x/notes", "ac--me/notes", "-acme/notes"])
+def test_an_owner_that_is_not_a_github_owner_is_compose_refused_for_both_generated_files(repo):
+    """Review of batch 2: compose and cloudflare_access raise for such an owner (no token name of its own); the writer refuses it
+    the same way, before it writes anything, even had the recheck let it through."""
+    from types import SimpleNamespace
+    req = SimpleNamespace(repo=repo, draft={"environment": "test"})
+    raw = yaml.safe_dump({"schema": "binding/v2", "repo": repo, "environment": "test", "linked_by": "p_" + "a" * 32,
+                          "linked_at": "2026-10-29T15:00:00Z", "request": "r_" + "b" * 32,
+                          "mcp": {"gateway": "mcp-test.example.com", "servers": []}}).encode()
+    with pytest.raises(Refused, match="compose_refused"):
+        access_for(raw)  # servers [] included: the file still names the token
+    assert composed_for(req, release_yaml(repo=repo), MANIFESTS, raw), "no servers: composed.yaml names no token"
+    notes = raw.replace(b"servers: []", b"servers:\n  - {server_id: notes, name: Notes, verified_by: mock-cloudflare}")
+    with pytest.raises(Refused, match="compose_refused"):
+        composed_for(req, release_yaml(repo=repo), MANIFESTS, notes)
+
+
+def test_access_for_is_none_without_mcp_and_the_file_with_it():
+    base = {"schema": "binding/v2", "repo": "acme/notes", "environment": "test", "linked_by": "p_" + "a" * 32,
+            "linked_at": "2026-10-29T15:00:00Z", "request": "r_" + "b" * 32}
+    assert access_for(yaml.safe_dump(base).encode()) is None
+    doc = {**base, "mcp": {"gateway": "mcp-test.example.com", "servers": [{"server_id": "notes", "name": "Notes", "verified_by": "mock-cloudflare"}]}}
+    assert access_for(yaml.safe_dump(doc).encode()) == cloudflare_access(doc).encode()
+    with pytest.raises(Refused, match="compose_refused"):
+        access_for(b"a: &x 1\nb: *x\n")
+
+
+def c(path):
+    return {"files": [{"filename": path, "status": "added"}]}
+
+
+@pytest.mark.parametrize("paths, written", [
+    (["b"], ["b"]), (["b", "c"], ["b", "c"]), (["b", "a"], ["b", "a"]), (["b", "c", "a"], ["b", "c", "a"]),
+    (["c"], None), (["a"], None), (["c", "a"], None), (["b", "a", "c"], None), (["b", "b"], None), (["b", "c", "a", "a"], None),
+])
+def test_the_chain_is_an_ordered_subsequence_that_starts_with_bindings(paths, written):
+    assert _chain_writes([c(p) for p in paths], ["b", "c", "a"], ("added",)) == written
+    assert _chain_writes(None, ["b", "c", "a"], ("added",)) is None and _chain_writes([], ["b", "c", "a"], ("added",)) is None
+
+
+@pytest.mark.parametrize("servers", [["notes"], []], ids=["with-servers", "servers-empty"])
+def test_a_binding_for_an_owner_with_no_token_name_is_refused_before_anything_is_written(servers):
+    """The writer's own file plan, for a request on acme_x/notes (the recheck refuses it first, as mcp_owner_invalid): with servers
+    composed.yaml is refused, with none cloudflare-access.yaml is, and either way nothing is PUT and no branch is made."""
+    from types import SimpleNamespace
+    from portal.writer.allowlist import target_for
+    from portal.writer.run import _files_to_write
+    final = {"schema": "binding/v2", "repo": "acme_x/notes", "environment": "test", "linked_by": "p_" + "a" * 32,
+             "linked_at": "2026-10-29T15:00:00Z", "request": "r_" + "b" * 32,
+             "mcp": {"gateway": "mcp-test.example.com",
+                     "servers": [{"server_id": s, "name": "Notes", "verified_by": "mock-cloudflare"} for s in servers]}}
+    req = SimpleNamespace(kind="binding", repo="acme_x/notes", draft={"environment": "test"}, final=final, id="r_" + "b" * 32)
+    target = target_for("acme", req)
+    d = f"{D}/contents/apps/acme_x/notes/test"
+    gh = FakeGitHub()
+    gh.on("GET", f"{d}/bindings.yaml", NOT_FOUND)
+    gh.on("GET", f"{d}/release.yaml", file_answer(release_yaml(repo="acme_x/notes")))
+    gh.on("GET", f"{d}/base/manifests.yaml", file_answer(MANIFESTS))
+    with pytest.raises(Refused, match="compose_refused"):
+        _files_to_write(client(gh), mcfg(), req, target, "main", BASE, binding_yaml(final, req.id).encode())
+    assert not puts(gh) and not gh.called("POST", D + "/git/refs")

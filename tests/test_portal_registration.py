@@ -7,7 +7,7 @@ from portal.store.base import RepoAdmin
 
 def submit(portal, who, **form):
     data = {"csrf_token": portal.csrfs[who], "repo": "acme/tools", "purpose": "Builds internal tools; no PHI, no email.",
-            "data_classification": "public", **form}
+            "data_classification": "public", "ownership_acknowledged": "yes", **form}
     return portal.client(who).post("/register", data=data)
 
 
@@ -197,3 +197,88 @@ def test_an_invalid_record_s_central_mark_is_carried_by_the_approval(portal):
     final, errors = intake_record(req, approver_id=portal.people["admin"].id, tier="moderate", classification="public", review_by="2027-10-23",
                                   justification="Change checked against the current record.", now=T0, evidence=evidence)
     assert errors == [] and final["scorecard"] == "central"
+
+
+# ---- What owning an app means (spec 2026-10-31): the notice and its required acknowledgement ----
+
+POINTS = ("<strong>Patching.</strong> When ongoing vulnerability scans find new vulnerabilities, you approve the patches. Access may be "
+          "suspended for a critical vulnerability until it is fixed.",
+          "<strong>Validation.</strong> You will be asked regularly to confirm the app is still in use.",
+          "<strong>Leaving.</strong> If you leave the organization or move to another department, you and your manager get a ServiceNow "
+          "task to name a new owner or decommission the app.")
+CHECKBOX = '<input type="checkbox" name="ownership_acknowledged" value="yes" required'
+ACK_NEEDED = "Confirm that you understand what owning this app means."
+
+
+def notice(text):
+    start = text.index('<section class="card ownership"')
+    return text[start:text.index("</section>", start)]
+
+
+def test_the_register_form_shows_what_owning_the_app_means_and_the_checkbox(portal):
+    text = portal.client("owner").get("/register").text
+    shown = notice(text)
+    assert all(point in shown for point in POINTS) and "What owning this app means" in shown
+    assert shown.count("within 30 days, the app is decommissioned.") == 2 and "ServiceNow (" not in shown   # no number before it is registered
+    assert CHECKBOX in text and "I understand what owning this app means" in text
+    assert text.index("ownership") < text.index("Submit for review") and text.index(CHECKBOX) < text.index("Submit for review")
+
+
+def test_the_notice_names_the_configured_organization_and_0_hides_the_day_count(portal):
+    portal.app.state.settings = make_settings(directory=portal.settings.directory, org_name="Example Org", lifecycle_grace_days=0)
+    shown = notice(portal.client("owner").get("/register").text)
+    assert "If you leave Example Org or move" in shown and "the organization" not in shown
+    assert "If you don't confirm in time, the app is decommissioned." in shown and "If neither happens in time, the app is decommissioned." in shown
+    assert "days" not in shown and "within" not in shown
+
+
+def test_the_org_name_is_escaped(portal):
+    portal.app.state.settings = make_settings(directory=portal.settings.directory, org_name="<b>Org</b>")
+    shown = notice(portal.client("owner").get("/register").text)
+    assert "<b>Org</b>" not in shown and "&lt;b&gt;Org&lt;/b&gt;" in shown
+
+
+@pytest.mark.parametrize("value", [None, "", "no", "on", "YES", "2020-01-01T00:00:00Z"])
+def test_a_registration_without_the_acknowledgement_is_refused_and_stores_nothing(portal, value):
+    form = {"ownership_acknowledged": value} if value is not None else {}
+    data = {"csrf_token": portal.csrfs["owner"], "repo": "acme/tools", "purpose": "Builds internal tools; no PHI, no email.",
+            "data_classification": "public", **form}
+    response = portal.client("owner").post("/register", data=data)
+    assert response.status_code == 400 and ACK_NEEDED in response.text and CHECKBOX in response.text
+    assert "Builds internal tools; no PHI, no email.</textarea>" in response.text   # the form comes back as it was filled in
+    assert [r.repo for r in portal.store.requests_by(portal.people["owner"].id)] == ["acme/notes"], "nothing was registered"
+
+
+def test_the_acknowledgement_is_the_clock_s_time_whatever_the_form_says(portal):
+    response = submit(portal, "owner", ownership_acknowledged_at="2020-01-01T00:00:00Z")
+    assert response.status_code == 303
+    req = portal.store.get_request(response.headers["location"].rsplit("/", 1)[1])
+    assert req.ownership_acknowledged_at == portal.clock()
+
+
+def test_a_refusal_for_another_reason_also_asks_for_the_acknowledgement(portal):
+    response = submit(portal, "owner", purpose="short", ownership_acknowledged="")
+    assert response.status_code == 400 and ACK_NEEDED in response.text and "10 to 4000 characters" in response.text
+
+
+def test_a_resubmit_after_a_send_back_keeps_the_acknowledgement(portal):
+    rid = submit(portal, "owner").headers["location"].rsplit("/", 1)[1]
+    acknowledged = portal.store.get_request(rid).ownership_acknowledged_at
+    portal.clock.advance(minutes=5)
+    portal.store.decide(request_id=rid, actor_id=portal.people["admin"].id, actor_groups=[], approve=False, note="Say more.", final=None,
+                        now=portal.clock())
+    data = {"csrf_token": portal.csrfs["owner"], "purpose": "Builds internal tools; no PHI, no email, no files.", "data_classification": "public"}
+    assert portal.client("owner").post(f"/requests/{rid}", data=data).status_code == 303
+    req = portal.store.get_request(rid)
+    assert req.state == "pending" and req.ownership_acknowledged_at == acknowledged
+
+
+def test_the_request_page_shows_the_acknowledgement_and_the_notice_to_the_requester(portal):
+    rid = submit(portal, "owner").headers["location"].rsplit("/", 1)[1]
+    text = portal.client("owner").get(f"/requests/{rid}").text
+    at = portal.clock()
+    assert f'Acknowledged <time datetime="{at.strftime("%Y-%m-%dT%H:%M:%SZ")}">{at.strftime("%Y-%m-%d %H:%M")} UTC</time>' in text
+    assert all(point in notice(text) for point in POINTS)
+    seeded = portal.client("owner").get(f"/requests/{portal.seeds['request']}").text   # created without it, as before 0.6.0
+    assert "Not recorded (submitted before 0.6.0)" in seeded
+    assert 'class="card ownership"' not in portal.client("admin").get(f"/requests/{rid}").text   # the notice is the requester's

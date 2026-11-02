@@ -58,6 +58,13 @@ ROUTES = {
     ("POST", "/apps/{owner}/{repo}/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/secrets"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/secrets/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("GET", "/apps/{owner}/{repo}/mcp/new"): {A: 303, O: 404, X: 404, P: 404, D: 404},   # 404 for everyone signed in: no Cloudflare here
+    ("POST", "/apps/{owner}/{repo}/mcp"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/mcp/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("GET", "/apps/{owner}/{repo}/skills/new"): {A: 303, O: 404, X: 404, P: 404, D: 404},   # 404 for everyone signed in: no catalog here
+    ("POST", "/apps/{owner}/{repo}/skills"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/skills/update"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    ("POST", "/apps/{owner}/{repo}/skills/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
 }
 
 

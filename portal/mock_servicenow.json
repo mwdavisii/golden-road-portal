@@ -1,0 +1,11 @@
+{
+  "schema": "mock-servicenow/v1",
+  "instance": "https://golden-road.service-now.example",
+  "integration_user": "golden-road-cmdb",
+  "number_prefix": "APM",
+  "first_number": 1001,
+  "users": [
+    {"sys_id": "6816f79cc0a8016401c5a33be04be441", "user_name": "mwdavisii", "email": "mwdavisii@example.com"},
+    {"sys_id": "5137153cc611227c000bbd1bd8cd2005", "user_name": "other", "email": "other@example.com"}
+  ]
+}

@@ -6,7 +6,7 @@ from fastapi.responses import RedirectResponse
 from ..binding_record import environment_of
 from ..registration import CLASSIFICATIONS, form_draft
 from ..store.base import Conflict
-from ..timeline import timeline
+from ..timeline import OFF, timeline
 from .access import PUBLIC, REQUESTER, REQUESTER_OR_ADMIN, SIGNED_IN
 from .ownership import admin_repos_of, fresh_admin_repos, stale_message  # noqa: F401 (tests import them from here)
 from .flash import redirect
@@ -15,6 +15,7 @@ from .render import page
 router = APIRouter()
 EMPTY = {"repo": "", "purpose": "", "data_classification": ""}
 REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")  # bounded, as GitHub bounds names
+ACK_NEEDED = "Confirm that you understand what owning this app means."
 
 
 def evidence_context(store, req) -> dict:
@@ -117,9 +118,14 @@ def register(request: Request, repo: str = Query(""), principal=PUBLIC):
 
 
 @router.post("/register")
-def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data_classification: str = Form(""), principal=SIGNED_IN):
-    form = {"repo": repo, "purpose": purpose, "data_classification": data_classification}
+def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data_classification: str = Form(""),
+           ownership_acknowledged: str = Form(""), principal=SIGNED_IN):
+    """A registration, first or a change. The person must tick "I understand what owning this app means" (spec 2026-10-31): the request
+    records when, at the portal's clock, and nothing in the form can set the time."""
+    form = {"repo": repo, "purpose": purpose, "data_classification": data_classification, "ownership_acknowledged": ownership_acknowledged}
     draft, errors = form_draft(repo, purpose, data_classification)
+    if ownership_acknowledged != "yes":
+        draft, errors = None, [*errors, ACK_NEEDED]
     if draft:
         state = request.app.state
         fresh, stale = fresh_admin_repos(state.store, principal.person.id, state.clock(), state.settings.repo_admins_stale_after)
@@ -130,7 +136,8 @@ def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data
     if draft is None:
         return register_page(request, principal, 400, form, errors)
     try:
-        req = request.app.state.store.create_registration(person_id=principal.person.id, draft=draft, now=request.app.state.clock())
+        now = request.app.state.clock()
+        req = request.app.state.store.create_registration(person_id=principal.person.id, draft=draft, now=now, ownership_acknowledged_at=now)
     except Conflict:
         return register_page(request, principal, 409, form, ["That repository already has an open registration."])
     return redirect(f"/requests/{req.id}", "registered")
@@ -149,6 +156,14 @@ def my_requests(request: Request, filter_: str = Query("all", alias="filter"), p
                 filter=filter_, apps=admin_repos(request, principal), environment_of=lambda r: environment_of(r) or "test")
 
 
+def request_steps(request, req) -> list:
+    """The request page's timeline. With ServiceNow set up, a registration's last step is Registered in ServiceNow, from the collector's
+    CMDB record of the repo (spec 2026-10-31)."""
+    store = request.app.state.store
+    cmdb = store.cmdb_record(req.repo) if request.app.state.settings.servicenow and req.kind == "registration" else OFF
+    return timeline(req, store.audit_for("request", req.id), cmdb=cmdb)
+
+
 @router.get("/requests/{request_id}")
 def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     found = request.state.found_request
@@ -157,7 +172,7 @@ def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     store = request.app.state.store
     context = evidence_context(store, found)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],
-                steps=timeline(found, store.audit_for("request", found.id)), change=change_context(store, found, context["evidence"]), **context)
+                steps=request_steps(request, found), change=change_context(store, found, context["evidence"]), **context)
 
 
 @router.post("/requests/{request_id}")
@@ -169,7 +184,7 @@ def resubmit(request: Request, request_id: str, purpose: str = Form(""), data_cl
     if draft is None:
         store = request.app.state.store
         context = evidence_context(store, found)
-        return page(request, "request.html", 400, req=found, mine=True, errors=errors, steps=timeline(found, store.audit_for("request", found.id)),
+        return page(request, "request.html", 400, req=found, mine=True, errors=errors, steps=request_steps(request, found),
                     change=change_context(store, found, context["evidence"]), **context)
     try:
         request.app.state.store.resubmit(request_id=found.id, person_id=principal.person.id, draft=draft, now=request.app.state.clock())

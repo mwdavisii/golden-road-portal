@@ -93,9 +93,33 @@ PERSON_MERGES = ("Written by the golden road portal's writer. The writer never m
                  "on the app's page.")
 
 
-def _binding_body(request, requester, platform_user, writer_merges) -> str:
+def _mcp_skills_lines(f, environment_dir, writes_access) -> list[str]:
+    """The binding's MCP servers and skills (spec 2026-10-31): ids, names and commits only (pattern-checked by binding/v2), what each
+    was checked against, and, when the PR writes it, what cloudflare-access.yaml is."""
+    lines = []
+    mcp = f.get("mcp")
+    if mcp is not None:
+        servers = mcp.get("servers") or []
+        names = ", ".join(f"`{s['server_id']}`" for s in servers) if servers else "none (the app's token may reach no server)"
+        lines.append(f"- MCP servers on `{mcp['gateway']}`: {names}")
+        if servers:
+            lines.append(f"- Each server checked against `{servers[0]['verified_by']}`: still on the gateway, ready, and usable with the "
+                         "app's Cloudflare service token (not one that needs each person's own sign-in). The token comes from Secret "
+                         "Server at its fixed path; its value never passes through the portal.")
+    skills = f.get("skills") or []
+    if skills:
+        lines.append("- Skills: " + ", ".join(f"`{s['name']}` at `{s['commit'][:12]}`" for s in skills))
+        lines.append(f"- Each skill read from `{skills[0]['verified_by']}` at its commit, approved there for `{f['environment']}`; "
+                     "composed.yaml mounts it read-only at `/skills`.")
+    if writes_access:
+        lines.append(f"- `{environment_dir}/cloudflare-access.yaml` is the desired state a platform job reconciles into Cloudflare (the "
+                     "app's service token and each server's Service Auth policy); nothing applies it from git.")
+    return lines
+
+
+def _binding_body(request, requester, platform_user, writer_merges, writes_access=False) -> str:
     """Nobody approves a binding: the body names who changed it, what is linked now, that only the directory (and, for secrets,
-    Secret Server as its platform account) was consulted, and who merges it."""
+    Secret Server as its platform account; for MCP servers, Cloudflare; for skills, the catalog) was consulted, and who merges it."""
     f = request.final
     linked = [f"Azure identity `{f['azure_identity']['directory_id']}`"] if f.get("azure_identity") else []
     linked += [f"Databricks connection `{f['databricks']['directory_id']}`"] if f.get("databricks") else []
@@ -110,25 +134,29 @@ def _binding_body(request, requester, platform_user, writer_merges) -> str:
             "never passes through the portal."]
     else:
         now_linked, secret_lines = ", ".join(linked) if linked else "neither (unlinked)", []
+    extra = _mcp_skills_lines(f, f"apps/{request.repo}/{f['environment']}", writes_access)
+    if not linked and extra:
+        now_linked = "no Azure identity or Databricks connection"
     return "\n".join([
         f"Portal request `{request.id}`: the connections of `{request.repo}` in `{f['environment']}`.", "",
         f"- Changed by {_name(requester)} (`{request.requested_by}`), an admin of the repository, at {f['linked_at']}",
         f"- Now linked: {now_linked}",
         *secret_lines,
+        *extra,
         *([f"- Checked against the portal's directory (`{verified_by}`); nothing was verified with Azure or Databricks."]
-          if linked or not secrets else []), "",
+          if linked or not (secrets or extra) else []), "",
         f"- `apps/{request.repo}/{f['environment']}/composed.yaml` is what golden-road compose makes from the environment's pinned "
         "release and this binding; deploy-check composes it again and fails on any difference.", "",
         f"{WRITER_MERGES if writer_merges else PERSON_MERGES} Change it on the app's page in the portal.",
     ])
 
 
-def pr_body(request, requester, approver, target, platform_user=None, current=None) -> str:
+def pr_body(request, requester, approver, target, platform_user=None, current=None, writes_access=False) -> str:
     """target: the request's allowlist.target_for, which says who merges (allowlist.writer_merges). platform_user: Secret Server's
     platform account (the writer's secret_server.platform_user), named for a binding's secrets. current: for a change, the stored
-    view of the record it replaces (its evidence's record)."""
+    view of the record it replaces (its evidence's record). writes_access: the binding's PR writes its cloudflare-access.yaml."""
     if request.kind == "binding":
-        return _binding_body(request, requester, platform_user, writer_merges(target))
+        return _binding_body(request, requester, platform_user, writer_merges(target), writes_access)
     f = request.final
     what = "change the registration of" if current is not None else "register"
     return "\n".join([
