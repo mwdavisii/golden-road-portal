@@ -81,7 +81,9 @@ def test_the_app_page_shows_the_gateway_and_links_to_the_steps(mcp):
 def test_step_1_offers_both_environments_with_their_gateways_and_the_tab_pre_chosen(mcp):
     text = get(mcp).text
     assert step_of(text) == "1" and radios(text, "environment") == {"test", "prod"}
-    assert "mcp-test.example.com" in text and "mcp.example.com" in text and 'value="test" required checked>' in text
+    assert '<span class="choice-title">test</span><span class="choice-line mono">mcp-test.example.com</span>' in text
+    assert '<span class="choice-title">prod</span><span class="choice-line mono">mcp.example.com</span>' in text
+    assert 'value="test" required checked>' in text
     assert 'value="prod" required checked>' in get(mcp, tab="prod").text
 
 
