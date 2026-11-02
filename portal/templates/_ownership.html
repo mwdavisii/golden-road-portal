@@ -1,0 +1,22 @@
+{# What owning an app means (spec 2026-10-31 "What owning the app means"): one notice for the register form, the request page and the
+   app page. org_name is PORTAL_ORG_NAME and grace_days PORTAL_LIFECYCLE_GRACE_DAYS (0 leaves the day count out; it never means "no
+   time"). With a number (the CMDB record's, once the collector has synced it) it says the app is registered in ServiceNow, and whose
+   it is: mine (the person looking owns it), else the owner's name, or none (an intake/v1 record has no owner of record);
+   unreadable: the intake record is missing or can't be used, so the notice names no owner and no review date. Every value is escaped.
+   Mock only: nothing suspends, asks, tasks or decommissions; the notice says what the real process does. #}
+{% macro ownership_notice(org_name, grace_days, number=none, review_by=none, mine=true, owner=none, unreadable=false) %}
+<section class="card ownership" aria-labelledby="ownership-title">
+{% if number %}
+<div class="card-head"><h2 id="ownership-title">{% if mine and not unreadable %}Your app{% else %}This app{% endif %} is registered in ServiceNow (<span class="mono">{{ number }}</span>).</h2><span class="badge cmdb">ServiceNow CMDB</span></div>
+<p class="ownership-lead">{% if unreadable %}The registration record can't be read right now. Owning it means:{% elif mine %}You are its owner. That means:{% elif owner %}Its owner is {{ owner }}. For its owner, that means:{% else %}No owner of record: a change or renewal of the registration names one. Owning it means:{% endif %}</p>
+{% else %}
+<div class="card-head"><h2 id="ownership-title">What owning this app means</h2></div>
+<p class="ownership-lead">Whoever submits this registration is the app's owner once it is approved. That means:</p>
+{% endif %}
+<ol class="ownership-points">
+<li><strong>Patching.</strong> When ongoing vulnerability scans find new vulnerabilities, you approve the patches. Access may be suspended for a critical vulnerability until it is fixed.</li>
+<li><strong>Validation.</strong> You will be asked regularly to confirm the app is still in use{% if review_by %} (next by <time datetime="{{ review_by }}">{{ review_by }}</time>){% endif %}. {% if grace_days %}If you don't confirm within {{ grace_days }} days, the app is decommissioned.{% else %}If you don't confirm in time, the app is decommissioned.{% endif %}</li>
+<li><strong>Leaving.</strong> If you leave {{ org_name }} or move to another department, you and your manager get a ServiceNow task to name a new owner or decommission the app. {% if grace_days %}If neither happens within {{ grace_days }} days, the app is decommissioned.{% else %}If neither happens in time, the app is decommissioned.{% endif %}</li>
+</ol>
+</section>
+{% endmacro %}

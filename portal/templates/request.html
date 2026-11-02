@@ -2,6 +2,7 @@
 {% from "_evidence.html" import evidence_view %}
 {% from "_change.html" import change_view %}
 {% from "_classification.html" import classification_cards with context %}
+{% from "_ownership.html" import ownership_notice %}
 {% set active = "requests" %}
 {% block title %}Request - golden road{% endblock %}
 {% block main %}
@@ -10,7 +11,7 @@
 <div class="card-head"><h1 class="mono">{{ req.repo }}</h1><span class="badge state-{{ req.state }}">{{ STATE_LABELS.get(req.state, req.state) }}</span></div>
 <ol class="timeline" aria-label="Progress">
 {% for s in steps %}<li class="step-{{ s.status }}"><span class="step-dot" aria-hidden="true">{% if s.status == "done" %}&#10003;{% elif s.status == "failed" %}&#10007;{% elif s.status == "now" %}&#9679;{% endif %}</span>
-<span class="step-label">{{ s.label }}</span><span class="step-state">{{ STEP_WORDS[s.status] }}</span>{% if s.at %}<time datetime="{{ s.at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ s.at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}</li>
+<span class="step-label">{{ s.label }}</span><span class="step-state">{{ STEP_WORDS[s.status] }}</span>{% if s.detail %}<span class="step-detail">{{ s.detail }}</span>{% endif %}{% if s.at %}<time datetime="{{ s.at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ s.at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}</li>
 {% endfor %}
 </ol>
 {% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
@@ -27,8 +28,10 @@
 <pre class="prose">{{ req.draft.get("purpose", "") }}</pre>
 <dl class="facts">
 <div><dt>Data classification</dt><dd>{{ req.draft.get("data_classification", "not given") }}</dd></div>
+<div><dt>Ownership</dt><dd>{% if req.ownership_acknowledged_at %}Acknowledged <time datetime="{{ req.ownership_acknowledged_at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ req.ownership_acknowledged_at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% else %}Not recorded (submitted before 0.6.0){% endif %}</dd></div>
 </dl>
 </section>
+{% if mine %}{{ ownership_notice(settings.org_name, settings.lifecycle_grace_days) }}{% endif %}
 <section>
 <h2>What the platform found</h2>
 {{ evidence_view(evidence, problem, claim, effective, mismatch, stale=stale) }}

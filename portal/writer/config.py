@@ -1,6 +1,8 @@
 import dataclasses as dc
 import datetime as dt
 
+from ..settings import DEFAULT_GATEWAYS
+
 FACTORY_CHECKS, DEPLOY_CHECKS = ("factory-check",), ("deploy-check",)
 
 
@@ -17,6 +19,9 @@ class WriterConfig:
     directory: object = None  # portal.directory.Directory (PORTAL_DIRECTORY): what a binding is re-checked against; None refuses bindings
     secret_server: object = None  # portal.secretserver_mock.MockSecretServer (PORTAL_SECRET_SERVER): what a binding's secrets are re-checked against
     repo_admins_stale_after: dt.timedelta = dt.timedelta(minutes=10)  # the portal's limit: a binding's requester must be a recent admin
+    cloudflare: object = None  # portal.cloudflare_mock.MockCloudflare (PORTAL_CLOUDFLARE): what a binding's MCP servers are re-checked against
+    mcp_gateways: dict = dc.field(default_factory=lambda: dict(DEFAULT_GATEWAYS))  # PORTAL_MCP_GATEWAY_TEST/_PROD, as the web reads them
+    skills_catalog: object = None  # portal.skills_catalog.MockSkillsCatalog (PORTAL_SKILLS_CATALOG): what a binding's skills are written from
 
     @property
     def targets(self) -> tuple[str, ...]:

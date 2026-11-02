@@ -949,3 +949,90 @@ def test_a_close_is_refused_while_the_record_can_t_be_read_and_by_whoever_last_r
     with pytest.raises(Conflict, match="own_app"):
         store.close_rereview_item(item_id=item.id, actor_id=admin.id, note="Closing my own app's item.", now=T0, events_seen=0)
     store.close_rereview_item(item_id=item.id, actor_id=owner.id, note="Reviewed the change with security.", now=T0, events_seen=0)
+
+
+# ---- 0.6.0: the CMDB record, the ownership acknowledgement, the cmdb part (spec 2026-10-31 Part 3) ----
+
+CMDB_REPO = "acme/notes"
+
+
+def test_a_cmdb_sync_is_recorded_and_an_error_keeps_the_ci(store):
+    assert store.cmdb_records() == [] and store.cmdb_record(CMDB_REPO) is None
+    store.record_cmdb_sync(repo=CMDB_REPO, sys_id="c" * 32, number="APM0001001", fields_hash="f" * 64, operation="INSERT", now=T0)
+    first = store.cmdb_record("ACME/notes")
+    assert (first.repo, first.sys_id, first.number, first.last_operation, first.last_error) == (CMDB_REPO, "c" * 32, "APM0001001", "INSERT", None)
+    assert first.last_synced_at is not None and first.last_error_at is None
+    store.record_cmdb_error(repo=CMDB_REPO, error="cmdb_unreachable", now=T0 + HOUR)
+    kept = store.cmdb_record(CMDB_REPO)
+    assert (kept.number, kept.fields_hash, kept.last_operation, kept.last_error) == ("APM0001001", "f" * 64, "INSERT", "cmdb_unreachable")
+    assert kept.last_error_at and kept.last_synced_at == first.last_synced_at
+    store.record_cmdb_sync(repo=CMDB_REPO, sys_id="c" * 32, number="APM0001001", fields_hash="e" * 64, operation="UPDATE", now=T0 + 2 * HOUR)
+    again = store.cmdb_record(CMDB_REPO)
+    assert (again.last_error, again.last_error_at, again.fields_hash, again.last_operation) == (None, None, "e" * 64, "UPDATE")
+    assert [r.repo for r in store.cmdb_records()] == [CMDB_REPO]
+
+
+def test_an_owner_unknown_before_any_sync_has_no_ci(store):
+    store.record_cmdb_error(repo=CMDB_REPO, error="cmdb_owner_unknown", now=T0)
+    r = store.cmdb_record(CMDB_REPO)
+    assert (r.sys_id, r.number, r.fields_hash, r.last_synced_at, r.last_error) == (None, None, None, None, "cmdb_owner_unknown")
+    store.record_cmdb_error(repo="ACME/notes", error="cmdb_refused", now=T0)   # the same record, in any case
+    assert [x.last_error for x in store.cmdb_records()] == ["cmdb_refused"]
+
+
+def test_cmdb_records_are_listed_by_repo_in_any_case(store):
+    for repo in ("acme/Zeta", "acme/alpha", "Acme/beta"):
+        store.record_cmdb_error(repo=repo, error="cmdb_owner_unknown", now=T0)
+    assert [r.repo for r in store.cmdb_records()] == ["acme/alpha", "Acme/beta", "acme/Zeta"]
+
+
+@pytest.mark.parametrize("bad", [dict(sys_id="x"), dict(number="apm1"), dict(fields_hash="f"), dict(operation="DELETE"), dict(repo="x"),
+                                 dict(sys_id=None), dict(number=None)])
+def test_a_malformed_sync_is_refused(store, bad):
+    args = dict(repo=CMDB_REPO, sys_id="c" * 32, number="APM0001001", fields_hash="f" * 64, operation="INSERT", now=T0)
+    args.update(bad)
+    with pytest.raises(ValueError):
+        store.record_cmdb_sync(**args)
+    assert store.cmdb_records() == []
+
+
+@pytest.mark.parametrize("repo, error", [("x", "cmdb_unreachable"), (CMDB_REPO, "failed"), (CMDB_REPO, None)])
+def test_a_malformed_cmdb_error_is_refused(store, repo, error):
+    with pytest.raises(ValueError):
+        store.record_cmdb_error(repo=repo, error=error, now=T0)
+
+
+def test_a_registration_records_its_acknowledgement(store):
+    owner, _ = people(store)
+    draft = {"schema": "registration-draft/v1", "repo": "acme/other", "purpose": "Stores short team notes; no email, no files.",
+             "data_classification": "public"}
+    req = store.create_registration(person_id=owner.id, draft=draft, now=T0, ownership_acknowledged_at=T0)
+    # the memory store keeps the time it is given; Postgres sets it to its own now() (0011's insert guard): either way it is recorded
+    assert req.ownership_acknowledged_at is not None and store.get_request(req.id).ownership_acknowledged_at == req.ownership_acknowledged_at
+    old = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0)
+    assert store.get_request(old.id).ownership_acknowledged_at is None   # as every request before 0.6.0
+
+
+def test_a_resubmit_keeps_the_acknowledgement(store):
+    owner, admin = people(store)
+    req = store.create_registration(person_id=owner.id, draft=DRAFT, now=T0, ownership_acknowledged_at=T0)
+    store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["golden-road-admins"], approve=False, note="needs more detail",
+                 final=None, now=T0)
+    store.resubmit(request_id=req.id, person_id=owner.id, draft=DRAFT, now=T0 + HOUR)
+    assert req.ownership_acknowledged_at is not None and store.get_request(req.id).ownership_acknowledged_at == req.ownership_acknowledged_at
+
+
+def test_the_owner_s_email_is_readable(store):
+    owner, _ = people(store)
+    assert store.person_email(owner.id) == owner.email == "sub-owner@example.test" and store.person_email("p_" + "0" * 32) is None
+
+
+def test_the_cmdb_part_has_its_own_problems(store):
+    store.set_rereview_status(source="cmdb", problem="cmdb_owner_unknown", counts={"owner_unknown": 1}, now=T0)
+    assert store.rereview_status()["cmdb"].problem == "cmdb_owner_unknown"
+    for problem in ("cmdb_unreachable", "cmdb_refused", "failed", None):
+        store.set_rereview_status(source="cmdb", problem=problem, counts={}, now=T0)
+    with pytest.raises(ValueError):
+        store.set_rereview_status(source="cmdb", problem="factory_unreadable", counts={}, now=T0)
+    with pytest.raises(ValueError):
+        store.set_rereview_status(source="intake", problem="cmdb_unreachable", counts={}, now=T0)

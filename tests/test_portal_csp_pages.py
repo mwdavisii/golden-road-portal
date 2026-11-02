@@ -74,21 +74,41 @@ PAGES = [("anonymous", "/"), ("anonymous", "/register"), ("owner", "/"), ("owner
          ("owner", "/apps/acme/notes/secrets/new?folder=17&secret_id=1042"),
          ("owner", "/apps/acme/notes/secrets/new?folder=17&secret_id=1042&field_slug=password&env=NOTES_DB_PASSWORD"),
          ("owner", "/apps/acme/notes/secrets/new?folder=30"),   # a refused step
+         ("owner", "/apps/acme/notes/mcp/new"), ("owner", "/apps/acme/notes/mcp/new?environment=test"),   # the MCP steps 1 to 3
+         ("owner", "/apps/acme/notes/mcp/new?environment=test&server_id=notes"),
+         ("owner", "/apps/acme/notes/mcp/new?environment=test&server_id=tickets"),   # a refused step
+         ("owner", "/apps/acme/notes?confirm_mcp=notes"),
+         ("owner", "/apps/acme/notes/skills/new"), ("owner", "/apps/acme/notes/skills/new?environment=test"),   # the skills steps 1 to 3
+         ("owner", "/apps/acme/notes/skills/new?environment=test&name=incident-triage"),
+         ("owner", "/apps/acme/notes/skills/new?environment=prod&name=release-notes"),   # a refused step
+         ("owner", "/apps/acme/notes?confirm_skill=incident-triage"), ("owner", "/apps/acme/notes?skills=old"),   # Update shown
          ("admin", "/admin/people?flash=link_added"),   # the toast after a redirect (the flash cookie, not the query, carries it)
          ("owner", "/register?repo=acme/tools"), ("owner", "/register?repo=Acme/Tools"),   # change or renew: a v2 record, a v1 one
          ("admin", "/admin/approvals?change=1"), ("admin", "/admin/approvals?renewal=1"), ("owner", "/requests/{change}"),
          ("admin", "/admin/rereview"), ("owner", "/apps/acme/notes?banner=1"),   # the page ignores the query: it only names this case
+         ("owner", "/register?repo=acme/notes"), ("admin", "/admin/approvals?ack=1"),   # the ownership notice; the acknowledgement
+         ("owner", "/apps/acme/notes?cmdb=1"), ("owner", "/requests/{merged}"), ("admin", "/admin/rereview?cmdb=1"),   # the CMDB card, step, problems
          ("other", "/requests/{request}")]   # the last is the error page (404, through base.html)
 
 
 # What each set-up page must show, so the scan looks at the page it means to (the step, the card, the refusal)
 STEP = 'aria-current="step"><span class="step-dot" aria-hidden="true">{}</span>'
 NEW = "/apps/acme/notes/secrets/new"
+MCP_NEW = "/apps/acme/notes/mcp/new"
+SKILL_NEW = "/apps/acme/notes/skills/new"
 RENDERS = {"/apps/acme/notes?confirm=azure-identity": "Remove the Azure identity?",
            "/apps/acme/notes?environment=test&confirm=azure-identity": "Remove the Azure identity?",
            NEW: STEP.format(1), f"{NEW}?folder=17": STEP.format(2), f"{NEW}?folder=17&secret_id=1042": STEP.format(3),
            f"{NEW}?folder=17&secret_id=1042&field_slug=password&env=NOTES_DB_PASSWORD": STEP.format(4),
-           f"{NEW}?folder=30": "Choose a folder from the list.", "/requests/{sent_back}": "What the admin asked you to change",
+           f"{NEW}?folder=30": "Choose a folder from the list.",
+           MCP_NEW: STEP.format(1), f"{MCP_NEW}?environment=test": STEP.format(2), f"{MCP_NEW}?environment=test&server_id=notes": STEP.format(3),
+           f"{MCP_NEW}?environment=test&server_id=tickets": "This server needs each person&#39;s own sign-in",
+           "/apps/acme/notes?confirm_mcp=notes": "Remove the MCP server Notes?",
+           SKILL_NEW: STEP.format(1), f"{SKILL_NEW}?environment=test": STEP.format(2),
+           f"{SKILL_NEW}?environment=test&name=incident-triage": STEP.format(3),
+           f"{SKILL_NEW}?environment=prod&name=release-notes": "That skill is not approved for prod.",
+           "/apps/acme/notes?confirm_skill=incident-triage": "Remove the skill incident-triage?",
+           "/apps/acme/notes?skills=old": 'action="/apps/acme/notes/skills/update"', "/requests/{sent_back}": "What the admin asked you to change",
            "/apps/acme/notes?flash=connection": '<p class="toast" role="status">Connection requested</p>',
            "/admin/people": '<section class="card person">', "/admin/people?flash=link_added": '<p class="toast" role="status">GitHub login linked</p>',
            "/admin/audit": '<th scope="col">When</th>', "/admin/directory": '<th scope="col">Client ID</th>',
@@ -96,7 +116,10 @@ RENDERS = {"/apps/acme/notes?confirm=azure-identity": "Remove the Azure identity
            "/register?repo=Acme/Tools": "<dd>none (registered outside the portal)</dd>",
            "/admin/approvals?change=1": "Owner changes from platform-team to", "/admin/approvals?renewal=1": "A renewal of the current registration",
            "/requests/{change}": "A change to the current registration", "/admin/rereview": '<span class="badge">Scorecard signal</span>',
-           "/apps/acme/notes?banner=1": "Change or renew the registration"}
+           "/apps/acme/notes?banner=1": "Change or renew the registration",
+           "/register?repo=acme/notes": '<section class="card ownership"', "/admin/approvals?ack=1": "Ownership acknowledged <time",
+           "/apps/acme/notes?cmdb=1": 'is registered in ServiceNow (<span class="mono">APM0001001</span>)',
+           "/requests/{merged}": '<span class="step-detail">APM0001001</span>', "/admin/rereview?cmdb=1": "<h2>ServiceNow CMDB</h2>"}
 
 
 def prepare(portal, path):
@@ -131,6 +154,39 @@ def prepare(portal, path):
         from portal_fakes import record_view
         from test_portal_register_change import pending_change
         pending_change(portal, record_view(portal.people["owner"].id))
+    if path == "/admin/approvals?ack=1":   # a registration submitted with the acknowledgement (0.6.0)
+        portal.store.create_registration(person_id=portal.people["owner"].id, now=portal.clock(), ownership_acknowledged_at=portal.clock(),
+                                         draft={"schema": "registration-draft/v1", "repo": "acme/tools",
+                                                "purpose": "Builds internal tools; no PHI, no email.", "data_classification": "public"})
+    if path == "/apps/acme/notes?cmdb=1":   # synced to ServiceNow: the notice with the number (the page ignores the query)
+        from test_portal_apps import cmdb_synced
+        cmdb_synced(portal)
+    if path == "/requests/{merged}":   # merged, then synced: Registered in ServiceNow, with the number
+        from test_portal_apps import cmdb_synced
+        from test_portal_timeline import merged
+        portal.seeds["merged"] = merged(portal)[0].id
+        portal.clock.advance(minutes=1)
+        cmdb_synced(portal)
+        portal.store.record_cmdb_sync(repo="acme/notes", sys_id="c" * 32, number="APM0001001", fields_hash="f" * 64, operation="INSERT",
+                                      now=portal.clock())
+    if path == "/admin/rereview?cmdb=1":   # the cmdb part's problem and the repos whose last attempt failed
+        portal.store.set_rereview_status(source="cmdb", problem="cmdb_owner_unknown", counts={}, now=portal.clock())
+        portal.store.record_cmdb_error(repo="acme/notes", error="cmdb_owner_unknown", now=portal.clock())
+    if "mcp/new" in path or "confirm_mcp=" in path:
+        from test_portal_mcp_steps import with_cloudflare
+        with_cloudflare(portal)
+    if "confirm_mcp=" in path:
+        from test_portal_mcp_steps import add_and_merge
+        add_and_merge(portal)
+    if "skills/new" in path or "confirm_skill=" in path or "skills=old" in path:
+        from test_portal_skill_steps import with_catalog
+        with_catalog(portal)
+    if "confirm_skill=" in path:
+        from test_portal_skill_steps import add_and_merge as add_skill_and_merge
+        add_skill_and_merge(portal)
+    if "skills=old" in path:   # the page ignores the query: it only names this case, a skill pinned before the catalog's main
+        from test_portal_skill_steps import pinned_old_and_merged
+        pinned_old_and_merged(portal)
     if "confirm=" in path:
         from test_portal_apps import link_identity_and_merge
         link_identity_and_merge(portal)
@@ -143,7 +199,8 @@ def test_every_rendered_page_has_no_inline_style_or_script(portal, who, path):
     if "flash=" in path:
         from portal.web.flash import FLASH_COOKIE
         client.cookies.set(FLASH_COOKIE, path.split("flash=", 1)[1], domain="portal.example.test")
-    response = client.get(path.format(request=portal.seeds["request"], sent_back=portal.seeds["request"], change=portal.seeds.get("change")))
+    response = client.get(path.format(request=portal.seeds["request"], sent_back=portal.seeds["request"], change=portal.seeds.get("change"),
+                                     merged=portal.seeds.get("merged")))
     assert RENDERS.get(path, "") in response.text, (path, RENDERS.get(path))
     flash_set = [c for c in response.headers.get_list("set-cookie") if c.startswith("__Host-portal-flash=")]
     assert all("Max-Age=0" in c for c in flash_set), flash_set   # a GET page only ever clears the toast, never sets one

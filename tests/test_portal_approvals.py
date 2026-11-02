@@ -140,3 +140,18 @@ def test_only_approve_s_reason_is_a_live_region(portal):
 def test_states_show_as_words(portal):
     text = portal.client("admin").get("/admin/approvals").text
     assert '<span class="badge state-pending">Pending</span>' in text and ">pending</span>" not in text
+
+
+def test_the_approval_screen_shows_the_ownership_acknowledgement_or_that_it_was_not_recorded(portal):
+    text = portal.client("admin").get("/admin/approvals").text   # the seeded request was created without it, as before 0.6.0
+    assert "Ownership acknowledged: Not recorded (submitted before 0.6.0)" in text
+    portal.store.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0), RepoAdmin("acme/tools", "owner-gh", 1001, T0)], observed_at=T0)
+    response = portal.client("owner").post("/register", data={
+        "csrf_token": portal.csrfs["owner"], "repo": "acme/tools", "purpose": "Builds internal tools; no PHI, no email.",
+        "data_classification": "public", "ownership_acknowledged": "yes"})
+    assert response.status_code == 303
+    at = portal.clock()
+    text = portal.client("admin").get("/admin/approvals").text
+    tools = text[text.index('<h2 class="repo">acme/tools</h2>'):]
+    assert (f'Ownership acknowledged <time datetime="{at.strftime("%Y-%m-%dT%H:%M:%SZ")}">{at.strftime("%Y-%m-%d %H:%M")} UTC</time>: '
+            "the requester confirmed they understand what owning this app means.") in tools.split("<h3>Purpose</h3>")[0]

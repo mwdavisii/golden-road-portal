@@ -3,7 +3,9 @@ environment, and every PORTAL_COLLECT_INTERVAL seconds records the repo admins a
 (PORTAL_ORG names the factory's owner, PORTAL_MODEL_GATEWAY_HOSTS the platform's model gateway hosts). Each pass also observes the
 factory's intake records and opens or closes the review-date items (PORTAL_REVIEW_DUE_SOON_DAYS), and reads the scorecard's re-review
 events from run artifacts onto the re-review list (PORTAL_REREVIEW_SIGNALS). Without actions: read, the events part is skipped and the
-Re-review page says so. It never prints a credential."""
+Re-review page says so. With PORTAL_SERVICENOW=mock, a fifth part after intake syncs each new or changed intake record to ServiceNow CMDB as
+a business application (the mock's CI table is seeded from the records the portal kept); unset, the part doesn't run. It never prints a
+credential."""
 
 import datetime as dt
 import logging
@@ -17,7 +19,8 @@ import httpx
 from ..github.appauth import InstallationToken
 from ..github.client import GitHub, GitHubError
 from ..rereview import BadSetting, parse_days, parse_signals
-from ..settings import HOST, ORG, SettingsError, github_bases
+from ..settings import HOST, ORG, SettingsError, github_bases, no_servicenow_url, servicenow_from
+from .cmdb import collect_cmdb, seed_mock
 from .events import ARTIFACT_HOSTS, collect_events
 from .evidence import collect_evidence
 from .intake import collect_intake
@@ -61,6 +64,8 @@ def main(argv=None, env=os.environ) -> int:
         due_soon = parse_days("PORTAL_REVIEW_DUE_SOON_DAYS", env.get("PORTAL_REVIEW_DUE_SOON_DAYS", ""))
         signals = parse_signals(env.get("PORTAL_REREVIEW_SIGNALS", ""))
         hosts = artifact_hosts(env.get("PORTAL_ARTIFACT_HOSTS", ""))
+        no_servicenow_url(env.get("PORTAL_SERVICENOW_URL", ""))
+        servicenow = servicenow_from(env.get("PORTAL_SERVICENOW", ""))
         try:
             key = Path(key_file).read_bytes()
         except OSError:
@@ -75,14 +80,24 @@ def main(argv=None, env=os.environ) -> int:
     gh = GitHub(api, http, token)
     store = PostgresStore(url)
     try:
+        if servicenow is not None:
+            try:
+                seed_mock(servicenow, store)
+            except Exception as exc:  # noqa: BLE001 - logged by type: the store's records may not be what the mock takes
+                print(f"collectors: the mock ServiceNow can't be seeded from the stored CMDB records: {type(exc).__name__}", file=sys.stderr)
+                return 2
+        github_web = github_bases(host)[0]
         while True:
             failed = False
+            cmdb = (("cmdb", "cmdb", lambda: _cmdb_note(collect_cmdb(store, servicenow, github_web=github_web, now=dt.datetime.now(dt.UTC)))),) \
+                if servicenow is not None else ()
             for name, part, run in (
                     ("repo_admins", "repo_admins", lambda: f"{collect(gh, store, now=dt.datetime.now(dt.UTC))} rows"),
                     ("evidence", "evidence", lambda: _evidence_note(collect_evidence(gh, store, org=org, gateway_hosts=gateway_hosts,
                                                                          now=dt.datetime.now(dt.UTC)))),
                     ("intake", "intake", lambda: _intake_note(collect_intake(gh, store, org=org, today=dt.datetime.now(dt.UTC).date(),
                                                                    due_soon_days=due_soon, now=dt.datetime.now(dt.UTC)))),
+                    *cmdb,
                     ("re-review events", "events", lambda: _events_note(collect_events(gh, store, org=org, signals=signals, now=dt.datetime.now(dt.UTC),
                                                                              actions_readable=actions_readable(token), artifact_hosts=hosts)))):
                 ok = _part(name, run)
@@ -157,6 +172,17 @@ def _intake_note(result) -> str:
     if result.get("held"):
         return f"no intake records in the factory: kept the {result['held']} it had, and their items"
     return f"{result['records']} records ({result['unreadable']} unreadable), {result['opened']} opened, {result['closed']} closed"
+
+
+def _cmdb_note(result) -> str:
+    note = f"{result['synced']} synced, {result['unchanged']} unchanged"
+    if result.get("owner_unknown"):
+        note += f" ({result['owner_unknown']} owner unknown)"
+    if result.get("refused"):
+        note += f" ({result['refused']} refused)"
+    if result.get("problem") == "cmdb_unreachable":
+        note += " (cmdb_unreachable: will retry)"
+    return note
 
 
 def _events_note(result) -> str:

@@ -1,7 +1,8 @@
 """Where the writer may write (P17). Intake records: a registration's tier and purpose, in the factory. Bindings: one environment's
 connections (its Azure identity and Databricks connection) in golden-road-deploy, with the composed.yaml that golden-road compose
 makes from them (spec 2026-10-29 GitOps deploy repo, G9 and correction 3). Only those files, for the request's own repo and
-environment; never release.yaml, kustomization.yaml, base/ or the adapters under clusters/, which come from bump.yml."""
+environment; never release.yaml, kustomization.yaml, base/ or the adapters under clusters/, which come from bump.yml. A binding
+with MCP servers also has its cloudflare-access.yaml, the desired state compose makes from its mcp (spec 2026-10-31 M6)."""
 
 import dataclasses as dc
 import re
@@ -9,6 +10,7 @@ import re
 INTAKE = re.compile(r"intake/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.yaml")
 DEPLOY_BINDING = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/bindings\.yaml")
 COMPOSED = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/composed\.yaml")
+CLOUDFLARE_ACCESS = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/cloudflare-access\.yaml")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ENVIRONMENTS = ("test", "prod")
 # A binding for one of these is opened and checked by the writer but merged by a person, through main-review (code-owner review of
@@ -17,9 +19,11 @@ REVIEWED = ("prod",)
 FACTORY, DEPLOY = "scorecard-factory", "golden-road-deploy"
 ALLOWED_PATHS = ("intake/<owner>/<repo>.yaml in <org>/scorecard-factory",
                  "apps/<owner>/<repo>/<test|prod>/bindings.yaml in <org>/golden-road-deploy",
-                 "apps/<owner>/<repo>/<test|prod>/composed.yaml in <org>/golden-road-deploy")
+                 "apps/<owner>/<repo>/<test|prod>/composed.yaml in <org>/golden-road-deploy",
+                 "apps/<owner>/<repo>/<test|prod>/cloudflare-access.yaml in <org>/golden-road-deploy")
 KINDS = {"registration": (FACTORY, "intake.v2"), "binding": (DEPLOY, "binding.v2")}
 COMPOSED_SCHEMA = "composed"  # not a JSON schema: the file is golden-road compose's output, checked byte for byte by deploy-check
+ACCESS_SCHEMA = "cloudflare-access"  # compose's cloudflare_access output (cloudflare-access/v1), checked byte for byte by deploy-check
 
 
 @dc.dataclass(frozen=True)
@@ -29,6 +33,7 @@ class Target:
     schema: str
     also: str | None = None  # a binding's second file, its environment's composed.yaml
     environment: str | None = None  # a binding's environment, from its stored draft
+    access: str | None = None  # a binding's third file, its environment's cloudflare-access.yaml (written only for a binding with mcp)
 
 
 def writer_merges(target: Target) -> bool:
@@ -43,11 +48,11 @@ def _clean(match) -> bool:
 
 
 def allowed(org: str, repo: str, path: str) -> str | None:
-    """The schema a file at repo/path must validate against (or "composed"), or None when the writer may not write there."""
+    """The schema a file at repo/path must validate against (or "composed", "cloudflare-access"), or None when the writer may not write there."""
     if repo == f"{org}/{FACTORY}":
         rules = ((INTAKE, "intake.v2"),)
     elif repo == f"{org}/{DEPLOY}":
-        rules = ((DEPLOY_BINDING, "binding.v2"), (COMPOSED, COMPOSED_SCHEMA))
+        rules = ((DEPLOY_BINDING, "binding.v2"), (COMPOSED, COMPOSED_SCHEMA), (CLOUDFLARE_ACCESS, ACCESS_SCHEMA))
     else:
         return None
     for pattern, schema in rules:
@@ -84,4 +89,5 @@ def target_for(org: str, request) -> Target | None:
     if not isinstance(environment, str) or environment not in ENVIRONMENTS:
         return None
     d = environment_dir(request.repo, environment)
-    return Target(f"{org}/{DEPLOY}", f"{d}/bindings.yaml", "binding.v2", also=f"{d}/composed.yaml", environment=environment)
+    return Target(f"{org}/{DEPLOY}", f"{d}/bindings.yaml", "binding.v2", also=f"{d}/composed.yaml", environment=environment,
+                  access=f"{d}/cloudflare-access.yaml")

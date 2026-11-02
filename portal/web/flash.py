@@ -17,6 +17,8 @@ MESSAGES = {
     "connection": "Connection requested",
     "removal": "Removal requested",
     "secret": "Secret requested",
+    "mcp_server": "MCP server requested",
+    "skill": "Skill requested",
     "link_added": "GitHub login linked",
     "link_removed": "GitHub login unlinked",
 }

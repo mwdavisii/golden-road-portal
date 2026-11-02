@@ -178,6 +178,14 @@ def test_each_collector_part_shows_when_it_last_worked_and_a_stopped_one_is_flag
     assert text.count("has not worked for more than") == 1                              # intake ran just now
 
 
+def test_the_cmdb_part_s_status_is_a_part_line_and_never_breaks_the_page(portal):
+    """The collector's fifth part (0.6.0) records its status like the others; a source the page doesn't name is left out, never an error."""
+    portal.store.set_rereview_status(source="repo_admins", problem=None, counts={"interval_seconds": 300}, now=T0)
+    portal.store.set_rereview_status(source="cmdb", problem="cmdb_unreachable", counts={"unreachable": 1}, now=T0)
+    r = portal.client("admin").get("/admin/rereview")
+    assert r.status_code == 200 and "<strong>ServiceNow CMDB</strong>" in r.text and "(cmdb_unreachable)" in r.text
+
+
 def test_the_run_sources_show_how_far_down_they_are_read_and_what_waits(portal):
     portal.store.set_rereview_watermark(repo="acme/scorecard-factory", run_id=40, now=T0 - dt.timedelta(hours=2))
     portal.store.record_failed_run(repo="acme/scorecard-factory", run_id=7, attempt=1, last_attempt_at=T0, retention_days=90, now=T0)
@@ -235,3 +243,37 @@ def test_a_run_given_up_on_after_twelve_passes_is_said(portal):
     portal.store.set_rereview_status(source="events", problem=None, counts={"unreadable_after_retries": 1}, now=T0)
     assert "1 scorecard run was recorded unreadable: GitHub didn&#39;t answer for it on twelve passes" in portal.client("admin").get(
         "/admin/rereview").text.replace("didn't", "didn&#39;t")
+
+
+# ---- The cmdb part's problems (spec 2026-10-31): what each means, and each repo whose last attempt failed ----
+
+@pytest.mark.parametrize("problem, words", [
+    ("cmdb_unreachable", "cmdb_unreachable: ServiceNow didn't answer: the collector retries on the next pass."),
+    ("cmdb_owner_unknown", "cmdb_owner_unknown: an owner's email matches no ServiceNow user."),
+    ("cmdb_refused", "cmdb_refused: ServiceNow refused a CI: see its reconciliation rules.")])
+def test_a_cmdb_problem_is_said_and_its_repos_are_listed(portal, problem, words):
+    import html
+    portal.store.set_rereview_status(source="cmdb", problem=problem, counts={}, now=T0)
+    portal.store.record_cmdb_error(repo="acme/notes", error=problem, now=T0)
+    text = html.unescape(portal.client("admin").get("/admin/rereview").text)
+    assert f'<p class="error warn">{words}</p>' in text
+    assert "<h2>ServiceNow CMDB</h2>" in text
+    assert f'<li><span class="mono">acme/notes</span>: {problem}, {T0.strftime("%Y-%m-%d %H:%M")} UTC.</li>' in text
+
+
+def test_each_repo_s_cmdb_error_is_said_even_when_the_last_pass_named_another(portal):
+    import html
+    portal.store.set_rereview_status(source="cmdb", problem="cmdb_unreachable", counts={}, now=T0)
+    portal.store.record_cmdb_error(repo="acme/notes", error="cmdb_owner_unknown", now=T0)
+    portal.store.record_cmdb_error(repo="acme/tools", error="cmdb_unreachable", now=T0)
+    portal.store.record_cmdb_sync(repo="acme/fine", sys_id="c" * 32, number="APM0001002", fields_hash="f" * 64, operation="INSERT", now=T0)
+    text = html.unescape(portal.client("admin").get("/admin/rereview").text)
+    assert text.count('<p class="error warn">cmdb_') == 2 and "an owner's email matches no ServiceNow user" in text
+    assert '<span class="mono">acme/notes</span>: cmdb_owner_unknown' in text and '<span class="mono">acme/tools</span>: cmdb_unreachable' in text
+    assert "acme/fine" not in text
+
+
+def test_no_cmdb_problem_no_cmdb_section(portal):
+    portal.store.set_rereview_status(source="cmdb", problem=None, counts={"synced": 1}, now=T0)
+    text = portal.client("admin").get("/admin/rereview").text
+    assert "<h2>ServiceNow CMDB</h2>" not in text and "<strong>ServiceNow CMDB</strong>" in text

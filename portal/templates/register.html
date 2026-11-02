@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_classification.html" import classification_cards with context %}
+{% from "_ownership.html" import ownership_notice %}
 {% set active = "register" %}
 {% block title %}{% if change %}Change or renew the registration{% else %}Register an app{% endif %} - golden road{% endblock %}
 {% block head %}<script src="/static/register.js" defer></script>{% endblock %}
@@ -52,6 +53,8 @@
 <span class="counter" id="purpose-count"></span></p>
 {{ classification_cards(form.data_classification) }}
 <p class="hint">The platform computes a minimum tier and classification from the repo; an admin decides.</p>
+{{ ownership_notice(settings.org_name, settings.lifecycle_grace_days) }}
+<p class="field acknowledge"><label><input type="checkbox" name="ownership_acknowledged" value="yes" required{% if form.get("ownership_acknowledged") == "yes" %} checked{% endif %}> I understand what owning this app means</label></p>
 <p class="actions"><button class="gold" type="submit">Submit for review</button></p>
 </form>
 </section>

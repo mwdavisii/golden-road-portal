@@ -41,7 +41,8 @@ def new_secret(request: Request, owner: str, repo: str, environment: str = Query
     if user is None:
         return steps_page(request, environment, NOTHING, Choices(), typed, note=NO_LINK)
     binding = {"current": current, "repo": request.state.app_repo, "org": state.settings.org, "directory": state.settings.directory,
-               "person_id": principal.person.id, "request_id": new_id("r"), "now": state.clock(), "environment": environment}
+               "person_id": principal.person.id, "request_id": new_id("r"), "now": state.clock(), "environment": environment,
+               "mcp_gateway": state.settings.mcp_gateways[environment]}
     errors, status = [], 200
     try:
         choices = parse(request.query_params)

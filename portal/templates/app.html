@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_ownership.html" import ownership_notice %}
 {% set active = "requests" %}
 {% block title %}{{ repo }} - golden road{% endblock %}
 {% macro remove_button(params) %}{% if open_request %}<button class="danger" type="button" disabled>Remove</button>{% else %}<a class="button danger" href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ environment }}&amp;{{ params }}">Remove</a>{% endif %}{% endmacro %}
@@ -7,6 +8,8 @@
 <span class="eyebrow">App</span>
 <h1 class="mono">{{ repo }}</h1>
 {% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+{% if cmdb and cmdb.number %}{{ ownership_notice(settings.org_name, settings.lifecycle_grace_days, number=cmdb.number, review_by=cmdb.review_by, mine=cmdb.mine, owner=cmdb.owner, unreadable=cmdb.unreadable) }}{% endif %}
+{% if cmdb and cmdb.owner_unknown %}<p class="callout warn" role="status">ServiceNow has no user with the owner's email, so {% if cmdb.number %}its owner there isn't updated yet.{% else %}this app isn't registered there yet.{% endif %}</p>{% endif %}
 {% for item in reviews %}<p class="callout warn" role="status">This app's registration {% if item.reason == "review_overdue" %}was due for review on {{ item.key }}{% else %}is due for review by {{ item.key }}{% endif %}. {% if can_change %}<a href="/register?repo={{ repo }}">Change or renew the registration</a>.{% else %}An admin of the repository can renew it.{% endif %}</p>
 {% endfor %}
 {% if record and can_change and not reviews %}<p><a href="/register?repo={{ repo }}">Change or renew the registration</a></p>{% endif %}
@@ -23,7 +26,7 @@
 {% else %}
 <p class="callout info">No portal registration; the writer checks the factory's intake record before it records a change.</p>
 {% endif %}
-{% if directory or settings.secret_server %}
+{% if directory or settings.secret_server or settings.cloudflare or settings.skills_catalog %}
 <div class="card-head"><h2>Connections</h2>
 <nav class="tabs" aria-label="Environment">{% for env in environments %}<a href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ env }}"{% if env == environment %} aria-current="page"{% endif %}>{{ env }}</a>{% endfor %}</nav></div>
 <p class="meta">Each environment has its own connections. These are <strong>{{ environment }}</strong>'s, recorded in <span class="mono">golden-road-deploy</span>.</p>
@@ -100,17 +103,52 @@
 {% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add a secret</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/secrets/new?environment={{ environment }}">Add a secret</a>{% endif %}</p>{% endif %}
 </section>
 {% endif %}
+{% if settings.cloudflare %}
+<section class="card connection">
+<h3>MCP servers (Cloudflare gateway)</h3>
+<p class="meta">{{ environment }}'s gateway is <span class="mono">{{ gateway }}</span>: one shared gateway per environment. Pick a server on it that Cloudflare lets you use; the app reaches it with its own Cloudflare service token, which the platform keeps in Secret Server{% if settings.mcp_process_url %} (<a href="{{ settings.mcp_process_url }}" rel="noopener noreferrer">how to ask for a server on the gateway</a>){% endif %}.</p>
+{% if gateway_moved %}<p class="callout warn">The platform moved {{ environment }} to a new gateway, <span class="mono">{{ gateway }}</span>. These servers are on the old one, <span class="mono">{{ current.mcp.gateway }}</span>: remove them (one Remove takes them all), then add them again. No other change can be made here until then.</p>{% endif %}
+{% if current_servers %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Server</th><th scope="col">Id</th><th scope="col"><span class="visually-hidden">Remove</span></th></tr></thead>
+<tbody>
+{% for s in current_servers %}<tr><td>{{ s.name }}</td><td class="mono">{{ s.server_id }}</td><td>{% if can_change %}{{ remove_button("confirm_mcp=" ~ s.server_id) }}{% endif %}</td></tr>
+{% endfor %}</tbody></table></div>
+{% else %}<p class="empty">No MCP servers in {{ environment }} yet.</p>{% endif %}
+{% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add an MCP server</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/mcp/new?environment={{ environment }}">Add an MCP server</a>{% endif %}</p>{% endif %}
+</section>
+{% endif %}
+{% if settings.skills_catalog %}
+<section class="card connection">
+<h3>Skills (platform catalog)</h3>
+<p class="meta">Pick a skill security approved in the platform's catalog. It is pinned to the catalog's commit and mounted read-only at <span class="mono">/skills</span>; a newer catalog changes nothing until you update it here.</p>
+{% if current_skills %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Skill</th><th scope="col">Pinned at</th><th scope="col">Catalog now</th><th scope="col"><span class="visually-hidden">Update</span></th><th scope="col"><span class="visually-hidden">Remove</span></th></tr></thead>
+<tbody>
+{% for s in current_skills %}<tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.commit[:7] }}</td><td>{% if s.name not in in_catalog %}no longer in the catalog{% elif s.commit == catalog_main %}the same{% else %}newer: <span class="mono">{{ catalog_main[:7] }}</span>{% endif %}</td>
+<td>{% if can_change and s.commit != catalog_main and s.name in in_catalog %}<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/skills/update">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="name" value="{{ s.name }}">
+<button class="secondary" type="submit"{% if open_request %} disabled{% endif %}>Update</button></form>{% endif %}</td>
+<td>{% if can_change %}{{ remove_button("confirm_skill=" ~ s.name) }}{% endif %}</td></tr>
+{% endfor %}</tbody></table></div>
+{% else %}<p class="empty">No skills in {{ environment }} yet.</p>{% endif %}
+{% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add a skill</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/skills/new?environment={{ environment }}">Add a skill</a>{% endif %}</p>{% endif %}
+</section>
+{% endif %}
 <section class="card">
 <h3>What the container gets</h3>
 {% if open_request %}<p class="meta">Shown as it will be once the pending change is recorded.</p>{% endif %}
-{% if effects.env or shown_secrets %}
+{% if effects.env or shown_secrets or effects.mcp %}
 <div class="table-wrap"><table>
 <thead><tr><th scope="col">Environment variable</th><th scope="col">Value</th></tr></thead>
 <tbody>
 {% for env_name, value in effects.env %}<tr><td class="mono">{{ env_name }}</td><td class="mono">{{ value }}</td></tr>{% endfor %}
 {% for s in shown_secrets %}<tr><td class="mono">{{ s.env }}</td><td>from Delinea Secret Server: {{ s.secret_name }} / {{ s.field_slug }}</td></tr>{% endfor %}
+{% if effects.mcp %}{% for name in ("CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET") %}<tr><td class="mono">{{ name }}</td><td>from Secret Server: the app's Cloudflare token</td></tr>{% endfor %}{% endif %}
 </tbody></table></div>
-{% if effects.client_id %}<p>Egress on 443 to: {% for host in effects.egress %}<span class="mono">{{ host }}</span>{% if not loop.last %}, {% endif %}{% endfor %}. The service account carries the Azure workload identity (client ID <span class="mono">{{ effects.client_id }}</span>); none of the identity's values is a secret.</p>{% endif %}
+{% if effects.egress %}<p>Egress on 443 to: {% for host in effects.egress %}<span class="mono">{{ host }}</span>{% if not loop.last %}, {% endif %}{% endfor %}.{% if effects.client_id %} The service account carries the Azure workload identity (client ID <span class="mono">{{ effects.client_id }}</span>); none of the identity's values is a secret.{% endif %}</p>{% endif %}
+{% if effects.skills %}<ul>{% for name, commit in effects.skills %}<li><span class="mono">/skills/{{ name }}</span>: mounted read-only from the platform's skills catalog: {{ name }} at <span class="mono">{{ commit[:7] }}</span></li>{% endfor %}</ul>{% endif %}
 {% if shown_secrets %}<p>Each secret arrives through the External Secrets Operator, read by <span class="mono">golden-road-eso</span> from Secret Server; the portal never sees a value.</p>{% endif %}
 {% else %}<p class="empty">Nothing yet.</p>{% endif %}
 </section>

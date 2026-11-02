@@ -6,9 +6,9 @@ import secrets
 import threading
 
 from ..ids import new_id
-from .base import (DATE_REASONS, LINK_SOURCES, OPEN_STATES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, Conflict, Evidence, ItemEvent,
-                   FailedRun, Link, Person, RepoAdmin, Request, RereviewItem, RereviewStatus, Session, check_approval, check_binding,
-                   check_failed_run, check_item,
+from .base import (DATE_REASONS, LINK_SOURCES, OPEN_STATES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, CmdbRecord, Conflict,
+                   Evidence, ItemEvent, FailedRun, Link, Person, RepoAdmin, Request, RereviewItem, RereviewStatus, Session, check_approval,
+                   check_binding, check_cmdb_error, check_cmdb_sync, check_failed_run, check_item,
                    check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row, item_event, open_key,
                    token_hash, PendingEvent, Watermark)
 
@@ -34,6 +34,7 @@ class MemoryStore:
         self._watermarks = {}  # lower(repo) -> Watermark
         self._failed = {}  # (lower(repo), run id) -> FailedRun
         self._stuck = {}  # (lower(repo), run id) -> passes GitHub couldn't answer for it
+        self._cmdb = {}  # lower(repo) -> CmdbRecord
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -87,6 +88,11 @@ class MemoryStore:
 
     def get_person(self, person_id):
         return self._people.get(person_id)
+
+    def person_email(self, person_id):
+        with self._lock:
+            person = self._people.get(person_id)
+            return person.email if person else None
 
     def list_people(self):
         with self._lock:
@@ -170,13 +176,14 @@ class MemoryStore:
 
     # ---- requests ----
 
-    def create_registration(self, *, person_id, draft, now):
+    def create_registration(self, *, person_id, draft, now, ownership_acknowledged_at=None):
         repo = draft["repo"]
         with self._lock:
             key = open_key("registration", repo, draft)
             if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
                 raise Conflict("open_request_exists")
-            req = Request(new_id("r"), "registration", repo, "pending", dict(draft), person_id, now, now)
+            req = Request(new_id("r"), "registration", repo, "pending", dict(draft), person_id, now, now,
+                          ownership_acknowledged_at=ownership_acknowledged_at)
             self._requests[req.id] = req
             self._log(now, "person", person_id, "request.created", "request", req.id, None, {"state": "pending", "repo": repo},
                       "registration submitted")
@@ -533,3 +540,28 @@ class MemoryStore:
     def drop_failed_run(self, *, repo, run_id):
         with self._lock:
             self._failed.pop((repo.lower(), run_id), None)
+
+    # ---- observed: the CMDB record of each intake record (the collector's; kept for ever) ----
+
+    def record_cmdb_sync(self, *, repo, sys_id, number, fields_hash, operation, now):
+        check_cmdb_sync(repo, sys_id, number, fields_hash, operation)
+        with self._lock:
+            kept = self._cmdb.get(repo.lower())
+            self._cmdb[repo.lower()] = CmdbRecord(kept.repo if kept else repo, sys_id, number, fields_hash, operation, now, None, None)
+
+    def record_cmdb_error(self, *, repo, error, now):
+        check_cmdb_error(repo, error)
+        with self._lock:
+            kept = self._cmdb.get(repo.lower())
+            if kept is None:
+                self._cmdb[repo.lower()] = CmdbRecord(repo, None, None, None, None, None, error, now)
+            else:
+                self._cmdb[repo.lower()] = dc.replace(kept, last_error=error, last_error_at=now)
+
+    def cmdb_records(self):
+        with self._lock:
+            return [self._cmdb[k] for k in sorted(self._cmdb)]
+
+    def cmdb_record(self, repo):
+        with self._lock:
+            return self._cmdb.get(str(repo).lower())

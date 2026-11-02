@@ -23,6 +23,8 @@ on {{ r.created_at.strftime("%Y-%m-%d %H:%M") }} UTC.</p>
 {% if item.admin_seen %}<p class="callout ok">Admin of {{ r.repo }} on GitHub, as the portal last saw it ({{ item.admin_seen.observed_at.strftime("%Y-%m-%d %H:%M") }} UTC).</p>
 {% elif item.stale_note %}<p class="error warn">{{ item.stale_note }} Approving will be refused until the collector has run again.</p>
 {% else %}<p class="error">The portal does not see the requester as an admin of {{ r.repo }}. Approving will be refused.</p>{% endif %}
+{% if r.ownership_acknowledged_at %}<p class="callout ok">Ownership acknowledged <time datetime="{{ r.ownership_acknowledged_at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ r.ownership_acknowledged_at.strftime("%Y-%m-%d %H:%M") }} UTC</time>: the requester confirmed they understand what owning this app means.</p>
+{% else %}<p class="callout warn">Ownership acknowledged: Not recorded (submitted before 0.6.0).</p>{% endif %}
 {{ change_view(item.change) }}
 <h3>Purpose</h3>
 <pre class="prose">{{ r.draft.get("purpose", "") }}</pre>

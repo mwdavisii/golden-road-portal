@@ -14,7 +14,8 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 
-from ..binding_record import ENVIRONMENTS, BindingRefused, SecretServerUnavailable, environment_state, next_binding, secret_tokens
+from ..binding_record import (ENVIRONMENTS, BindingRefused, CloudflareUnavailable, SecretServerUnavailable, environment_state, next_binding,
+                              secret_tokens)
 from ..bindings import effects
 from ..ids import new_id
 from ..secretserver import SecretServerError
@@ -30,6 +31,13 @@ NOT_REPO_ADMIN = "Only an admin of the repository, as the portal last saw it, ca
 NO_LINK = ("Link your GitHub account (verified) first: the portal finds your Secret Server user through it. An admin-made link "
            "is not enough; link it yourself from your page.")
 NO_SECRET_SERVER = "Secret Server is not set up here."
+NO_CLOUDFLARE = "Cloudflare is not set up here."
+NO_SKILLS_CATALOG = "The skills catalog is not set up here."
+# Each choice that isn't the directory's, by the setting it needs and what a POST without that setting is told
+NEEDS = {"add_secret": ("secret_server", NO_SECRET_SERVER), "remove_secret": ("secret_server", NO_SECRET_SERVER),
+         "add_mcp": ("cloudflare", NO_CLOUDFLARE), "remove_mcp": ("cloudflare", NO_CLOUDFLARE),
+         "add_skill": ("skills_catalog", NO_SKILLS_CATALOG), "update_skill": ("skills_catalog", NO_SKILLS_CATALOG),
+         "remove_skill": ("skills_catalog", NO_SKILLS_CATALOG)}
 CONFIRM_FIRST = "Confirm the removal first: press Remove, then confirm it."
 NOTHING_TO_REMOVE = "There is nothing to remove."
 WRONG_FOLDER = "Choose the secret from its folder: start again from Add a secret."
@@ -69,7 +77,7 @@ def secret_user(request):
     return state.settings.secret_server.user_for(state.store.links_for(request.state.principal.person.id))
 
 
-def confirmation(current, repo, what=None, secret=None) -> dict | None:
+def confirmation(current, repo, what=None, secret=None, mcp_server=None, skill=None, gateway=None) -> dict | None:
     """The confirmation card for a removal the person asked for, or None when there is nothing to remove (spec 2026-10-30 R6)."""
     current, base = current or {}, app_url(repo, "test").split("?", 1)[0]
     if what == "azure-identity" and current.get("azure_identity"):
@@ -82,7 +90,37 @@ def confirmation(current, repo, what=None, secret=None) -> dict | None:
     if secret is not None and any(s["env"] == secret for s in current.get("secrets") or []):
         return {"title": f"Remove the secret {secret}?", "action": f"{base}/secrets/remove", "fields": [("env", secret)],
                 "text": f"The app no longer gets {secret} in this environment. The secret itself stays in Secret Server."}
+    found = next((s for s in (current.get("mcp") or {}).get("servers") or [] if s["server_id"] == mcp_server), None)
+    mcp = current.get("mcp") or {}
+    if mcp_server is not None and found is not None and gateway and mcp.get("gateway") != gateway:
+        n = len(mcp["servers"])
+        return {"title": "Remove every MCP server on the old gateway?", "action": f"{base}/mcp/remove", "fields": [("server_id", found["server_id"])],
+                "text": f"The platform moved this environment to a new gateway ({gateway}); this removes all {n} server{'s' if n != 1 else ''} "
+                        f"on {mcp['gateway']}. Add them again from the new gateway afterwards."}
+    if mcp_server is not None and found is not None:
+        return {"title": f"Remove the MCP server {found['name']}?", "action": f"{base}/mcp/remove", "fields": [("server_id", found["server_id"])],
+                "text": f"The app loses {found['name']} in this environment: its token is taken off the server's policy when the platform "
+                        "reconciles cloudflare-access.yaml."}
+    if skill is not None and any(s["name"] == skill for s in current.get("skills") or []):
+        return {"title": f"Remove the skill {skill}?", "action": f"{base}/skills/remove", "fields": [("name", skill)],
+                "text": f"The app no longer mounts /skills/{skill} in this environment. The skill stays in the catalog."}
     return None
+
+
+def cmdb_card(store, settings, repo, record, viewer_id) -> dict | None:
+    """What the app page shows of the collector's CMDB record (spec 2026-10-31 "What owning the app means"), or None when ServiceNow is
+    not set up here or nothing is recorded: the CI's number once a sync succeeded (the ownership notice), the record's review date, whose
+    app it is (an intake/v1 record has no owner of record; an intake record that is missing or can't be read names nobody), and whether
+    ServiceNow knows no user with the owner's email."""
+    found = store.cmdb_record(repo) if settings.servicenow else None
+    if found is None:
+        return None
+    readable = record is not None and record.problem is None  # the collector skips a record it can't use: so does the card
+    owner = record.owner if readable and record.schema == "intake/v2" and isinstance(record.owner, str) else None
+    person = store.get_person(owner) if owner and owner.startswith("p_") else None
+    return {"number": found.number, "review_by": record.review_by.isoformat() if readable and record.review_by else None,
+            "mine": owner is not None and owner == viewer_id, "owner": person.display_name if person else owner,
+            "unreadable": not readable, "owner_unknown": found.last_error == "cmdb_owner_unknown"}
 
 
 def app_page(request, environment, status=200, errors=(), confirm=None):
@@ -94,12 +132,21 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
     shown = open_one.final if open_one else current  # what composed.yaml gets: the pending binding once recorded, else the current
     records = state.store.intake_observed(repo)  # the factory's record (spec 2026-10-31 R7): its open date reasons are the owner's banner
     reviews = [i for i in state.store.rereview_items() if i.repo.lower() == repo.lower() and i.reason in DATE_REASONS]
+    record = records[0] if records else None
     return page(request, "app.html", status, repo=repo, owner_name=owner_name, repo_name=repo_name, registration=registration, directory=directory,
-                record=records[0] if records else None, reviews=reviews,
+                record=record, reviews=reviews, cmdb=cmdb_card(state.store, state.settings, repo, record, request.state.principal.person.id),
                 environment=environment, environments=ENVIRONMENTS, current=current, open_request=open_one, failed=failed,
                 can_change=request.state.app_repo_admin,
                 principals=directory.principals_for(org, repo) if directory else [],
                 warehouses=directory.warehouses_for(identity["directory_id"]) if directory and identity else [],
+                gateway=state.settings.mcp_gateways[environment],
+                current_servers=sorted(((current or {}).get("mcp") or {}).get("servers") or [], key=lambda s: s["server_id"]),
+                current_skills=sorted((current or {}).get("skills") or [], key=lambda s: s["name"]),
+                catalog_main=state.settings.skills_catalog.main if state.settings.skills_catalog else None,
+                in_catalog={s["name"] for s in (current or {}).get("skills") or []
+                            if state.settings.skills_catalog and state.settings.skills_catalog.skill(s["name"], state.settings.skills_catalog.main)},
+                gateway_moved=bool(((current or {}).get("mcp") or {}).get("servers"))
+                              and current["mcp"]["gateway"] != state.settings.mcp_gateways[environment],
                 effects=effects(shown), shown_secrets=sorted((shown or {}).get("secrets") or [], key=lambda s: s["env"]),
                 current_secrets=sorted((current or {}).get("secrets") or [], key=lambda s: s["env"]),
                 errors=list(errors), confirm=confirm)
@@ -107,16 +154,18 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
 
 @router.get("/apps/{owner}/{repo}")
 def show(request: Request, owner: str, repo: str, environment: str = Query("test"), confirm: str | None = Query(None),
-         confirm_secret: str | None = Query(None), principal=APP_ADMIN):
+         confirm_secret: str | None = Query(None), confirm_mcp: str | None = Query(None), confirm_skill: str | None = Query(None),
+         principal=APP_ADMIN):
     if environment not in ENVIRONMENTS:
         return _bad_environment(request)
-    if confirm is not None or confirm_secret is not None:  # a removal asks first; only its confirming POST removes
+    if any(x is not None for x in (confirm, confirm_secret, confirm_mcp, confirm_skill)):  # a removal asks first; only its confirming POST removes
         if not request.state.app_repo_admin:
             return app_page(request, environment, 403, [NOT_REPO_ADMIN])
         current, open_one, _, _ = binding_state(request.app.state.store, request.state.app_repo, environment)
         if open_one is not None:
             return app_page(request, environment, 409, [IN_PROGRESS])
-        card = confirmation(current, request.state.app_repo, what=confirm, secret=confirm_secret)
+        card = confirmation(current, request.state.app_repo, what=confirm, secret=confirm_secret, mcp_server=confirm_mcp,
+                            skill=confirm_skill, gateway=request.app.state.settings.mcp_gateways[environment])
         if card is None:
             return app_page(request, environment, 400, [NOTHING_TO_REMOVE])
         return app_page(request, environment, confirm=card)
@@ -132,9 +181,11 @@ def person_folders(secret_server, user) -> dict:
 def _change(request, principal, environment, flash_key, confirmed=None, folder=None, **choice):
     # the path parameters are not used: request.state.app_repo is the checked, stored owner/name
     state, repo = request.app.state, request.state.app_repo
-    secret_choice = "add_secret" in choice or "remove_secret" in choice
-    # Azure and Databricks need the directory; secrets need only Secret Server. With neither, there is nothing to change here.
-    if state.settings.directory is None and not (secret_choice and state.settings.secret_server is not None):
+    kind = next((key for key in choice if key in NEEDS), None)
+    needed, missing = (getattr(state.settings, NEEDS[kind][0]), NEEDS[kind][1]) if kind else (state.settings.directory, None)
+    # Azure and Databricks need the directory; secrets need only Secret Server, MCP servers only Cloudflare, skills only the catalog.
+    # With neither the directory nor what the choice needs, there is nothing to change here.
+    if state.settings.directory is None and needed is None:
         return page(request, "error.html", 404, message="Not found.")
     if environment not in ENVIRONMENTS:
         return _bad_environment(request)
@@ -144,16 +195,21 @@ def _change(request, principal, environment, flash_key, confirmed=None, folder=N
     if open_one is not None:
         return app_page(request, environment, 409, [IN_PROGRESS])
     request_id, now = new_id("r"), state.clock()
-    if secret_choice and state.settings.secret_server is None:
-        return app_page(request, environment, 400, [NO_SECRET_SERVER])
+    if needed is None:  # the directory is here, but not what this choice needs
+        return app_page(request, environment, 400, [missing])
     if "add_secret" in choice:
         choice.update(secret_server=state.settings.secret_server, secret_user=secret_user(request))
+    choice["mcp_gateway"] = state.settings.mcp_gateways[environment]  # every choice: a moved gateway is never carried on
+    if "add_mcp" in choice:
+        choice.update(cloudflare=state.settings.cloudflare, person_email=principal.person.email)
+    if "add_skill" in choice or "update_skill" in choice:
+        choice.update(skills_catalog=state.settings.skills_catalog, person_groups=tuple(principal.session.groups))
     if confirmed is not None and confirmed != "yes":  # a removal needs its confirming POST (spec 2026-10-30 R6)
         return app_page(request, environment, 400, [CONFIRM_FIRST])
     try:
         final = next_binding(current=current, repo=repo, org=state.settings.org, directory=state.settings.directory,
                              person_id=principal.person.id, request_id=request_id, now=now, environment=environment, **choice)
-    except SecretServerUnavailable as exc:
+    except (SecretServerUnavailable, CloudflareUnavailable) as exc:
         return app_page(request, environment, 503, [str(exc)])
     except BindingRefused as exc:
         return app_page(request, environment, 400, [str(exc)])

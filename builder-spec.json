@@ -101,6 +101,38 @@
       "secret": false
     },
     {
+      "name": "PORTAL_CLOUDFLARE",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_MCP_GATEWAY_TEST",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_MCP_GATEWAY_PROD",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_MCP_PROCESS_URL",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_SKILLS_CATALOG",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_SERVICENOW",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_ORG_NAME",
+      "secret": false
+    },
+    {
+      "name": "PORTAL_LIFECYCLE_GRACE_DAYS",
+      "secret": false
+    },
+    {
       "name": "PORTAL_CLASSIFICATION_POLICY_URL",
       "secret": false
     },

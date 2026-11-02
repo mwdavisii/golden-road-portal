@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}Add a skill - {{ repo }} - golden road{% endblock %}
+{% block main %}
+<p><a href="{{ app_href }}">&larr; {{ repo }}</a></p>
+<span class="eyebrow">Add a skill{% if environment %} &middot; {{ environment }}{% endif %}</span>
+<h1>{{ STEPS[shown.step - 1] }}</h1>
+<ol class="stepper" aria-label="Steps">
+{% for label in STEPS %}{% set n = loop.index %}<li class="{{ 'step-done' if n < shown.step else 'step-now' if n == shown.step else 'step-todo' }}"{% if n == shown.step %} aria-current="step"{% endif %}><span class="step-dot" aria-hidden="true">{% if n < shown.step %}&#10003;{% else %}{{ n }}{% endif %}</span>{{ label }}{% if n < shown.step %}<span class="visually-hidden"> (done)</span>{% endif %}</li>
+{% endfor %}
+</ol>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+{% if shown.step == 1 %}
+<form method="get" action="{{ base }}/skills/new" class="form-card">
+<fieldset class="choices">
+<legend>Which environment?</legend>
+<p class="hint">Security approves each skill in the platform's catalog for test, prod or both.</p>
+<div class="choice-list">
+{% for env in shown.environments %}<label class="choice"><input type="radio" name="environment" value="{{ env }}" required{% if env == tab %} checked{% endif %}><span class="choice-title">{{ env }}</span></label>
+{% endfor %}
+</div>
+</fieldset>
+<p class="actions"><button type="submit">Next</button><a class="button secondary" href="{{ app_href }}">Cancel</a></p>
+</form>
+{% elif shown.step == 2 %}
+<p class="meta">For {{ environment }}. <a href="{{ base }}/skills/new?tab={{ environment }}">Choose another environment</a></p>
+<form method="get" action="{{ base }}/skills/new" class="form-card">
+<input type="hidden" name="environment" value="{{ environment }}">
+<fieldset class="choices">
+<legend>Skill</legend>
+<p class="hint">The skills in the platform's catalog that are approved for {{ environment }} and for you. Each is pinned to the catalog's commit when you save it.</p>
+<div class="choice-list">
+{% for s in shown.skills %}{% if not s.bound %}<label class="choice"><input type="radio" name="name" value="{{ s.name }}" required><span class="choice-title mono">{{ s.name }}</span><span class="choice-line">{{ s.description }} Approved at <span class="mono">{{ shown.main[:7] }}</span>.</span><span class="badge state-merged">Approved</span></label>
+{% else %}<div class="choice unavailable"><span class="choice-title mono">{{ s.name }}</span><span class="choice-line">{{ s.description }} Already on this app: <a href="{{ app_href }}">update it from the app's page</a>.</span><span class="badge">Added</span></div>
+{% endif %}{% else %}<p class="empty">No skill in the catalog is approved for {{ environment }} and for you.</p>
+{% endfor %}
+</div>
+</fieldset>
+<p class="actions"><button type="submit"{% if not shown.skills|rejectattr("bound")|list %} disabled{% endif %}>Next</button><a class="button secondary" href="{{ base }}/skills/new?tab={{ environment }}">Back</a></p>
+</form>
+{% else %}
+<p class="meta">Check the skill before you save. It is mounted read-only; the app can't change it.</p>
+<dl class="review">
+<dt>Environment</dt><dd>{{ environment }}</dd>
+<dt>Skill</dt><dd class="mono">{{ shown.added.name }}</dd>
+<dt>Catalog commit</dt><dd class="mono">{{ shown.added.commit }}</dd>
+<dt class="arrives">Mounted at</dt><dd class="arrives"><ul>{% for path, size in shown.files %}<li><span class="mono">{{ path }}</span> ({{ size }} bytes)</li>{% endfor %}</ul>{{ shown.size }} bytes in all.</dd>
+</dl>
+<form method="post" action="{{ base }}/skills">
+<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
+<input type="hidden" name="name" value="{{ shown.added.name }}">
+<p class="meta">Saving opens a change for the writer to record in golden-road-deploy. The app gets <span class="mono">SKILLS_DIR=/skills</span>.</p>
+<p class="actions"><button type="submit">Save the skill</button><a class="button secondary" href="{{ base }}/skills/new?environment={{ environment }}">Back</a></p>
+</form>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,24 @@
+{
+  "schema": "mock-cloudflare/v1",
+  "account_id": "0123456789abcdef0123456789abcdef",
+  "portals": [
+    {"id": "mcp-test", "hostname": "mcp-test.example.com", "name": "Golden Road MCP (test)", "environment": "test", "servers": [
+      {"server_id": "notes", "name": "Notes", "description": "Search and write team notes.", "hostname": "notes.mcp.internal.example",
+       "auth_type": "unauthenticated", "on_behalf": false, "status": "ready", "tools": [{"name": "search_notes"}, {"name": "create_note"}]},
+      {"server_id": "tickets", "name": "Tickets", "description": "The ticket queue, as the signed-in person.", "hostname": "tickets.mcp.internal.example",
+       "auth_type": "oauth", "on_behalf": true, "status": "ready", "tools": [{"name": "list_tickets"}]},
+      {"server_id": "docs-search", "name": "Docs search", "description": "Search the internal docs.", "hostname": "docs.mcp.internal.example",
+       "auth_type": "unauthenticated", "on_behalf": false, "status": "error", "tools": []}]},
+    {"id": "mcp-prod", "hostname": "mcp.example.com", "name": "Golden Road MCP (prod)", "environment": "prod", "servers": [
+      {"server_id": "notes", "name": "Notes", "description": "Search and write team notes.", "hostname": "notes.mcp.internal.example",
+       "auth_type": "unauthenticated", "on_behalf": false, "status": "ready", "tools": [{"name": "search_notes"}, {"name": "create_note"}]},
+      {"server_id": "tickets", "name": "Tickets", "description": "The ticket queue, as the signed-in person.", "hostname": "tickets.mcp.internal.example",
+       "auth_type": "oauth", "on_behalf": true, "status": "ready", "tools": [{"name": "list_tickets"}]},
+      {"server_id": "finance-ledger", "name": "Finance ledger", "description": "Read the general ledger.", "hostname": "ledger.mcp.internal.example",
+       "auth_type": "bearer", "on_behalf": false, "status": "ready", "tools": [{"name": "read_ledger"}]}]}
+  ],
+  "users": [
+    {"email": "mwdavisii@example.com", "servers": ["notes", "tickets", "docs-search"]},
+    {"email": "other@example.com", "servers": ["finance-ledger"]}
+  ]
+}

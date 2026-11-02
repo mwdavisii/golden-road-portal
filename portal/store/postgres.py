@@ -9,8 +9,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ..ids import new_id
-from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, Conflict, Evidence, FailedRun,
-                   IntakeObserved, ItemEvent,
+from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, CmdbRecord, Conflict, Evidence,
+                   FailedRun, IntakeObserved, ItemEvent, check_cmdb_error, check_cmdb_sync,
                    Link, LoginState, Person, RepoAdmin, Request, RereviewEvent, RereviewItem, RereviewStatus, Session, check_approval,
                    check_binding, check_failed_run, check_item, check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row,
                    item_event, token_hash, PendingEvent, Watermark)
@@ -32,7 +32,13 @@ def _request(r):
                    created_at=r["created_at"], updated_at=r["updated_at"], decided_by=r["decided_by"], decided_at=r["decided_at"],
                    decision_groups=tuple(r["decision_groups"] or ()), decision_note=r["decision_note"], final=r["final"],
                    branch=r["branch"], pr_number=r["pr_number"], pr_url=r["pr_url"], merge_sha=r["merge_sha"], failure_reason=r["failure_reason"],
-                   head_sha=r["head_sha"], base_sha=r["base_sha"], submission=r["submission"], floor_override=r["floor_override"])
+                   head_sha=r["head_sha"], base_sha=r["base_sha"], submission=r["submission"], floor_override=r["floor_override"],
+                   ownership_acknowledged_at=r.get("ownership_acknowledged_at"))  # 0011's column (absent before it is applied)
+
+
+def _cmdb(r):
+    return CmdbRecord(r["repo"], r["sys_id"], r["number"], r["fields_hash"], r["last_operation"], r["last_synced_at"], r["last_error"],
+                      r["last_error_at"])
 
 
 def _evidence(r):
@@ -145,6 +151,12 @@ class PostgresStore:
             row = conn.execute("SELECT * FROM person WHERE id = %s", (person_id,)).fetchone()
         return _person(row) if row else None
 
+    def person_email(self, person_id):
+        """The collector's one read of person: it may select id and email only (0011)."""
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT email FROM person WHERE id = %s", (str(person_id),)).fetchone()
+        return row["email"] if row else None
+
     def list_people(self):
         with self.pool.connection() as conn:
             return [_person(r) for r in conn.execute("SELECT * FROM person ORDER BY lower(display_name), id").fetchall()]
@@ -236,13 +248,18 @@ class PostgresStore:
 
     # ---- requests ----
 
-    def create_registration(self, *, person_id, draft, now):
+    def create_registration(self, *, person_id, draft, now, ownership_acknowledged_at=None):
         with self.pool.connection() as conn:
             try:
                 with conn.transaction():
-                    row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at) "
-                                       "VALUES (%s, 'registration', %s, 'pending', %s, %s, %s, %s) RETURNING *",
-                                       (new_id("r"), draft["repo"], Jsonb(dict(draft)), person_id, now, now)).fetchone()
+                    values = (new_id("r"), draft["repo"], Jsonb(dict(draft)), person_id, now, now)
+                    if ownership_acknowledged_at is None:  # left to its default (NULL), so the store also runs before 0011 is applied
+                        row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at) "
+                                           "VALUES (%s, 'registration', %s, 'pending', %s, %s, %s, %s) RETURNING *", values).fetchone()
+                    else:
+                        row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at, "
+                                           "ownership_acknowledged_at) VALUES (%s, 'registration', %s, 'pending', %s, %s, %s, %s, %s) RETURNING *",
+                                           (*values, ownership_acknowledged_at)).fetchone()
             except errors.UniqueViolation:
                 raise Conflict("open_request_exists") from None
             self._log(conn, now, "person", person_id, "request.created", "request", row["id"], None,
@@ -701,3 +718,29 @@ class PostgresStore:
     def drop_pending_event(self, *, run_repo, run_id):
         with self.pool.connection() as conn:
             conn.execute("DELETE FROM rereview_pending_event WHERE lower(run_repo) = lower(%s) AND run_id = %s", (run_repo, run_id))
+
+    # ---- observed: the CMDB record of each intake record (the collector's; kept for ever, times are the database's) ----
+
+    def record_cmdb_sync(self, *, repo, sys_id, number, fields_hash, operation, now):
+        check_cmdb_sync(repo, sys_id, number, fields_hash, operation)
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO cmdb_record (repo, sys_id, number, fields_hash, last_operation, last_synced_at) "
+                         "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (lower(repo)) DO UPDATE SET sys_id = EXCLUDED.sys_id, "
+                         "number = EXCLUDED.number, fields_hash = EXCLUDED.fields_hash, last_operation = EXCLUDED.last_operation, "
+                         "last_synced_at = EXCLUDED.last_synced_at, last_error = NULL, last_error_at = NULL",
+                         (repo, sys_id, number, fields_hash, operation, now))
+
+    def record_cmdb_error(self, *, repo, error, now):
+        check_cmdb_error(repo, error)
+        with self.pool.connection() as conn:
+            conn.execute("INSERT INTO cmdb_record (repo, last_error, last_error_at) VALUES (%s, %s, %s) ON CONFLICT (lower(repo)) "
+                         "DO UPDATE SET last_error = EXCLUDED.last_error, last_error_at = EXCLUDED.last_error_at", (repo, error, now))
+
+    def cmdb_records(self):
+        with self.pool.connection() as conn:
+            return [_cmdb(r) for r in conn.execute("SELECT * FROM cmdb_record ORDER BY lower(repo)").fetchall()]
+
+    def cmdb_record(self, repo):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM cmdb_record WHERE lower(repo) = lower(%s)", (str(repo),)).fetchone()
+        return _cmdb(row) if row else None

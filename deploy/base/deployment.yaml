@@ -124,6 +124,54 @@ spec:
               name: golden-road-portal-config
               key: PORTAL_SECRET_PROCESS_URL
               optional: true
+        - name: PORTAL_CLOUDFLARE
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_CLOUDFLARE
+              optional: true
+        - name: PORTAL_MCP_GATEWAY_TEST
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_MCP_GATEWAY_TEST
+              optional: true
+        - name: PORTAL_MCP_GATEWAY_PROD
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_MCP_GATEWAY_PROD
+              optional: true
+        - name: PORTAL_MCP_PROCESS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_MCP_PROCESS_URL
+              optional: true
+        - name: PORTAL_SKILLS_CATALOG
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_SKILLS_CATALOG
+              optional: true
+        - name: PORTAL_SERVICENOW
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_SERVICENOW
+              optional: true
+        - name: PORTAL_ORG_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_ORG_NAME
+              optional: true
+        - name: PORTAL_LIFECYCLE_GRACE_DAYS
+          valueFrom:
+            configMapKeyRef:
+              name: golden-road-portal-config
+              key: PORTAL_LIFECYCLE_GRACE_DAYS
+              optional: true
         - name: PORTAL_CLASSIFICATION_POLICY_URL
           valueFrom:
             configMapKeyRef:

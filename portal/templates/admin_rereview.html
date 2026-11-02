@@ -16,6 +16,8 @@
 {% set given_up = (events_source.counts.get("unreadable_after_retries", 0) if events_source else 0) %}
 {% if given_up %}<p class="meta">{{ given_up }} scorecard run{{ "s were" if given_up != 1 else " was" }} recorded unreadable: GitHub didn't answer for {{ "them" if given_up != 1 else "it" }} on twelve passes, so the runs below were read on.</p>{% endif %}
 {% if events_source and events_source.problem == "factory_not_main" %}<p class="error warn">factory_not_main: the factory's default branch is not main, and scorecard-assess runs only from main, so central scorecard runs are not collected. Make main the factory's default branch.</p>{% endif %}
+{% for problem, words in cmdb_problems %}<p class="error warn">{{ problem }}: {{ words }}.</p>
+{% endfor %}
 {% if skipped %}<p class="meta">{{ skipped }} scorecard run{{ "s were" if skipped != 1 else " was" }} not read for the list: the artifact was missing, expired, too large or not a valid event, or the run was not trusted. Counted, never shown.</p>{% endif %}
 {% if not items %}<div class="empty"><p>Nothing to re-review.</p></div>{% endif %}
 {% for entry in items %}
@@ -66,6 +68,11 @@
 {% endfor %}
 {% if pending %}<li>{{ pending }} event{{ "s wait" if pending != 1 else " waits" }} for its app's intake record.</li>{% endif %}
 </ul>
+{% endif %}
+{% if cmdb_failing %}
+<h2>ServiceNow CMDB</h2>
+<p class="meta">The intake records whose last sync to ServiceNow failed. The collector tries each again on its next pass; a CI already made keeps its number.</p>
+<ul class="link-list">{% for r in cmdb_failing %}<li><span class="mono">{{ r.repo }}</span>: {{ r.last_error }}, {{ r.last_error_at.strftime("%Y-%m-%d %H:%M") }} UTC.</li>{% endfor %}</ul>
 {% endif %}
 {% if outside %}
 <h2>Registered outside the portal</h2>

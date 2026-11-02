@@ -40,10 +40,11 @@ def test_registration_flow_on_postgres_within_the_database_rules(pg_db):
         collector.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0), RepoAdmin("acme/tools", "owner-gh", 1001, T0)], observed_at=T0)
 
         form = {"csrf_token": owner_csrf, "repo": "acme/notes", "purpose": "Stores short team notes; no email, no files.",
-                "data_classification": "public"}
+                "data_classification": "public", "ownership_acknowledged": "yes"}
         created = owner_http.post("/register", data=form)
         assert created.status_code == 303
         rid = created.headers["location"].rsplit("/", 1)[1]
+        assert web.get_request(rid).ownership_acknowledged_at is not None   # the register form's acknowledgement (0011)
         collector.add_evidence(request_id=rid, submission=1, commit="e" * 40, evidence=evidence_doc("acme/notes", "e" * 40), floor_tier="low",
                                floor_classification="public", rules_commit="f" * 40, now=T0)
         approval = {"csrf_token": admin_csrf, "submission": "1", "tier": "moderate", "data_classification": "public", "review_by": "2027-10-23",
@@ -68,6 +69,7 @@ def test_registration_flow_on_postgres_within_the_database_rules(pg_db):
         again = {"csrf_token": owner_csrf, "purpose": "Builds internal tools; no PHI, no email, no files.", "data_classification": "public"}
         assert owner_http.post(f"/requests/{rid2}", data=again).status_code == 303
         assert web.get_request(rid2).state == "pending" and web.get_request(rid2).decided_by is None
+        assert web.get_request(rid2).ownership_acknowledged_at is not None   # a resubmit keeps the acknowledgement
 
         actions = [(e.actor_kind, e.action) for e in reversed(web.audit_entries(1000)) if e.subject_id == rid]
         assert actions == [("person", "request.created"), ("person", "request.approved"), ("writer", "request.writing"),

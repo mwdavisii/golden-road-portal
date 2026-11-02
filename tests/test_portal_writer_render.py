@@ -160,3 +160,33 @@ def test_a_value_too_long_for_a_pr_body_is_cut_in_its_code_span(portal):
     req = approved_change(portal.store, portal.people, T0, record=current)
     body = _pr_body(req, portal.people["owner"], portal.people["admin"], target_for("acme", req), current=current)
     assert f"- Owner: `{'t' * 200}…` →" in body and "t" * 201 not in body
+
+
+def test_a_binding_s_pr_lists_its_mcp_servers_and_skills_and_what_cloudflare_access_yaml_is(portal):
+    """Spec 2026-10-31: ids and commits only, what each was checked against, and the access file's line only when the PR writes it."""
+    import json
+    from portal.skills_catalog import MOCK
+    main = json.loads(MOCK.read_text(encoding="utf-8"))["main"]
+    req = binding_request(portal.store, portal.people, T0, identity=False, mcp=["notes"], skills=[("incident-triage", main)])
+    body = _pr_body(req, portal.people["owner"], None, target_for("acme", req), writes_access=True)
+    for needle in ("- MCP servers on `mcp-test.example.com`: `notes`", "checked against `mock-cloudflare`",
+                   f"- Skills: `incident-triage` at `{main[:12]}`", "read from `mock-skills-catalog`",
+                   "- `apps/acme/notes/test/cloudflare-access.yaml` is the desired state a platform job reconciles into Cloudflare",
+                   "nothing applies it from git", "Now linked: no Azure identity or Databricks connection"):
+        assert needle in body, needle
+    assert "Checked against the portal's directory" not in body, "the directory wasn't consulted"
+    assert "cloudflare-access.yaml" not in _pr_body(req, portal.people["owner"], None, target_for("acme", req))
+
+
+def test_a_binding_s_pr_says_when_its_last_mcp_server_is_gone(portal):
+    req = binding_request(portal.store, portal.people, T0, mcp=["notes"])
+    final = {**req.final, "mcp": {"gateway": "mcp-test.example.com", "servers": []}}
+    body = _pr_body(dc.replace(req, final=final), portal.people["owner"], None, target_for("acme", req), writes_access=True)
+    assert "- MCP servers on `mcp-test.example.com`: none (the app's token may reach no server)" in body
+    assert "checked against `mock-cloudflare`" not in body and "`sp-notes`" in body
+
+
+def test_a_binding_without_mcp_or_skills_has_neither_line(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    body = pr_body(req, portal.people["owner"], None)
+    assert "MCP servers" not in body and "Skills:" not in body and "cloudflare-access.yaml" not in body
