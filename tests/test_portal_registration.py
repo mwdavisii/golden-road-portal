@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from portal_fakes import T0, make_settings
 
@@ -222,6 +224,13 @@ def test_the_register_form_shows_what_owning_the_app_means_and_the_checkbox(port
     assert shown.count("within 30 days, the app is decommissioned.") == 2 and "ServiceNow (" not in shown   # no number before it is registered
     assert CHECKBOX in text and "I understand what owning this app means" in text
     assert text.index("ownership") < text.index("Submit for review") and text.index(CHECKBOX) < text.index("Submit for review")
+
+
+def test_each_point_is_one_grid_item_beside_its_number(portal):
+    # The li is a two-column grid (the number, the text): bare text runs and the review date would each be a grid item of their own.
+    shown = notice(portal.client("owner").get("/register").text)
+    points = re.findall(r"<li>(.*?)</li>", shown, re.S)
+    assert len(points) == 3 and all(re.fullmatch(r"<span>(?:(?!</?span>).)*</span>", p, re.S) for p in points), points
 
 
 def test_the_notice_names_the_configured_organization_and_0_hides_the_day_count(portal):

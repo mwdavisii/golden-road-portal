@@ -13,10 +13,10 @@
 <div class="card-head"><h2 id="ownership-title">What owning this app means</h2></div>
 <p class="ownership-lead">Whoever submits this registration is the app's owner once it is approved. That means:</p>
 {% endif %}
-<ol class="ownership-points">
-<li><strong>Patching.</strong> When ongoing vulnerability scans find new vulnerabilities, you approve the patches. Access may be suspended for a critical vulnerability until it is fixed.</li>
-<li><strong>Validation.</strong> You will be asked regularly to confirm the app is still in use{% if review_by %} (next by <time datetime="{{ review_by }}">{{ review_by }}</time>){% endif %}. {% if grace_days %}If you don't confirm within {{ grace_days }} days, the app is decommissioned.{% else %}If you don't confirm in time, the app is decommissioned.{% endif %}</li>
-<li><strong>Leaving.</strong> If you leave {{ org_name }} or move to another department, you and your manager get a ServiceNow task to name a new owner or decommission the app. {% if grace_days %}If neither happens within {{ grace_days }} days, the app is decommissioned.{% else %}If neither happens in time, the app is decommissioned.{% endif %}</li>
+<ol class="ownership-points">{# each point is one span: the li is a two-column grid (number, text), and bare text runs would each be a grid item #}
+<li><span><strong>Patching.</strong> When ongoing vulnerability scans find new vulnerabilities, you approve the patches. Access may be suspended for a critical vulnerability until it is fixed.</span></li>
+<li><span><strong>Validation.</strong> You will be asked regularly to confirm the app is still in use{% if review_by %} (next by <time datetime="{{ review_by }}">{{ review_by }}</time>){% endif %}. {% if grace_days %}If you don't confirm within {{ grace_days }} days, the app is decommissioned.{% else %}If you don't confirm in time, the app is decommissioned.{% endif %}</span></li>
+<li><span><strong>Leaving.</strong> If you leave {{ org_name }} or move to another department, you and your manager get a ServiceNow task to name a new owner or decommission the app. {% if grace_days %}If neither happens within {{ grace_days }} days, the app is decommissioned.{% else %}If neither happens in time, the app is decommissioned.{% endif %}</span></li>
 </ol>
 </section>
 {% endmacro %}
