@@ -352,3 +352,52 @@ def test_a_record_that_had_a_problem_is_read_again_even_when_its_blob_is_the_sam
     collect(store, broken)
     _, gh = collect(store, broken)
     assert [c for c in gh.calls if c["path"].endswith(git_sha(broken["acme/broken"]))]
+
+
+# ---- 0.7.0: a decommissioned app is no longer due for review (spec 2026-11-02; decided while planning: item 13) ----
+
+def decommissioned(store, repo="acme/notes"):
+    from portal_fakes import lifecycle_request
+
+    from portal.store.base import ACTION_STEPS
+    admin, _, _ = store.sign_in(issuer="i", subject="admin", display_name="Admin", email=None, groups=[], roles=["admin"], now=T0,
+                                max_age=dt.timedelta(hours=8))
+    req = lifecycle_request(store, {"admin": admin}, T0, action="decommission", repo=repo)
+    store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS["decommission"], now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0)
+    store.set_lifecycle_state(request_id=req.id, state="decommissioned", now=T0)  # once the deploy PR merges, as the writer does
+    return req
+
+
+def test_a_decommissioned_app_s_date_item_closes_and_none_opens():
+    store = MemoryStore()
+    collect(store, records(notes="2026-10-01"))
+    [item] = store.rereview_items()
+    assert item.reason == "review_overdue"
+    decommissioned(store)
+    result, _ = collect(store, records(notes="2026-10-01"))
+    assert (result["opened"], result["closed"]) == (0, 1) and store.rereview_items() == []
+    assert store.audit_for("rereview_item", item.id)[-1].reason == "Closed by the platform: the app is decommissioned."
+    result, _ = collect(store, records(notes="2026-10-01"), today=dt.date(2027, 1, 1))
+    assert result["opened"] == 0 and store.rereview_items() == []
+
+
+def test_a_decommissioned_app_s_item_closes_even_when_its_record_can_t_be_read():
+    store = MemoryStore()
+    collect(store, records(notes="2026-10-01"))
+    decommissioned(store)
+    collect(store, {**records(), "acme/notes": b": [broken"})
+    assert store.rereview_items() == []
+
+
+def test_a_suspended_app_is_still_due_for_review():
+    store = MemoryStore()
+    admin, _, _ = store.sign_in(issuer="i", subject="admin", display_name="Admin", email=None, groups=[], roles=["admin"], now=T0,
+                                max_age=dt.timedelta(hours=8))
+    from portal_fakes import lifecycle_request
+    req = lifecycle_request(store, {"admin": admin}, T0)
+    store.add_lifecycle_steps(request_id=req.id, steps=("deploy",), now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0)
+    store.apply_lifecycle(request_id=req.id, merge_sha=None, note="Applied in git.", now=T0)
+    result, _ = collect(store, records(notes="2026-10-01"))
+    assert result["opened"] == 1 and [i.reason for i in store.rereview_items()] == ["review_overdue"]

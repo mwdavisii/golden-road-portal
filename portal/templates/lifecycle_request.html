@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}{{ words }} {{ req.repo }} - golden road{% endblock %}
+{% macro when(at) %}<time datetime="{{ at.strftime('%Y-%m-%dT%H:%M:%SZ') }}">{{ at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endmacro %}
+{% block main %}
+<p><a href="/requests">&larr; My requests</a></p>
+<span class="eyebrow">Lifecycle request</span>
+<div class="card-head"><h1>{{ words }} <span class="mono">{{ req.repo }}</span></h1><span class="badge state-{{ req.state }}">{{ STATE_LABELS.get(req.state, req.state) }}</span></div>
+<dl class="facts summary">
+<div><dt>Action</dt><dd>{{ words }}</dd></div>
+<div><dt>App</dt><dd class="mono"><a href="/apps/{{ req.repo }}">{{ req.repo }}</a></dd></div>
+<div><dt>ServiceNow task</dt><dd class="mono">{% if mock_task %}<a href="/mock/servicenow/tasks/{{ req.final.task }}">{{ req.final.task }}</a>{% else %}{{ req.final.task }}{% endif %}</dd></div>
+</dl>
+<ol class="timeline" aria-label="Progress">
+{% for s in timeline %}<li class="step-{{ s.status }}"><span class="step-dot" aria-hidden="true">{% if s.status == "done" %}&#10003;{% elif s.status == "failed" %}&#10007;{% elif s.status == "now" %}&#9679;{% endif %}</span>
+<span class="step-label">{{ s.label }}</span><span class="step-state">{{ STEP_WORDS[s.status] }}</span>{% if s.detail %}<span class="step-detail">{{ s.detail }}</span>{% endif %}{% if s.at %}{{ when(s.at) }}{% endif %}</li>
+{% endfor %}
+</ol>
+<section>
+<h2>Reason</h2>
+<pre class="prose">{{ req.final.reason }}</pre>
+{% if pr_steps %}<h3>Pull requests</h3>
+<ul>{% for s in pr_steps %}<li>{{ s.label }}: <a href="{{ s.url }}" rel="noopener noreferrer">#{{ s.number }}</a>{% if s.attempt > 1 %} (attempt {{ s.attempt }}){% endif %}</li>{% endfor %}</ul>{% endif %}
+</section>
+{% if command %}
+<p class="callout info" role="status">{{ command.command|capitalize }} asked by {{ command_by }} at {{ when(command.requested_at) }}: the writer carries it out on its next pass.</p>
+{% elif can_act and (can_retry or can_abandon or can_stop) %}
+<section class="card" aria-labelledby="commands-title">
+<h2 id="commands-title">{% if can_stop %}Retry or stop{% else %}Retry or abandon{% endif %}</h2>
+{% if can_retry %}
+<form method="post" action="/requests/{{ req.id }}/retry">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="meta">A step failed. Retry starts it again (a pull request step on a new branch from the current main); the steps before it stay done.</p>
+<p class="actions"><button class="gold" type="submit">Retry</button></p>
+</form>
+{% endif %}
+{% if can_abandon %}
+<section class="confirm" aria-labelledby="abandon-title">
+<h3 id="abandon-title">Abandon this request? The writer closes its pull requests. The ServiceNow task stays open.</h3>
+<p>An abandon is carried out on the writer's next pass. If the deploy repo pull request merges first, the writer ignores the abandon and notes the task: {% if req.final.action == "decommission" %}a decommission can't be undone after the deploy merge.{% else %}the action is applied.{% endif %}</p>
+<form method="post" action="/requests/{{ req.id }}/abandon">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="actions"><button class="danger solid" type="submit">Abandon</button></p>
+</form>
+</section>
+{% endif %}
+{% if can_stop %}
+<section class="confirm" aria-labelledby="stop-title">
+<h3 id="stop-title">Stop this request? The writer closes the steps still to do and does no more. The ServiceNow task stays open.</h3>
+<p>The deploy repo pull request merged, so the app stays removed from the deploy repo and decommissioned in the portal. A stop is carried out on the writer's next pass. If the factory pull request merges first, the writer ignores the stop and applies the decommission.</p>
+<form method="post" action="/requests/{{ req.id }}/stop">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="actions"><button class="danger solid" type="submit">Stop</button></p>
+</form>
+</section>
+{% endif %}
+</section>
+{% endif %}
+<section aria-labelledby="told-title">
+<h2 id="told-title">What ServiceNow was told</h2>
+<p class="meta">Each step is a work note on the task, sent by the collector in order; the last one closes the task.</p>
+{% if events %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">When</th><th scope="col">Step</th><th scope="col">Note</th><th scope="col">Sent</th></tr></thead>
+<tbody>
+{% for e in events %}<tr><td class="when">{{ when(e.created_at) }}</td><td class="mono">{{ e.step }}</td><td><pre class="prose">{{ e.note }}</pre></td><td>{% if e.sent_at %}Sent at {{ when(e.sent_at) }}{% elif e.attempts %}Waiting: {{ e.attempts }} attempt{% if e.attempts != 1 %}s{% endif %}, last error {{ e.last_error }}{% else %}Waiting: the collector sends it on its next pass{% endif %}</td></tr>
+{% endfor %}</tbody></table></div>
+{% else %}<p class="empty">Nothing yet.</p>{% endif %}
+</section>
+{% endblock %}

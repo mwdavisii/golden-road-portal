@@ -45,6 +45,7 @@ PR_URL = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]{1,300
 
 
 def run_once(store, gh, cfg, now) -> list[str]:
+    from .lifecycle import advance as lifecycle_advance  # here, not at the top: writer.lifecycle imports this module
     waiting = store.requests_in(("pr_open",))  # taken first: a request this pass opens waits for its checks until the next pass
     done = []
 
@@ -54,10 +55,14 @@ def run_once(store, gh, cfg, now) -> list[str]:
         except Conflict as exc:  # another process moved the request: its turn ends here, and the pass goes on
             done.append(f"{request.id}: skipped ({exc.code})")
 
-    for request in store.requests_in(("writing",)):  # left over from an interrupted run
-        turn(request, _write)
+    def write(store_, gh_, cfg_, request, now_):
+        """A lifecycle request (spec 2026-11-02) stays writing while its steps run: writer.lifecycle drives it, one pass at a time."""
+        return (lifecycle_advance if request.kind == "lifecycle" else _write)(store_, gh_, cfg_, request, now_)
+
+    for request in store.requests_in(("writing",)):  # left over from an interrupted run, and every lifecycle request in progress
+        turn(request, write)
     while (claimed := store.claim_approved(now=now)) is not None:
-        turn(claimed, _write)
+        turn(claimed, write)
     for request in waiting:
         turn(request, _advance)
     return done
@@ -183,9 +188,13 @@ def _from_the_target_repo(pr, repo) -> bool:
     return ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo
 
 
-def _our_pr(pr, base, head, repo) -> bool:
+def _our_pr(pr, base, head, repo, login=None) -> bool:
+    """An open PR into base at head from the target repo itself, and (login: the write App's bot, which main always sets) opened by the
+    write App: a PR someone else opened from the writer's branch is never adopted."""
+    author = (pr.get("user") or {}) if isinstance(pr, dict) else {}
     return (isinstance(pr, dict) and pr.get("state") == "open" and (pr.get("base") or {}).get("ref") == base
-            and (pr.get("head") or {}).get("sha") == head and _from_the_target_repo(pr, repo))
+            and (pr.get("head") or {}).get("sha") == head and _from_the_target_repo(pr, repo)
+            and (login is None or (author.get("login") == login and author.get("type") == "Bot")))
 
 
 def _only_our_pr(prs, req, default_branch) -> bool:
@@ -209,6 +218,19 @@ def _run_is_ours(gh, target, req, default_branch, run) -> bool:
     return (wf.get("check_suite_id") == suite and wf.get("event") == "pull_request"
             and (wf.get("head_repository") or {}).get("full_name") == target.repo and wf.get("head_branch") == req.branch
             and wf.get("head_sha") == req.head_sha and _only_our_pr(wf.get("pull_requests"), req, default_branch))
+
+
+def check_conclusions(gh, cfg, target, pinned, default_branch) -> dict:
+    """{check name: its conclusion, or None while no run of it has completed} for each check target.repo requires, counting only runs
+    from the GitHub Actions app traced to the pinned PR (_run_is_ours). pinned has head_sha, pr_number and branch: a Request or a
+    lifecycle step (spec 2026-11-02)."""
+    conclusions = {}
+    for name in cfg.required_checks[target.repo]:
+        runs = gh.call("GET", f"/repos/{target.repo}/commits/{pinned.head_sha}/check-runs", params={"check_name": name}).json()["check_runs"]
+        ours = [r for r in runs if r.get("name") == name and (r.get("app") or {}).get("id") == ACTIONS_APP_ID
+                and _run_is_ours(gh, target, pinned, default_branch, r)]
+        conclusions[name] = next((r.get("conclusion") for r in ours if r.get("status") == "completed"), None)
+    return conclusions
 
 
 def _merged_at(pr):
@@ -261,7 +283,12 @@ class Refused(Exception):
     (record_case_mismatch), a record that moved (record_changed; record_conflict when GitHub's PUT finds it), or is already there
     (already_registered), a binding whose environment
     has no release pinned (not_deployed), composing refused (compose_refused), or a cloudflare-access.yaml beside a binding with no
-    mcp (access_file_without_mcp: the writer never deletes a file)."""
+    mcp (access_file_without_mcp: the writer never deletes a binding's file). A lifecycle step's (spec 2026-11-02, writer.lifecycle):
+    nothing to suspend (nothing_to_suspend), nothing suspended to resume (not_suspended_in_git), an environment already suspended
+    (already_suspended), an intake record that isn't intake/v2 (record_not_intake_v2) or already says decommissioned
+    (already_decommissioned), no intake record (not_registered), a planned path off the allowlist (path_not_allowlisted), an adapter by
+    the app's name that reconciles another path (adapter_not_ours), the app under another spelling in the deploy repo (case_mismatch),
+    or a requester no longer an admin before a merge (not_admin)."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -308,28 +335,46 @@ def _skills_for(binding, catalog):
     return files
 
 
-def composed_for(request, release_raw: bytes, manifests_raw: bytes, binding_raw: bytes, skills_catalog=None) -> bytes:
-    """The environment's composed.yaml as `golden-road compose` writes it from release.yaml, base/manifests.yaml and the bindings.yaml
-    the writer writes (binding_raw, read back as deploy-check reads it), byte for byte: portal/compose.py is golden_road/compose.py.
-    release.yaml must be a valid deploy-release/v1 for exactly the request's repo and environment, and the manifests must be its
-    manifests_sha256. The binding's skills are read from skills_catalog at their pins (the portal's catalog is the same bytes as the
-    one deploy-verify reads). Raises Refused("compose_refused") on anything golden-road compose would refuse, a skill the catalog
-    doesn't hold, and an owner with no MCP token name."""
-    environment = request.draft["environment"]
+def _lifecycle_read_back(raw: bytes, repo: str, environment: str) -> dict:
+    """lifecycle.yaml as deploy-check reads it: at most MAX_BINDING_BYTES, one YAML object, a valid lifecycle/v1 for exactly this repo and
+    environment (spec 2026-11-02 rule 10). Raises ValueError."""
+    if len(raw) > MAX_BINDING_BYTES:
+        raise ValueError("lifecycle.yaml too large")
+    doc = _one_yaml_object(raw)
+    if validate("lifecycle.v1", doc) or doc["repo"] != repo or doc["environment"] != environment:
+        raise ValueError("not this environment's lifecycle/v1")
+    return doc
+
+
+def compose_bytes(repo, environment, release_raw: bytes, manifests_raw: bytes, binding_raw: bytes | None, skills_catalog=None,
+                  lifecycle_raw: bytes | None = None) -> bytes:
+    """One environment's composed.yaml as `golden-road compose` writes it from release.yaml, base/manifests.yaml, bindings.yaml (None:
+    the environment has none) and lifecycle.yaml (None: it runs), each read back as deploy-check reads it, byte for byte:
+    portal/compose.py is golden_road/compose.py. release.yaml must be a valid deploy-release/v1 for exactly this repo and
+    environment, and the manifests must be its manifests_sha256. The binding's skills are read from skills_catalog at their pins
+    (the portal's catalog is the same bytes as the one deploy-verify reads). Raises Refused("compose_refused") on anything
+    golden-road compose would refuse, a skill the catalog doesn't hold, and an owner with no MCP token name."""
     try:
         release = _one_yaml_object(release_raw)
-        if len(release_raw) > MAX_FILE_BYTES or validate("deploy-release.v1", release) or release["repo"] != request.repo \
+        if len(release_raw) > MAX_FILE_BYTES or validate("deploy-release.v1", release) or release["repo"] != repo \
                 or release["environment"] != environment:
             raise ValueError("not this environment's release")
         if len(manifests_raw) > MAX_FILE_BYTES or hashlib.sha256(manifests_raw).hexdigest() != release["manifests_sha256"]:
             raise ValueError("not the release's manifests")
-        binding = _binding_read_back(binding_raw)
-        if binding["repo"] != release["repo"] or binding["environment"] != environment:
+        binding = None if binding_raw is None else _binding_read_back(binding_raw)
+        if binding is not None and (binding["repo"] != release["repo"] or binding["environment"] != environment):
             raise ValueError("not this environment's binding")
+        lifecycle = None if lifecycle_raw is None else _lifecycle_read_back(lifecycle_raw, repo, environment)
         return compose(manifests_raw.decode("utf-8"), release["image"], binding, namespace=release["namespace"],
-                       skills=_skills_for(binding, skills_catalog)).encode("utf-8")
+                       skills=_skills_for(binding, skills_catalog) if binding is not None else None, lifecycle=lifecycle).encode("utf-8")
     except (ComposeError, ValueError, KeyError, TypeError, yaml.YAMLError, RecursionError):  # UnicodeDecodeError is a ValueError
         raise Refused("compose_refused") from None
+
+
+def composed_for(request, release_raw: bytes, manifests_raw: bytes, binding_raw: bytes, skills_catalog=None, lifecycle_raw=None) -> bytes:
+    """A binding request's composed.yaml: compose_bytes for its repo and environment, with the bindings.yaml it writes and the
+    environment's lifecycle.yaml at the base, so a suspended app's binding stays at zero replicas (spec 2026-11-02 rule 5)."""
+    return compose_bytes(request.repo, request.draft["environment"], release_raw, manifests_raw, binding_raw, skills_catalog, lifecycle_raw)
 
 
 def access_for(binding_raw: bytes) -> bytes | None:
@@ -362,7 +407,7 @@ def _files_to_write(gh, cfg, req, target, base, base_sha, content, expected_sha=
     writes its bindings.yaml and then its composed.yaml, the latter only when it changes; first its app must be registered (the
     intake record in the factory) and deployed in the environment (release.yaml and base/manifests.yaml at base_sha). Then its
     cloudflare-access.yaml, when the binding has mcp and the file changes; never deleted, so a binding without mcp whose base has
-    one is refused."""
+    one is refused. composed.yaml is composed with the environment's lifecycle.yaml at the base, which a binding never writes."""
     existing = _file(gh, target.repo, target.path, base_sha)  # read at the commit the branch starts from: the blob a PUT replaces
     if req.kind != "binding":
         if case_variants(gh, target.repo, target.path, base_sha):  # the record in another spelling: the scorecard reads only one
@@ -379,7 +424,8 @@ def _files_to_write(gh, cfg, req, target, base, base_sha, content, expected_sha=
     manifests = _file(gh, target.repo, f"{d}/base/manifests.yaml", base_sha)
     if release is None or manifests is None:
         raise Refused("not_deployed")
-    composed = composed_for(req, release[1], manifests[1], content, cfg.skills_catalog)
+    lifecycle = _file(gh, target.repo, f"{d}/lifecycle.yaml", base_sha)  # a suspended environment stays at zero (spec 2026-11-02 rule 5)
+    composed = composed_for(req, release[1], manifests[1], content, cfg.skills_catalog, lifecycle[1] if lifecycle else None)
     access = access_for(content)
     current = _file(gh, target.repo, target.also, base_sha)
     files = [(target.path, content, existing)]
@@ -448,7 +494,7 @@ def _write(store, gh, cfg, req, now) -> str:
                        writes_access=any(path == target.access for path, _, _ in files))
         pr = found[0] if found else gh.call("POST", f"/repos/{target.repo}/pulls", ok=(201,), json={
             "title": title(req, change), "head": branch, "base": base, "maintainer_can_modify": False, "body": body}).json()
-        if not _our_pr(pr, base, head, target.repo):
+        if not _our_pr(pr, base, head, target.repo, cfg.write_login):
             return _fail(store, req, "pr_not_ours", now)
         number, url = int(pr["number"]), str(pr["html_url"])
         if number < 1 or not PR_URL.fullmatch(url):
@@ -514,12 +560,7 @@ def _advance(store, gh, cfg, req, now) -> str:
         files = list(gh.paginate(f"/repos/{target.repo}/pulls/{req.pr_number}/files"))
         if not _only_these(files, {p: statuses for p in written}):
             return fail("pr_files_unexpected")
-        conclusions = {}
-        for name in cfg.required_checks[target.repo]:
-            runs = gh.call("GET", f"/repos/{target.repo}/commits/{req.head_sha}/check-runs", params={"check_name": name}).json()["check_runs"]
-            ours = [r for r in runs if r.get("name") == name and (r.get("app") or {}).get("id") == ACTIONS_APP_ID
-                    and _run_is_ours(gh, target, req, default_branch, r)]
-            conclusions[name] = next((r.get("conclusion") for r in ours if r.get("status") == "completed"), None)
+        conclusions = check_conclusions(gh, cfg, target, req, default_branch)
         if not conclusions:
             return fail("no_required_checks")
         failed = [n for n, c in conclusions.items() if c not in (None, "success")]
@@ -535,6 +576,10 @@ def _advance(store, gh, cfg, req, now) -> str:
         # as the review takes, and every check above still runs on each pass.
         if not writer_merges(target):
             return f"{req.id}: waiting for review"
+        # Rule 4 (spec 2026-11-02) again right before the merge: the app may have been decommissioned since the request was claimed
+        state = store.lifecycle_state(req.repo)
+        if state is not None and state.state == "decommissioned":
+            return fail("decommissioned")
         try:
             merged = gh.call("PUT", f"/repos/{target.repo}/pulls/{req.pr_number}/merge",
                              json={"merge_method": cfg.merge_method, "sha": req.head_sha}).json()

@@ -214,7 +214,7 @@ def test_0011_applies_to_a_populated_database_migrated_through_0010(pg_server, m
                                                           "Stores notes.", dt.date(2027, 10, 1), None, None)], observed_at=NOW)
             for source, problem in (("repo_admins", None), ("evidence", "failed"), ("intake", "factory_unreadable"), ("events", "github_busy")):
                 store.set_rereview_status(source=source, problem=problem, counts={"n": 1}, now=NOW)
-            monkeypatch.setattr(migrate, "migrations", lambda: every)
+            monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0011"])  # 0012 has its own test
             assert migrate.apply(dsn()) == ["0011_mcp_skills_and_cmdb"] and migrate.apply(dsn()) == []
             old = store.get_request(old_id)
             assert old.state == "pending" and old.ownership_acknowledged_at is None

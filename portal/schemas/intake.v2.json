@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://platform.internal/schemas/intake.v2.json",
   "title": "intake/v2",
-  "description": "The factory's intake/<owner>/<repo>.yaml as the portal's writer records it: intake/v1's fields, an owner of record that is a portal person, who registered and approved it, when and why, and when it is next reviewed. From builder 0.3.11 it may also carry the evidence commit and floor the platform computed and any admin override below it.",
+  "description": "The factory's intake/<owner>/<repo>.yaml as the portal's writer records it: intake/v1's fields, an owner of record that is a portal person, who registered and approved it, when and why, and when it is next reviewed. From builder 0.3.11 it may also carry the evidence commit and floor the platform computed and any admin override below it. From builder 0.7.0 it may say the app was decommissioned (`decommissioned`).",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "repo", "tier", "purpose", "owner", "data_classification", "registered_by", "approved_by", "approved_at", "approval_justification", "review_by", "request"],
@@ -35,6 +35,18 @@
         "by": {"$ref": "#/$defs/person"},
         "at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
         "reason": {"type": "string", "minLength": 30, "maxLength": 1000, "allOf": [{"$ref": "#/$defs/single_line"}]}
+      }
+    },
+    "decommissioned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "task", "by", "request"],
+      "description": "Set by the portal's writer when the platform decommissions the app (spec 2026-11-02 L7): no longer due for review, its CI retired, and deploy-check refuses any added or changed environment under apps/<owner>/<repo>/ (removing one passes). Only a reviewed factory PR removes it, when the app comes back.",
+      "properties": {
+        "at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "task": {"type": "string", "pattern": "^SCTASK[0-9]{7}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+        "by": {"$ref": "#/$defs/person"},
+        "request": {"type": "string", "pattern": "^r_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
       }
     }
   }

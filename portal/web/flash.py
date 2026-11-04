@@ -21,6 +21,10 @@ MESSAGES = {
     "skill": "Skill requested",
     "link_added": "GitHub login linked",
     "link_removed": "GitHub login unlinked",
+    "lifecycle": "Lifecycle action requested: the writer applies it next",
+    "retry": "Retry requested: the writer tries the step again on its next pass",
+    "abandon": "Abandon requested: the writer closes the pull requests on its next pass",
+    "stop": "Stop requested: the writer closes the steps still to do on its next pass",
 }
 
 

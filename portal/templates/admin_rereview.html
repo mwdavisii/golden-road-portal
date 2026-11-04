@@ -74,6 +74,11 @@
 <p class="meta">The intake records whose last sync to ServiceNow failed. The collector tries each again on its next pass; a CI already made keeps its number.</p>
 <ul class="link-list">{% for r in cmdb_failing %}<li><span class="mono">{{ r.repo }}</span>: {{ r.last_error }}, {{ r.last_error_at.strftime("%Y-%m-%d %H:%M") }} UTC.</li>{% endfor %}</ul>
 {% endif %}
+{% if writeback_stale %}
+<h2>ServiceNow task notes</h2>
+<p class="meta">The lifecycle notes unsent for more than a day, oldest first. The collector sends each request's notes in order, so a note here holds back that request's later ones; it tries again on every pass, with no limit.</p>
+<ul class="link-list">{% for e in writeback_stale %}<li><a href="/requests/{{ e.request_id }}" class="mono">{{ e.request_id }}</a>: {{ e.step }}, {{ e.attempts }} attempt{{ "" if e.attempts == 1 else "s" }}, {{ e.last_error or "not tried yet" }}.</li>{% endfor %}</ul>
+{% endif %}
 {% if outside %}
 <h2>Registered outside the portal</h2>
 <p class="meta">These intake/v1 records have no review date, so they get no date reason. A change or renewal in the portal replaces each with an intake/v2 record that has one.</p>

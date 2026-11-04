@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from portal.servicenow import CLASS, ServiceNowError
-from portal.servicenow_mock import MOCK, PASSWORD, MockServiceNowError, load_mock, parse, values_hash
+from portal.servicenow_mock import MOCK, PASSWORD, MockServiceNowError, ci_sys_id, load_mock, parse, values_hash
 
 NOTES = {"name": "acme/notes", "short_description": "Stores team notes.", "u_tier": "low", "u_data_classification": "public",
          "u_repo_url": "https://github.com/acme/notes", "correlation_id": "github:acme/notes", "discovery_source": "golden_road"}
@@ -190,3 +190,134 @@ def test_a_bad_fixture_is_refused(d):
 def test_the_fixture_is_valid_and_names_no_real_instance():
     mock = parse(doc())
     assert mock.instance.endswith(".example") and len(mock.users) == 2
+
+
+# ---- The lifecycle (spec 2026-11-02): sc_task, the PATCH calls, the CI's lifecycle fields, the replay ----
+
+def mock_for(org="acme"):
+    return load_mock(org=org)
+
+
+def test_the_fixture_tasks_name_hello_app_s_ci_for_the_org():
+    with mock_for("mwdavisii").client() as c:
+        task = c.task("SCTASK0010001")
+        assert (task.state, task.ci, task.open) == ("1", ci_sys_id("mwdavisii/hello-app"), True)
+        assert c.task("SCTASK0010004").open is False
+        assert c.task("SCTASK0010005").ci == ci_sys_id("mwdavisii/other-app")
+        assert c.task("SCTASK0010009") is None
+
+
+def test_without_an_org_a_task_names_no_ci():
+    with load_mock().client() as c:
+        assert c.task("SCTASK0010001").ci is None
+
+
+def test_the_ci_sys_id_is_the_first_reconcile_s():
+    mock = mock_for()
+    with mock.client() as c:
+        done = c.reconcile({"name": "acme/notes", "correlation_id": "github:acme/notes", "discovery_source": "golden_road"})
+    assert done.sys_id == ci_sys_id("acme/notes") == ci_sys_id("ACME/Notes")
+
+
+def test_work_notes_and_the_close_are_stored_in_order():
+    mock = mock_for()
+    sys_id = "5ca1ab1e000040008000000000010001"
+    with mock.client() as c:
+        c.add_work_note(sys_id, "Requested in the golden road portal by Ada: suspend the app.")
+        c.add_work_note(sys_id, "Pull request #7 opened.")
+        c.close_task(sys_id, "Applied in git.")
+        assert c.task("SCTASK0010001").open is False
+    assert mock.task_history("SCTASK0010001") == [("work_notes", "Requested in the golden road portal by Ada: suspend the app."),
+                                                  ("work_notes", "Pull request #7 opened."), ("closed", "Applied in git.")]
+
+
+def test_a_patch_of_an_unknown_task_or_another_field_is_refused():
+    mock = mock_for()
+    with mock.client() as c:
+        with pytest.raises(ServiceNowError, match="404"):
+            c.add_work_note("f" * 32, "x" * 10)
+    raw = httpx.Client(transport=mock.transport())
+    answer = raw.patch(f"{mock.instance}/api/now/table/sc_task/5ca1ab1e000040008000000000010001", json={"short_description": "x"},
+                       auth=(mock.integration_user, PASSWORD))
+    assert answer.status_code == 400
+    assert mock.task_history("SCTASK0010001") == []
+
+
+def test_the_ci_reports_its_lifecycle_fields_and_an_edit_changes_them():
+    mock = mock_for()
+    values = {"name": "acme/notes", "correlation_id": "github:acme/notes", "discovery_source": "golden_road", "operational_status": "1",
+              "install_status": "1", "u_golden_road_state": "active", "u_golden_road_task": ""}
+    with mock.client() as c:
+        sys_id = c.reconcile(values).sys_id
+        assert c.ci_lifecycle(sys_id) == {"operational_status": "1", "install_status": "1", "u_golden_road_state": "active",
+                                          "u_golden_road_task": ""}
+        assert c.number(sys_id) == "APM0001001"  # the number call still answers
+        mock.edit_ci("acme/notes", u_golden_road_state="suspended", operational_status="2")
+        assert c.ci_lifecycle(sys_id)["u_golden_road_state"] == "suspended"
+        assert c.reconcile(values).operation == "UPDATE"  # the portal's values again: ServiceNow changes back
+        assert c.ci_lifecycle(sys_id)["u_golden_road_state"] == "active"
+
+
+def test_a_seeded_ci_reports_no_lifecycle_fields():
+    """(decided while planning: item 12)"""
+    mock = mock_for()
+    mock.seed([("github:acme/notes", ci_sys_id("acme/notes"), "APM0001001", None)])
+    with mock.client() as c:
+        assert c.ci_lifecycle(ci_sys_id("acme/notes")) == {}
+
+
+def test_a_replay_rebuilds_a_task_s_history():
+    mock = mock_for()
+    sys_id = "5ca1ab1e000040008000000000010002"
+    mock.replay([(sys_id, "requested", "Requested."), (sys_id, "merged", "Merged."), (sys_id, "completed", "Applied in git.")])
+    assert mock.task_history("SCTASK0010002") == [("work_notes", "Requested."), ("work_notes", "Merged."), ("closed", "Applied in git.")]
+    with mock.client() as c:
+        assert c.task("SCTASK0010002").open is False
+
+
+def test_a_fresh_mock_has_the_fixture_s_tasks_as_loaded_and_shares_nothing():
+    """The web's task check and task page replay into a fresh mock each time: never into the one the settings hold."""
+    mock = mock_for()
+    sys_id = "5ca1ab1e000040008000000000010001"
+    mock.replay([(sys_id, "requested", "Requested."), (sys_id, "completed", "Applied in git.")])
+    fresh = mock.fresh()
+    assert fresh is not mock and fresh.org == mock.org and fresh.task_history("SCTASK0010001") == []
+    assert fresh.task_fields("SCTASK0010001")["open"] is True and mock.task_fields("SCTASK0010001")["open"] is False
+    fresh.replay([(sys_id, "requested", "Again.")])
+    assert mock.task_history("SCTASK0010001") == [("work_notes", "Requested."), ("closed", "Applied in git.")]
+    assert [mock.fresh().task_fields(t["number"]) for t in doc()["tasks"]] == [load_mock(org="acme").task_fields(t["number"])
+                                                                               for t in doc()["tasks"]]
+
+
+def test_the_task_fields_for_the_demo_page():
+    mock = mock_for()
+    assert mock.task_fields("SCTASK0010004") == {"number": "SCTASK0010004", "state": "3", "short_description": "A closed task (demo: refused)",
+                                                 "ci": "hello-app", "open": False}
+    assert mock.task_fields("SCTASK0010009") is None
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["tasks"].append(dict(d["tasks"][0])),
+    lambda d: d["tasks"][0].update(number="SCTASK1"),
+    lambda d: d["tasks"][0].update(sys_id="x"),
+    lambda d: d["tasks"][0].update(state="open"),
+    lambda d: d["tasks"][0].update(ci="Hello App"),
+    lambda d: d["tasks"][0].update(extra=1),
+    lambda d: d.pop("tasks")])
+def test_a_bad_task_fixture_is_refused(change):
+    doc = json.loads(MOCK.read_text())
+    change(doc)
+    with pytest.raises(MockServiceNowError):
+        parse(doc)
+
+
+@pytest.mark.parametrize("method, path, kw", [
+    ("GET", "/api/now/table/sc_task", {"params": {"sysparm_query": "number=SCTASK0010001"}}),
+    ("PATCH", "/api/now/table/sc_task/5ca1ab1e000040008000000000010001", {"json": {"work_notes": "x"}}),
+    ("PATCH", "/api/now/table/sc_task/5ca1ab1e000040008000000000010001", {"json": {"state": "3", "close_notes": "x"}})])
+@pytest.mark.parametrize("auth", [None, ("golden-road-cmdb", "wrong")])
+def test_the_task_routes_are_401_without_the_integration_user(method, path, kw, auth):
+    mock = mock_for()
+    r = httpx.Client(transport=mock.transport()).request(method, f"{mock.instance}{path}", auth=auth, **kw)
+    assert r.status_code == 401
+    assert mock.task_history("SCTASK0010001") == [] and mock.task_fields("SCTASK0010001")["state"] == "1"

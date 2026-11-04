@@ -7,6 +7,7 @@ import datetime as dt
 
 from fastapi import APIRouter, Form, Request
 
+from ..outbox import stale_events
 from ..rereview import is_stale
 from ..store.base import Conflict
 from .access import ADMIN
@@ -57,16 +58,22 @@ PROBLEM_WORDS = {"invalid": "is not a valid intake record (the scorecard refuses
 # The cmdb part's problems (spec 2026-10-31), in words written here
 CMDB_WORDS = {"cmdb_unreachable": "ServiceNow didn't answer: the collector retries on the next pass",
               "cmdb_owner_unknown": "an owner's email matches no ServiceNow user",
-              "cmdb_refused": "ServiceNow refused a CI: see its reconciliation rules"}
+              "cmdb_refused": "ServiceNow refused a CI: see its reconciliation rules",
+              # spec 2026-11-02 "Outbox": computed here from the outbox (decided while planning: item 11), never a part's own status
+              "cmdb_writeback_pending": "work notes for ServiceNow tasks have waited more than a day: ServiceNow refused them or didn't "
+                                        "answer, and the collector keeps trying"}
 
 
-def cmdb_problems(store, sources) -> tuple[list, list]:
-    """(the cmdb problems to say, in CMDB_WORDS's order; the CMDB records whose last attempt failed, by repo). A problem is said when
-    the part's last pass named it or a repo's last attempt ended in it: one pass names one problem, and several repos can fail apart."""
+def cmdb_problems(store, sources, now) -> tuple[list, list, list]:
+    """(the cmdb problems to say, in CMDB_WORDS's order; the CMDB records whose last attempt failed, by repo; the lifecycle notes unsent
+    for more than a day, oldest first). A problem is said when the part's last pass named it or a repo's last attempt ended in it: one
+    pass names one problem, and several repos can fail apart. cmdb_writeback_pending is said while any note is stale."""
     failing = [r for r in store.cmdb_records() if r.last_error]
+    stale = stale_events(store, now)
     status = sources.get("cmdb")
-    found = {r.last_error for r in failing} | ({status.problem} if status and status.problem in CMDB_WORDS else set())
-    return [(p, CMDB_WORDS[p]) for p in CMDB_WORDS if p in found], failing
+    found = ({r.last_error for r in failing} | ({status.problem} if status and status.problem in CMDB_WORDS else set())
+             | ({"cmdb_writeback_pending"} if stale else set()))
+    return [(p, CMDB_WORDS[p]) for p in CMDB_WORDS if p in found], failing, stale
 
 
 def rereview_page(request, principal, status=200, errors=()):
@@ -87,12 +94,12 @@ def rereview_page(request, principal, status=200, errors=()):
               "worked": _ago(now - s.last_ok_at) if s.last_ok_at else None,
               "stopped": s.last_ok_at is None or now - s.last_ok_at > dt.timedelta(seconds=3 * interval)}
              for name, s in sorted((kv for kv in sources.items() if kv[0] in PART_WORDS), key=lambda kv: list(PART_WORDS).index(kv[0]))]
-    cmdb, cmdb_failing = cmdb_problems(store, sources)
+    cmdb, cmdb_failing, writeback_stale = cmdb_problems(store, sources, now)
     runs = [{"repo": w.repo, "run_id": w.run_id, "age": _ago(now - w.updated_at), "rechecked": len(store.failed_runs(w.repo))}
             for w in store.rereview_watermarks()]
     return page(request, "admin_rereview.html", status, items=entries, errors=list(errors), stale_days=days,
                 stale_count=sum(1 for e in entries if e["stale"]), sources=sources, problem_words=PROBLEM_WORDS, parts=parts, runs=runs,
-                cmdb_problems=cmdb, cmdb_failing=cmdb_failing,
+                cmdb_problems=cmdb, cmdb_failing=cmdb_failing, writeback_stale=writeback_stale,
                 pending=len(store.pending_events()), skipped=sum(n for outcome, n in counts.items() if outcome not in ("event", "duplicate")),
                 outside=[o for o in observed.values() if o.schema == "intake/v1"], unreadable=[o for o in observed.values() if o.problem])
 

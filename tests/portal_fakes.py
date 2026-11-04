@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import jwt
+import yaml
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 
@@ -126,6 +127,8 @@ PERMISSION_RULES = (
     ("GET", rf"{REPO_PATH}/compare/.+", "contents", "read"),
     ("GET", rf"{REPO_PATH}/git/trees/[0-9a-f]{{40}}", "contents", "read"),
     ("PUT", rf"{REPO_PATH}/contents/.*", "contents", "write"),
+    ("DELETE", rf"{REPO_PATH}/contents/.*", "contents", "write"),  # a decommission's deletions, a resume's lifecycle.yaml (spec 2026-11-02)
+    ("PATCH", rf"{REPO_PATH}", "administration", "write"),  # the archive: the lifecycle App's only call, never the write App's (L9)
     ("POST", rf"{REPO_PATH}/git/refs", "contents", "write"),
     ("GET", rf"{REPO_PATH}/(pulls|pulls/\d+|pulls/\d+/files)", "pull_requests", "read"),
     ("POST", rf"{REPO_PATH}/pulls", "pull_requests", "write"),
@@ -140,6 +143,7 @@ PERMISSION_RULES = (
     ("GET", rf"{REPO_PATH}/actions/artifacts/\d+/zip", "actions", "read"),
     ("GET", rf"{REPO_PATH}/rulesets(/\d+)?", "administration", "read"),
 )
+LIFECYCLE_APP_ONLY = (("PATCH", rf"{REPO_PATH}"),)  # the rules the write App must never meet: only the lifecycle App archives (L9)
 
 
 class FakeGitHub:
@@ -226,6 +230,17 @@ def mock_cloudflare(email="owner@example.test", doc=None):
     return parse(doc)
 
 
+def mock_servicenow(org="acme", ci="notes", doc=None):
+    """The mock ServiceNow (mock_servicenow.json, or `doc`) for `org`, with hello-app's tasks naming `ci` instead (the portal fixture's app
+    is acme/notes), as mock_cloudflare swaps the policy's email."""
+    from portal.servicenow_mock import MOCK, parse
+    doc = json.loads(MOCK.read_text(encoding="utf-8")) if doc is None else doc
+    for task in doc["tasks"]:
+        if task["ci"] == "hello-app":
+            task["ci"] = ci
+    return parse(doc, org=org)
+
+
 def binding_request(store, people, now, repo="acme/notes", databricks=True, current=None, environment="test", identity=True,
                     secrets=(), mcp=(), skills=()):
     """A binding by owner (an admin of acme/notes as seeded) for one environment: sp-notes unless identity is False, wh-notes unless
@@ -269,7 +284,7 @@ def binding_request(store, people, now, repo="acme/notes", databricks=True, curr
 
 def writer_config(**changes):
     from portal.writer.config import WriterConfig
-    base = dict(org="acme", role_groups={"admin": frozenset({"golden-road-admins"})}, app_id=424242)
+    base = dict(org="acme", role_groups={"admin": frozenset({"golden-road-admins"})}, app_id=424242, write_login="golden-road-portal-writer[bot]")
     return WriterConfig(**{**base, **changes})
 
 
@@ -470,3 +485,344 @@ def zipped(entries) -> bytes:
         for name, data in entries.items():
             zf.writestr(name, data)
     return out.getvalue()
+
+
+# ---- lifecycle (spec 2026-11-02): a stateful GitHub, the deploy repo and factory it starts from, a lifecycle request ----
+
+class RepoWorld:
+    """A small stateful GitHub for the lifecycle flows (spec 2026-11-02 Testing): repos on main, branches, and commits that hold whole
+    trees ({path: bytes}). It answers the calls the writer makes: the repo, refs, the contents API (GET; PUT and DELETE, one commit
+    each), commits with their files, the Git Trees API, pull requests (list, create, read, files, merge, close, comment), check runs and
+    the workflow run behind each (every check passes unless `checks` says otherwise), and for the lifecycle App: a repo's installation,
+    its token and the archive. A person merges with merge(), pushes with push(), moves main with advance_main(). An unknown call fails.
+
+    Its answers have the shapes writer.run's checks read: a check run names its suite, head_sha and the one PR (_run_is_ours), the
+    suite's one workflow run is a pull_request run for the PR's branch and tip from the repo itself, and a commit names its one parent
+    and its files (_chain)."""
+
+    def __init__(self, api_host="api.github.com"):
+        self.api_host, self.hosts = api_host, {api_host}
+        self.repos, self.commits, self.pulls, self.trees = {}, {}, {}, {}
+        self.checks = {}  # (repo, check name) -> "success", "failure" or None (still running)
+        self.installed = {}  # repo -> the lifecycle App's installation id there
+        self.lifecycle_app_id = 424243  # the App whose JWT the installation and token calls need (lifecycle_app() signs as it)
+        self.archived = set()
+        self.lifecycle_token = "ghs_" + "L" * 36
+        self.token_requests = []
+        self.token_permissions = None  # what GitHub grants the token (None: what was asked)
+        self.revoked = set()  # tokens revoked with DELETE /installation/token
+        self.calls = []
+        self.comments = []  # (repo, number, body)
+        self.writer_login = "golden-road-portal-writer[bot]"  # who opens a PR through the API (the write App's bot)
+        self._n = 0
+
+    # ---- set up and act as people ----
+
+    def add_repo(self, repo, files=None):
+        self.repos[repo] = {"main": self._new_commit(dict(files or {}), None, [])}
+        return self.repos[repo]["main"]
+
+    def head(self, repo, branch="main"):
+        return self.repos[repo][branch]
+
+    def files(self, repo, ref="main"):
+        return dict(self.commits[self.repos[repo].get(ref, ref)]["tree"])
+
+    def push(self, repo, branch, path, content):
+        tree = self.files(repo, branch)
+        status = "modified" if path in tree else "added"
+        tree[path] = content
+        self.repos[repo][branch] = self._new_commit(tree, self.repos[repo][branch], [{"filename": path, "status": status}])
+
+    def advance_main(self, repo, path, content):
+        self.push(repo, "main", path, content)
+
+    def merge(self, repo, number):
+        """A person merges the PR (squash), as the review rule lets a code owner. The strict ruleset holds a person too: the PR must be
+        open and up to date with main (its base the current main), or GitHub refuses the merge."""
+        pull = self.pulls[(repo, number)]
+        if pull["state"] != "open" or pull["base_sha"] != self.repos[repo]["main"]:
+            raise AssertionError(f"GitHub refuses to merge #{number}: {'not open' if pull['state'] != 'open' else 'not up to date with main'}")
+        tree = self.files(repo, pull["head"]["ref"])
+        sha = self._new_commit(tree, self.repos[repo]["main"], self._diff(repo, pull))
+        self.repos[repo]["main"] = sha
+        pull.update(state="closed", merged=True, merge_commit_sha=sha, merged_at="2026-11-02T23:00:00Z", last_tip=self.repos[repo][pull["head"]["ref"]])
+        return sha
+
+    def pull(self, repo, number):
+        return self.pulls[(repo, number)]
+
+    def branches(self, repo):
+        return {name for name in self.repos[repo] if name != "main"}
+
+    # ---- the answers ----
+
+    def _new_commit(self, tree, parent, changed):
+        self._n += 1
+        sha = hashlib.sha1(f"commit {self._n}".encode()).hexdigest()
+        self.commits[sha] = {"tree": tree, "parent": parent, "files": changed}
+        return sha
+
+    def _ref(self, repo, ref):
+        return self.repos[repo].get(ref, ref if ref in self.commits else None)
+
+    def _diff(self, repo, pull):
+        base, head = self.files(repo, pull["base_sha"]), self.files(repo, pull["head"]["ref"])
+        out = [{"filename": p, "status": "added" if p not in base else "modified"} for p in sorted(head) if base.get(p) != head[p]]
+        return out + [{"filename": p, "status": "removed"} for p in sorted(set(base) - set(head))]
+
+    def _tree_sha(self, commit, prefix):
+        sha = hashlib.sha1(f"tree {commit} {prefix}".encode()).hexdigest()
+        self.trees[sha] = (commit, prefix)
+        return sha
+
+    def _tree(self, sha):
+        commit, prefix = (sha, "") if sha in self.commits else self.trees[sha]
+        entries, seen = [], set()
+        for path, content in sorted(self.commits[commit]["tree"].items()):
+            if prefix and not path.startswith(prefix + "/"):
+                continue
+            rest = path[len(prefix) + 1:] if prefix else path
+            head, _, tail = rest.partition("/")
+            if tail and head not in seen:
+                seen.add(head)
+                entries.append({"path": head, "mode": "040000", "type": "tree", "sha": self._tree_sha(commit, f"{prefix}/{head}".lstrip("/"))})
+            elif not tail:
+                entries.append({"path": head, "mode": "100644", "type": "blob", "sha": git_sha(content)})
+        return {"sha": sha, "truncated": False, "tree": entries}
+
+    def _as_lifecycle_app(self, request) -> bool:
+        """The call carries an RS256 App JWT issued by the lifecycle App (its signature is the real GitHub's to check)."""
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        try:
+            claims = jwt.decode(token, options={"verify_signature": False})
+            return jwt.get_unverified_header(token).get("alg") == "RS256" and claims.get("iss") == str(self.lifecycle_app_id)
+        except jwt.PyJWTError:
+            return False
+
+    def _pr_view(self, repo, pull):
+        # GitHub keeps a merged PR's head, and a PR's last head once its branch is deleted
+        tip = pull["last_tip"] if pull.get("merged") else self.repos[repo].get(pull["head"]["ref"], pull.get("last_tip"))
+        return {**{k: v for k, v in pull.items() if k not in ("base_sha", "last_tip")}, "head": {**pull["head"], "sha": tip, "repo": {"full_name": repo}},
+                "base": {"ref": "main", "sha": pull["base_sha"]},  # the base at the PR's last sync: the writer never updates it
+                "mergeable_state": "behind" if pull["base_sha"] != self.repos[repo]["main"] else "clean"}
+
+    def handle(self, request):
+        method, path, params = request.method, request.url.path, dict(request.url.params)
+        body = json.loads(request.content) if request.content else None
+        self.calls.append({"method": method, "path": path, "query": params, "body": body, "auth": request.headers.get("authorization", "")})
+        as_app = path.startswith("/app/") or path.endswith("/installation")
+        if as_app and not self._as_lifecycle_app(request):
+            return httpx.Response(401, json={"message": "A JSON web token could not be decoded"})
+        if method == "POST" and (m := re.fullmatch(r"/app/installations/(\d+)/access_tokens", path)):
+            self.token_requests.append((int(m.group(1)), body))
+            self.revoked.discard(self.lifecycle_token)
+            return httpx.Response(201, json={"token": self.lifecycle_token, "expires_at": "2026-11-03T00:00:00Z",
+                                             "permissions": self.token_permissions or (body or {}).get("permissions", {}),
+                                             "repository_selection": "selected",
+                                             "repositories": [{"name": n} for n in (body or {}).get("repositories", [])]})
+        if request.headers.get("authorization") in {f"Bearer {t}" for t in self.revoked}:
+            return httpx.Response(401, json={"message": "Bad credentials"})
+        if method == "DELETE" and path == "/installation/token":
+            if request.headers.get("authorization") != f"Bearer {self.lifecycle_token}":
+                return httpx.Response(401, json={"message": "Bad credentials"})
+            self.revoked.add(self.lifecycle_token)
+            return httpx.Response(204)
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)(/.*)?", path)
+        if m is None or m.group(1) not in self.repos and not path.endswith("/installation"):
+            return httpx.Response(404, json={"message": "Not Found"})
+        repo, rest = m.group(1), m.group(2) or ""
+        if rest == "/installation":
+            found = self.installed.get(repo)
+            return httpx.Response(200, json={"id": found}) if found else httpx.Response(404, json={"message": "Not Found"})
+        if rest == "" and method == "GET":
+            return httpx.Response(200, json={"full_name": repo, "default_branch": "main", "archived": repo in self.archived})
+        if rest == "" and method == "PATCH":
+            if request.headers.get("authorization") != f"Bearer {self.lifecycle_token}" or repo not in self.installed:
+                return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+            if body != {"archived": True}:
+                return httpx.Response(422, json={"message": "the fake archives only"})
+            self.archived.add(repo)
+            return httpx.Response(200, json={"full_name": repo, "archived": True})
+        if method == "GET" and (b := re.fullmatch(r"/git/ref/heads/(.+)", rest)):
+            sha = self.repos[repo].get(b.group(1))
+            return httpx.Response(200, json={"object": {"sha": sha}}) if sha else httpx.Response(404, json={"message": "Not Found"})
+        if method == "DELETE" and (b := re.fullmatch(r"/git/refs/heads/(.+)", rest)):
+            if b.group(1) == "main" or b.group(1) not in self.repos[repo]:
+                return httpx.Response(422, json={"message": "Reference does not exist"})
+            for (r, _), pull in self.pulls.items():
+                if r == repo and pull["head"]["ref"] == b.group(1) and not pull.get("merged"):
+                    pull["last_tip"] = self.repos[repo][b.group(1)]
+            del self.repos[repo][b.group(1)]
+            return httpx.Response(204)
+        if method == "POST" and rest == "/git/refs":
+            name = body["ref"].removeprefix("refs/heads/")
+            if name in self.repos[repo]:
+                return httpx.Response(422, json={"message": "Reference already exists"})
+            self.repos[repo][name] = body["sha"]
+            return httpx.Response(201, json={"ref": body["ref"]})
+        if method == "GET" and (t := re.fullmatch(r"/git/trees/([0-9a-f]{40})", rest)):
+            return httpx.Response(200, json=self._tree(t.group(1)))
+        if method == "GET" and (c := re.fullmatch(r"/commits/([0-9a-f]{40})", rest)):
+            commit = self.commits[c.group(1)]
+            return httpx.Response(200, json={"sha": c.group(1), "parents": [{"sha": commit["parent"]}] if commit["parent"] else [],
+                                             "files": commit["files"]})
+        if (f := re.fullmatch(r"/contents/(.+)", rest)):
+            file_path = f.group(1)
+            if method == "GET":
+                ref = self._ref(repo, params.get("ref", "main"))
+                tree = self.files(repo, ref) if ref is not None else {}
+                if file_path not in tree:
+                    return httpx.Response(404, json={"message": "Not Found"})
+                raw = tree[file_path]
+                return httpx.Response(200, json={"type": "file", "encoding": "base64", "sha": git_sha(raw), "content": base64.b64encode(raw).decode()})
+            branch = body["branch"]
+            tree = self.files(repo, branch)
+            if (body.get("sha") is not None) != (file_path in tree) or (file_path in tree and git_sha(tree[file_path]) != body.get("sha")):
+                return httpx.Response(409 if file_path in tree else 422, json={"message": "sha does not match"})
+            if method == "DELETE":
+                del tree[file_path]
+                status = "removed"
+            else:
+                status = "modified" if file_path in tree else "added"
+                tree[file_path] = base64.b64decode(body["content"])
+            sha = self._new_commit(tree, self.repos[repo][branch], [{"filename": file_path, "status": status}])
+            self.repos[repo][branch] = sha
+            return httpx.Response(200 if status != "added" else 201,
+                                  json={"commit": {"sha": sha}, "content": None if method == "DELETE" else {"sha": git_sha(tree[file_path])}})
+        if rest == "/pulls" and method == "GET":
+            head = params.get("head", "").split(":", 1)[-1]
+            # GitHub's list answers the pull-request-simple shape: merged_at and merge_commit_sha, but no "merged" (only GET /pulls/{n} has it)
+            return httpx.Response(200, json=[{k: v for k, v in self._pr_view(repo, p).items() if k != "merged"}
+                                             for (r, _), p in sorted(self.pulls.items()) if r == repo and p["head"]["ref"] == head])
+        if rest == "/pulls" and method == "POST":
+            number = 1 + max([n for (r, n) in self.pulls if r == repo], default=0)
+            self.pulls[(repo, number)] = {"number": number, "html_url": f"https://github.com/{repo}/pull/{number}", "state": "open", "merged": False,
+                                          "merged_at": None, "merge_commit_sha": None,
+                                          "title": body["title"], "body": body["body"], "head": {"ref": body["head"]}, "base_sha": self.repos[repo]["main"],
+                                          "user": {"login": self.writer_login, "type": "Bot"}}
+            return httpx.Response(201, json=self._pr_view(repo, self.pulls[(repo, number)]))
+        if (p := re.fullmatch(r"/pulls/(\d+)(/files|/merge)?", rest)):
+            pull = self.pulls[(repo, int(p.group(1)))]
+            if p.group(2) == "/files":
+                return httpx.Response(200, json=self._diff(repo, pull))
+            if p.group(2) == "/merge":
+                if pull["state"] != "open" or pull["base_sha"] != self.repos[repo]["main"]:
+                    return httpx.Response(405, json={"message": "Pull Request is not mergeable"})
+                if body.get("sha") != self.repos[repo][pull["head"]["ref"]]:
+                    return httpx.Response(409, json={"message": "Head branch was modified"})
+                return httpx.Response(200, json={"sha": self.merge(repo, pull["number"]), "merged": True})
+            if method == "PATCH":
+                if pull["merged"] and "state" in body:
+                    return httpx.Response(422, json={"message": "a merged pull request can't be closed or reopened"})
+                pull.update({k: v for k, v in body.items() if k in ("state", "body")})
+                return httpx.Response(200, json=self._pr_view(repo, pull))
+            return httpx.Response(200, json=self._pr_view(repo, pull))
+        if method == "POST" and (i := re.fullmatch(r"/issues/(\d+)/comments", rest)):
+            self.comments.append((repo, int(i.group(1)), (body or {}).get("body")))
+            return httpx.Response(201, json={})
+        if method == "GET" and (k := re.fullmatch(r"/commits/([0-9a-f]{40})/check-runs", rest)):
+            sha, name = k.group(1), params.get("check_name")
+            runs = []
+            for (r, n), pull in sorted(self.pulls.items()):
+                if r == repo and pull["state"] == "open" and self.repos[repo].get(pull["head"]["ref"]) == sha:
+                    conclusion = self.checks.get((repo, name), "success")
+                    runs.append({"id": 9000 + n, "name": name, "head_sha": sha, "status": "completed" if conclusion else "in_progress",
+                                 "conclusion": conclusion, "app": {"id": 15368}, "check_suite": {"id": 5000 + n},
+                                 "pull_requests": [{"number": n, "base": {"ref": "main"}}]})
+            return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
+        if method == "GET" and rest == "/actions/runs":
+            n = int(params["check_suite_id"]) - 5000
+            pull = self.pulls[(repo, n)]
+            return httpx.Response(200, json={"workflow_runs": [{"check_suite_id": 5000 + n, "event": "pull_request",
+                                                                "head_repository": {"full_name": repo}, "head_branch": pull["head"]["ref"],
+                                                                "head_sha": self.repos[repo][pull["head"]["ref"]],
+                                                                "pull_requests": [{"number": n, "base": {"ref": "main"}}]}]})
+        raise AssertionError(f"RepoWorld has no answer for {method} {path}")
+
+
+def INTAKE_V2(repo):  # noqa: N802 - a fixture's bytes, as the writer wrote them at the registration
+    from portal.writer.render import intake_yaml
+    record = {"schema": "intake/v2", "repo": repo, "tier": "moderate", "purpose": "Stores short team notes; no email, no files.",
+              "owner": "p_" + "a" * 32, "data_classification": "public", "registered_by": "p_" + "a" * 32, "approved_by": "p_" + "b" * 32,
+              "approved_at": "2026-10-23T12:00:00Z", "approval_justification": "Purpose and classification checked.",
+              "review_by": "2027-10-23", "request": "r_" + "c" * 32}
+    return intake_yaml(record, "r_" + "c" * 32).encode()
+
+
+def adapter_yaml(adapter_dir, d, namespace, org="acme"):
+    """An environment's adapter as golden_road.deploy.adapters writes it (the portal can't import it): the Flux Kustomization names
+    ./<d>, the Argo CD Application <d>."""
+    from portal.writer.allowlist import adapter_name
+    owner, name, env = d.split("/")[1:]
+    meta = {"name": adapter_name(owner, name, env)}
+    if adapter_dir == "clusters/home/flux":
+        doc = {"apiVersion": "kustomize.toolkit.fluxcd.io/v1", "kind": "Kustomization", "metadata": {**meta, "namespace": "flux-system"},
+               "spec": {"suspend": True, "interval": "10m", "path": f"./{d}", "prune": True,
+                        "sourceRef": {"kind": "GitRepository", "name": "golden-road-deploy"}, "targetNamespace": namespace}}
+    else:
+        doc = {"apiVersion": "argoproj.io/v1alpha1", "kind": "Application", "metadata": {**meta, "namespace": "argocd"},
+               "spec": {"project": "default", "source": {"repoURL": f"https://github.com/{org}/golden-road-deploy", "targetRevision": "main",
+                                                          "path": d},
+                        "destination": {"server": "https://kubernetes.default.svc", "namespace": namespace}}}
+    return (f"# Generated by golden-road compose; deploy-check fails on any edit. The adapter for {d}.\n"
+            + yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)).encode()
+
+
+def deploy_world(world, *, org="acme", repo="acme/notes", environments=("test", "prod"), lifecycle=None, bindings=None, manifests=None,
+                 image="ghcr.io/acme/notes@sha256:" + "b" * 64, intake=None):  # the fixture manifests' image
+    """golden-road-deploy as bump and the writer leave it: each environment's release.yaml, base/manifests.yaml, bindings.yaml (`bindings`:
+    {env: bytes}), lifecycle.yaml (`lifecycle`: {env: bytes}), composed.yaml (the portal's compose of them) and kustomization.yaml, and
+    its two adapters; and the factory with `repo`'s intake record (INTAKE_V2, or `intake`'s bytes). Returns (deploy repo, factory repo)."""
+    from portal.compose import kustomization
+    from portal.writer.allowlist import adapter_name
+    from portal.writer.run import compose_bytes
+    manifests = manifests or (FIXTURES / "deploy/manifests.yaml").read_bytes()
+    owner, name = repo.split("/")
+    files = {"clusters/home/flux/gitrepository.yaml": b"# the Flux source\n", "apps/.gitkeep": b""}
+    for env in environments:
+        d = f"apps/{owner}/{name}/{env}"
+        release = {"schema": "deploy-release/v1", "repo": repo, "environment": env, "namespace": f"{name.lower()}-{env}",
+                   "release": f"{env}-20261029120000-abcdef1", "image": image, "manifests_sha256": hashlib.sha256(manifests).hexdigest(),
+                   "gate_record_sha256": "c" * 64}
+        files[f"{d}/release.yaml"] = yaml.safe_dump(release, sort_keys=False).encode()
+        files[f"{d}/base/manifests.yaml"] = manifests
+        files[f"{d}/kustomization.yaml"] = kustomization(f"{name.lower()}-{env}").encode()
+        binding = (bindings or {}).get(env)
+        life = (lifecycle or {}).get(env)
+        if binding is not None:
+            files[f"{d}/bindings.yaml"] = binding
+        if life is not None:
+            files[f"{d}/lifecycle.yaml"] = life
+        files[f"{d}/composed.yaml"] = compose_bytes(repo, env, files[f"{d}/release.yaml"], manifests, binding, None, life)
+        for adapters in ("clusters/home/flux", "clusters/office/argo"):
+            files[f"{adapters}/{adapter_name(owner, name, env)}.yaml"] = adapter_yaml(adapters, d, f"{name.lower()}-{env}", org)
+    deploy, factory = f"{org}/golden-road-deploy", f"{org}/scorecard-factory"
+    world.add_repo(deploy, files)
+    world.add_repo(factory, {f"intake/{repo}.yaml": INTAKE_V2(repo) if intake is None else intake})
+    world.add_repo(repo, {"README.md": b"# app\n"})
+    return deploy, factory
+
+
+LIFECYCLE_KEY = None  # one RSA key for every lifecycle App in a run (a fresh key per run: none is committed)
+
+
+def lifecycle_app(world, app_id=None):
+    """The real lifecycle App (writer.config.LifecycleApp) talking to `world`."""
+    from portal.writer.config import LifecycleApp
+    global LIFECYCLE_KEY
+    LIFECYCLE_KEY = LIFECYCLE_KEY or pem(new_rsa_key())
+    return LifecycleApp(app_id or world.lifecycle_app_id, LIFECYCLE_KEY, "https://api.github.com", httpx.Client(transport=transport(world)))
+
+
+LIFECYCLE_REASON = "Critical vulnerability CVE-2026-0001; suspended until patched"
+
+
+def lifecycle_request(store, people, now, action="suspend", repo="acme/notes", task="SCTASK0010001", claim=True):
+    """A lifecycle request by admin, as the web makes it after the task check (the mock's SCTASK0010001 sys_id), claimed by the writer."""
+    from portal.ids import new_id
+    req = store.create_lifecycle(request_id=new_id("r"), person_id=people["admin"].id, repo=repo, now=now,
+                                 final={"action": action, "task": task, "task_sys_id": "5ca1ab1e000040008000000000010001",
+                                        "reason": LIFECYCLE_REASON},
+                                 note=f"Requested in the golden road portal by Admin: {action} the app.")
+    return store.claim_approved(now=now) if claim else req

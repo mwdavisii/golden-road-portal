@@ -2,15 +2,26 @@
 connections (its Azure identity and Databricks connection) in golden-road-deploy, with the composed.yaml that golden-road compose
 makes from them (spec 2026-10-29 GitOps deploy repo, G9 and correction 3). Only those files, for the request's own repo and
 environment; never release.yaml, kustomization.yaml, base/ or the adapters under clusters/, which come from bump.yml. A binding
-with MCP servers also has its cloudflare-access.yaml, the desired state compose makes from its mcp (spec 2026-10-31 M6)."""
+with MCP servers also has its cloudflare-access.yaml, the desired state compose makes from its mcp (spec 2026-10-31 M6).
+
+A lifecycle request (spec 2026-11-02) writes a suspend's lifecycle.yaml and composed.yaml (resume deletes lifecycle.yaml), deletes a
+decommissioned app's directory and adapters, and adds the decommissioned key to its intake record: lifecycle_path_allowed."""
 
 import dataclasses as dc
+import hashlib
 import re
 
 INTAKE = re.compile(r"intake/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.yaml")
 DEPLOY_BINDING = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/bindings\.yaml")
 COMPOSED = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/composed\.yaml")
 CLOUDFLARE_ACCESS = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/cloudflare-access\.yaml")
+LIFECYCLE = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/lifecycle\.yaml")
+# A decommission deletes every file of its app's directory (golden_road.deploy.ALLOWED) and each environment's two adapters.
+APP_FILE = re.compile(r"apps/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(test|prod)/(release\.yaml|bindings\.yaml|lifecycle\.yaml|composed\.yaml"
+                      r"|kustomization\.yaml|cloudflare-access\.yaml|base/manifests\.yaml)")
+ADAPTER_DIRS = ("clusters/home/flux", "clusters/office/argo")
+NAMESPACE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+LIFECYCLE_WRITER_MERGES = ("suspend", "resume")  # L5: the one prod change the writer merges itself, inside writer.lifecycle.l5_problems
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ENVIRONMENTS = ("test", "prod")
 # A binding for one of these is opened and checked by the writer but merged by a person, through main-review (code-owner review of
@@ -20,10 +31,14 @@ FACTORY, DEPLOY = "scorecard-factory", "golden-road-deploy"
 ALLOWED_PATHS = ("intake/<owner>/<repo>.yaml in <org>/scorecard-factory",
                  "apps/<owner>/<repo>/<test|prod>/bindings.yaml in <org>/golden-road-deploy",
                  "apps/<owner>/<repo>/<test|prod>/composed.yaml in <org>/golden-road-deploy",
-                 "apps/<owner>/<repo>/<test|prod>/cloudflare-access.yaml in <org>/golden-road-deploy")
+                 "apps/<owner>/<repo>/<test|prod>/cloudflare-access.yaml in <org>/golden-road-deploy",
+                 "apps/<owner>/<repo>/<test|prod>/lifecycle.yaml in <org>/golden-road-deploy (a lifecycle suspend; resume deletes it)",
+                 "apps/<owner>/<repo>/ and its environments' adapters under clusters/ in <org>/golden-road-deploy, deleted (a decommission only)",
+                 "intake/<owner>/<repo>.yaml's decommissioned key in <org>/scorecard-factory (a decommission only)")
 KINDS = {"registration": (FACTORY, "intake.v2"), "binding": (DEPLOY, "binding.v2")}
 COMPOSED_SCHEMA = "composed"  # not a JSON schema: the file is golden-road compose's output, checked byte for byte by deploy-check
 ACCESS_SCHEMA = "cloudflare-access"  # compose's cloudflare_access output (cloudflare-access/v1), checked byte for byte by deploy-check
+LIFECYCLE_SCHEMA = "lifecycle.v1"
 
 
 @dc.dataclass(frozen=True)
@@ -52,7 +67,7 @@ def allowed(org: str, repo: str, path: str) -> str | None:
     if repo == f"{org}/{FACTORY}":
         rules = ((INTAKE, "intake.v2"),)
     elif repo == f"{org}/{DEPLOY}":
-        rules = ((DEPLOY_BINDING, "binding.v2"), (COMPOSED, COMPOSED_SCHEMA), (CLOUDFLARE_ACCESS, ACCESS_SCHEMA))
+        rules = ((DEPLOY_BINDING, "binding.v2"), (COMPOSED, COMPOSED_SCHEMA), (CLOUDFLARE_ACCESS, ACCESS_SCHEMA), (LIFECYCLE, LIFECYCLE_SCHEMA))
     else:
         return None
     for pattern, schema in rules:
@@ -91,3 +106,43 @@ def target_for(org: str, request) -> Target | None:
     d = environment_dir(request.repo, environment)
     return Target(f"{org}/{DEPLOY}", f"{d}/bindings.yaml", "binding.v2", also=f"{d}/composed.yaml", environment=environment,
                   access=f"{d}/cloudflare-access.yaml")
+
+
+def adapter_name(owner: str, repo: str, environment: str) -> str | None:
+    """golden_road.deploy.adapter_name, which the portal can't import (tests/pipeline/test_portal_lifecycle_parity.py holds them equal):
+    <owner>-<repo>-<env> lowercased with . and _ as -, cut to 56 and a 6-hex digest past 63. None for a name that isn't a DNS label."""
+    full = re.sub(r"[._]", "-", f"{owner}-{repo}-{environment}".lower())
+    if len(full) > 63:
+        digest = hashlib.sha256(f"{owner}/{repo}/{environment}".encode("utf-8")).hexdigest()[:6]
+        full = f"{full[:56].rstrip('-')}-{digest}"
+    return full if NAMESPACE.fullmatch(full) else None
+
+
+def lifecycle_merges(action: str, step: str) -> bool:
+    """Only a suspend's or resume's deploy PR is merged by the writer (after L5); a decommission's PRs wait for a person."""
+    return action in LIFECYCLE_WRITER_MERGES and step == "deploy"
+
+
+def _ours(match, owner, name) -> bool:
+    return bool(match) and _clean(match) and (match.group(1), match.group(2)) == (owner, name)
+
+
+def lifecycle_path_allowed(org: str, target_repo: str, path: str, app_repo: str, action: str, step: str) -> bool:
+    """Whether a lifecycle step may change `path` in `target_repo` for `app_repo` (the request's stored repo). A suspend or resume: its
+    app's lifecycle.yaml and composed.yaml in the deploy repo. A decommission's deploy step: any file of its app's directory, and the
+    two adapters of each of its environments. Its factory step: the app's intake record. The archive step writes no file."""
+    if not REPO.fullmatch(app_repo) or {".", ".."} & set(app_repo.split("/")):
+        return False
+    owner, name = app_repo.split("/")
+    if step == "factory":
+        return action == "decommission" and target_repo == factory(org) and path == intake_path(app_repo)
+    if step != "deploy" or target_repo != f"{org}/{DEPLOY}":
+        return False
+    if action in ("suspend", "resume"):
+        return _ours(LIFECYCLE.fullmatch(path) or COMPOSED.fullmatch(path), owner, name)
+    if action != "decommission":
+        return False
+    if path.startswith("apps/"):
+        return _ours(APP_FILE.fullmatch(path), owner, name)
+    names = {adapter_name(owner, name, env) for env in ENVIRONMENTS} - {None}
+    return any(path == f"{d}/{n}.yaml" for d in ADAPTER_DIRS for n in names)

@@ -85,3 +85,11 @@ def test_the_chips_filter_every_state(portal, value, shown):
 
 def test_the_requests_table_centres_its_cells(portal):
     assert '<table class="requests">' in portal.client("owner").get("/requests").text
+
+
+def test_an_admin_s_lifecycle_request_is_listed_by_its_action(portal):
+    """Spec 2026-11-02 "Requests": the kind reads Lifecycle (the action), and the row links the request page."""
+    from portal_fakes import lifecycle_request
+    req = lifecycle_request(portal.store, portal.people, portal.clock(), claim=False)
+    text = portal.client("admin").get("/requests").text
+    assert f'<a href="/requests/{req.id}">acme/notes</a>' in text and "<td>Lifecycle (suspend)</td>" in text

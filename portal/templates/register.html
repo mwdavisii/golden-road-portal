@@ -55,7 +55,7 @@
 <p class="hint">The platform computes a minimum tier and classification from the repo; an admin decides.</p>
 {{ ownership_notice(settings.org_name, settings.lifecycle_grace_days) }}
 <p class="field acknowledge"><label><input type="checkbox" name="ownership_acknowledged" value="yes" required{% if form.get("ownership_acknowledged") == "yes" %} checked{% endif %}> I understand what owning this app means</label></p>
-<p class="actions"><button class="gold" type="submit">Submit for review</button></p>
+{% if not decommissioned %}<p class="actions"><button class="gold" type="submit">Submit for review</button></p>{% endif %}
 </form>
 </section>
 {% endif %}

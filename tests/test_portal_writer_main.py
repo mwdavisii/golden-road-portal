@@ -240,3 +240,85 @@ def test_the_writer_loads_the_mock_skills_catalog_when_asked(tmp_path, monkeypat
 def test_a_bad_mcp_or_skills_setting_stops_the_writer_with_its_name(portal, tmp_path, env, name):
     code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
     assert code == 2 and name in err and next(iter(env.values())) not in err
+
+
+# ---- the lifecycle App (spec 2026-11-02 L9): its key in the writer's Secret only, optional ----
+
+def lifecycle_env(tmp_path, key=None, app_id="424243"):
+    path = tmp_path / "lifecycle-app.pem"
+    path.write_bytes(key if key is not None else pem(new_rsa_key()))
+    return {"PORTAL_LIFECYCLE_APP_ID": app_id, "PORTAL_LIFECYCLE_APP_KEY_FILE": str(path)}
+
+
+def test_the_writer_loads_the_lifecycle_app_when_both_settings_are_set(tmp_path):
+    assert load_with(tmp_path).lifecycle_app is None, "no lifecycle App: a decommission is refused, suspend and resume go on"
+    assert load_with(tmp_path, PORTAL_LIFECYCLE_APP_ID="", PORTAL_LIFECYCLE_APP_KEY_FILE="").lifecycle_app is None
+    env = lifecycle_env(tmp_path)
+    app = load_with(tmp_path, **env).lifecycle_app
+    assert (app.app_id, app.api) == (424243, "https://api.github.com")
+    assert app.key == (tmp_path / "lifecycle-app.pem").read_bytes()
+    assert load_with(tmp_path, PORTAL_GITHUB_HOST="ghe.example.test", **env).lifecycle_app.api == "https://ghe.example.test/api/v3"
+
+
+def test_the_writer_starts_with_the_lifecycle_app_and_gives_it_its_client(portal, tmp_path, monkeypatch):
+    from portal.writer import __main__ as writer_main
+    seen = []
+    monkeypatch.setattr(writer_main, "run_once", lambda store, gh, cfg, now: seen.append(cfg) or [])
+    code, err = run(tmp_path, good_github(), portal.store, env=lifecycle_env(tmp_path))
+    assert code == 0 and seen[0].lifecycle_app.app_id == 424243 and seen[0].lifecycle_app.http is not None
+    assert "BEGIN" not in err and "PRIVATE KEY" not in err
+
+
+@pytest.mark.parametrize("drop", ["PORTAL_LIFECYCLE_APP_ID", "PORTAL_LIFECYCLE_APP_KEY_FILE"])
+def test_one_lifecycle_setting_without_the_other_stops_the_writer(portal, tmp_path, drop):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env={**lifecycle_env(tmp_path), drop: ""})
+    assert code == 2 and "PORTAL_LIFECYCLE_APP_ID and PORTAL_LIFECYCLE_APP_KEY_FILE are set together, or neither" in err
+
+
+def test_a_bad_lifecycle_app_id_stops_the_writer(portal, tmp_path):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=lifecycle_env(tmp_path, app_id="x"))
+    assert code == 2 and "PORTAL_LIFECYCLE_APP_ID" in err
+
+
+def ec_key():
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+
+
+@pytest.mark.parametrize("key", [b"not a key", b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", "ec"])
+def test_a_lifecycle_key_that_is_not_an_rsa_key_stops_the_writer_without_the_key(portal, tmp_path, key):
+    raw = ec_key() if key == "ec" else key
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=lifecycle_env(tmp_path, key=raw))
+    assert code == 2 and "PORTAL_LIFECYCLE_APP_KEY_FILE" in err and "PORTAL_WRITE_APP_KEY_FILE" not in err and "Traceback" not in err
+    assert "AAAA" not in err and "not a key" not in err and "BEGIN" not in err
+
+
+def test_an_unreadable_lifecycle_key_file_stops_the_writer(portal, tmp_path):
+    env = {**lifecycle_env(tmp_path), "PORTAL_LIFECYCLE_APP_KEY_FILE": str(tmp_path / "missing.pem")}
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
+    assert code == 2 and "PORTAL_LIFECYCLE_APP_KEY_FILE can't be read" in err
+
+
+def test_the_writer_learns_its_bot_login_from_the_installation(portal, tmp_path, monkeypatch):
+    from portal.writer import __main__ as writer_main
+    seen = []
+    monkeypatch.setattr(writer_main, "run_once", lambda store, gh, cfg, now: seen.append(cfg) or [])
+    code, _ = run(tmp_path, good_github(), portal.store)
+    assert code == 0 and seen[0].write_login == "golden-road-portal-writer[bot]"
+
+
+@pytest.mark.parametrize("edit", [lambda d: d.pop("app_slug"), lambda d: d.update(app_id=1), lambda d: d.update(app_slug="Not A Slug")])
+def test_an_installation_that_does_not_name_the_write_app_stops_the_writer(portal, tmp_path, edit):
+    gh = good_github()
+    doc = gh.fixture("installation")
+    edit(doc)
+    gh.routes[("GET", "api.github.com", "/app/installations/777")] = [(200, doc)]
+    req = approved_request(portal.store, portal.people, T0)
+    code, err = run(tmp_path, gh, portal.store)
+    assert code == 3 and "refusing to start" in err and portal.store.get_request(req.id).state == "writing"
+
+
+def test_a_lifecycle_app_that_is_the_write_app_stops_the_writer(portal, tmp_path):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=lifecycle_env(tmp_path, app_id="424242"))
+    assert code == 2 and "PORTAL_LIFECYCLE_APP_ID must be another App than PORTAL_WRITE_APP_ID" in err

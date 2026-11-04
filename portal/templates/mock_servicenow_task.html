@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Mock ServiceNow task {{ task.number }} - golden road{% endblock %}
+{% block main %}
+<span class="eyebrow">Mock ServiceNow task</span>
+<div class="card-head"><h1 class="mono">{{ task.number }}</h1><span class="badge">{% if task.open %}Open{% else %}Closed Complete{% endif %}</span></div>
+<p class="callout info">This is the mock ServiceNow's task, rebuilt from the notes the collector sent.</p>
+<dl class="facts">
+<div><dt>Short description</dt><dd>{{ task.short_description }}</dd></div>
+<div><dt>Configuration item</dt><dd class="mono">{{ task.ci }}</dd></div>
+</dl>
+<section aria-labelledby="history-title">
+<h2 id="history-title">History</h2>
+{% if history %}
+<ol class="task-history">
+{% for kind, text in history %}<li><h3>{% if kind == "closed" %}Close notes{% else %}Work note{% endif %}</h3><pre class="prose">{{ text }}</pre></li>
+{% endfor %}
+</ol>
+{% else %}<p class="empty">No work notes yet.</p>{% endif %}
+</section>
+{% endblock %}

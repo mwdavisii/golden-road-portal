@@ -1,11 +1,13 @@
 """`python -m portal.writer [--once]`: the only process that writes to git (P17). It checks the write App's bypass at startup and
 refuses to run if it covers more than the plan allows, and checks it again at the start of every pass, writing nothing in a pass
 whose check finds a problem. Then it claims approved requests, writes, opens PRs and merges after checks. It holds the write
-App's key and prints neither it nor any token.
+App's key. It also holds the lifecycle App's key (spec 2026-11-02 L9; optional: without it, a decommission is refused), and prints
+neither key nor any token.
 
 Exit codes: 0 after `--once`, 2 for a missing or bad setting or key, 3 for a refusal to start (the bypass check found a problem)."""
 
 import argparse
+import dataclasses as dc
 import datetime as dt
 import os
 import re
@@ -21,8 +23,8 @@ from ..github.appauth import InstallationToken, app_jwt
 from ..github.client import GitHub
 from ..settings import (ORG, SettingsError, cloudflare_from, github_bases, mcp_gateways_from, no_cloudflare_account, no_secret_server_url,
                         parse_role_groups, skills_catalog_from)
-from .bypass import check_bypass
-from .config import WriterConfig
+from .bypass import check_bypass, write_login
+from .config import LifecycleApp, WriterConfig
 from .run import run_once
 
 CHECK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/-]{0,99}")
@@ -53,18 +55,29 @@ def _int(env, name, low=1, high=2**53, default=None):
     return value
 
 
-def _key(path: str) -> bytes:
+def _key(path: str, name: str = "PORTAL_WRITE_APP_KEY_FILE") -> bytes:
     try:
         raw = Path(path).read_bytes()
     except OSError:
-        raise SettingsError("PORTAL_WRITE_APP_KEY_FILE can't be read") from None
+        raise SettingsError(f"{name} can't be read") from None
     try:
         loaded = load_pem_private_key(raw, password=None)
     except (ValueError, TypeError):  # never the file's text, whatever the library says
-        raise SettingsError("PORTAL_WRITE_APP_KEY_FILE does not hold a usable PEM private key") from None
+        raise SettingsError(f"{name} does not hold a usable PEM private key") from None
     if not isinstance(loaded, rsa.RSAPrivateKey):
-        raise SettingsError("PORTAL_WRITE_APP_KEY_FILE must hold an RSA private key (a GitHub App's)") from None
+        raise SettingsError(f"{name} must hold an RSA private key (a GitHub App's)") from None
     return raw
+
+
+def _lifecycle_app(env, api):
+    """PORTAL_LIFECYCLE_APP_ID and PORTAL_LIFECYCLE_APP_KEY_FILE (spec 2026-11-02 L9): both set, or neither (no lifecycle App: a
+    decommission is refused, suspend and resume go on). main gives it the writer's HTTP client."""
+    app_id, path = env.get("PORTAL_LIFECYCLE_APP_ID", ""), env.get("PORTAL_LIFECYCLE_APP_KEY_FILE", "")
+    if not app_id and not path:
+        return None
+    if not app_id or not path:
+        raise SettingsError("PORTAL_LIFECYCLE_APP_ID and PORTAL_LIFECYCLE_APP_KEY_FILE are set together, or neither")
+    return LifecycleApp(_int(env, "PORTAL_LIFECYCLE_APP_ID"), _key(path, "PORTAL_LIFECYCLE_APP_KEY_FILE"), api)
 
 
 def _check_list(env, name, required) -> tuple[str, ...]:
@@ -135,11 +148,15 @@ def _load(env):
     key = _key(_need(env, "PORTAL_WRITE_APP_KEY_FILE"))
     stale = dt.timedelta(seconds=_int(env, "PORTAL_REPO_ADMINS_STALE_AFTER", 60, 7 * 86400, default=600))  # the web's limit and default
     cloudflare, gateways = _cloudflare(env)
+    api = github_bases(host)[1]
     cfg = WriterConfig(org=org, role_groups=role_groups, app_id=app_id, factory_checks=_checks(env), deploy_checks=_deploy_checks(env),
                        directory=_directory(env), secret_server=_secret_server(env),
                        repo_admins_stale_after=stale, cloudflare=cloudflare, mcp_gateways=gateways,
-                       skills_catalog=skills_catalog_from(env.get("PORTAL_SKILLS_CATALOG", "")))
-    return cfg, key, installation, github_bases(host)[1], url, interval
+                       skills_catalog=skills_catalog_from(env.get("PORTAL_SKILLS_CATALOG", "")),
+                       lifecycle_app=_lifecycle_app(env, api))
+    if cfg.lifecycle_app is not None and cfg.lifecycle_app.app_id == app_id:
+        raise SettingsError("PORTAL_LIFECYCLE_APP_ID must be another App than PORTAL_WRITE_APP_ID: the write App never archives")
+    return cfg, key, installation, api, url, interval
 
 
 def main(argv=None, env=os.environ, *, http=None, store=None, sleep=time.sleep, clock=lambda: dt.datetime.now(dt.UTC)) -> int:
@@ -152,6 +169,8 @@ def main(argv=None, env=os.environ, *, http=None, store=None, sleep=time.sleep, 
         _say(str(exc))
         return BAD_SETTING
     http = http or httpx.Client(timeout=30)
+    if cfg.lifecycle_app is not None:
+        cfg = dc.replace(cfg, lifecycle_app=dc.replace(cfg.lifecycle_app, http=http))
     as_app = GitHub(api, http, lambda: app_jwt(cfg.app_id, key, int(time.time())))
     as_installation = GitHub(api, http, InstallationToken(http, api, cfg.app_id, key, installation))
     if store is None:
@@ -159,6 +178,11 @@ def main(argv=None, env=os.environ, *, http=None, store=None, sleep=time.sleep, 
         store = PostgresStore(url)
     first = True
     try:
+        login = write_login(as_app, installation, cfg)
+        if login is None:
+            _say("refusing to start: the write App's installation doesn't name the App (its app_id and app_slug can't be read)")
+            return REFUSED
+        cfg = dc.replace(cfg, write_login=login)
         while True:
             problems = check_bypass(as_app, as_installation, installation, cfg)
             if problems and first:

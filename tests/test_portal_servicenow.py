@@ -6,7 +6,8 @@ import json
 import httpx
 import pytest
 
-from portal.servicenow import CLASS, DATA_SOURCE, Client, ServiceNowError
+from portal.servicenow import CLASS, DATA_SOURCE, GOLDEN_ROAD_STATES, LIFECYCLE_FIELDS, MAX_ANSWER, UNEXPECTED, Client, ServiceNowError, Task
+from portal.store.base import LIFECYCLE_STATES
 
 BASE = "https://instance.service-now.example"
 VALUES = {"name": "acme/notes", "short_description": "Stores team notes.", "owned_by": "a" * 32, "u_tier": "low",
@@ -40,7 +41,7 @@ def test_none_or_two_users_is_no_owner(result):
 
 
 @pytest.mark.parametrize("email", ["a@example.test^ORemail=b@example.test", "a@example.test,b@example.test", "a b@example.test",
-                                   "a@example.test\n", "nobody", "", None, "a@b@example.test", "a​@example.test",
+                                   "a@example.test\n", "nobody", "", None, "a@b@example.test", "a\u200b@example.test",
                                    "javascript:'victim'+String.fromCharCode(64)+'example.org'//@x.io", "JavaScript%3Ax@x.io",
                                    '"quoted"@example.test', "a(comment)@example.test", "a:b@example.test", "ü@example.test",
                                    "a@exa_mple.test"])
@@ -174,3 +175,172 @@ def test_the_client_closes_its_http_client():
     with Client(BASE, http=http, auth=("u", "p")):
         pass
     assert http.is_closed
+
+
+TASK_ROW = {"sys_id": "5ca1ab1e000040008000000000010001", "number": "SCTASK0010001", "state": "1",
+            "cmdb_ci": {"link": f"{BASE}/api/now/table/cmdb_ci/{'c' * 32}", "value": "c" * 32}}
+
+
+def test_a_task_is_read_by_number_with_its_ci():
+    seen = []
+    c = client({("GET", "/api/now/table/sc_task"): (200, {"result": [TASK_ROW]})}, seen)
+    assert c.task("SCTASK0010001") == Task("5ca1ab1e000040008000000000010001", "SCTASK0010001", "1", "c" * 32)
+    assert seen[0][2] == {"sysparm_query": "number=SCTASK0010001", "sysparm_fields": "sys_id,number,state,cmdb_ci", "sysparm_limit": "1"}
+    assert c.task("SCTASK0010001").open
+
+
+@pytest.mark.parametrize("state, open_", [("1", True), ("2", True), ("3", False), ("4", False), ("7", False)])
+def test_open_is_state_1_or_2(state, open_):
+    assert Task("a" * 32, "SCTASK0010001", state, None).open is open_
+
+
+def test_no_task_and_no_ci():
+    assert client({("GET", "/api/now/table/sc_task"): (200, {"result": []})}, []).task("SCTASK0010009") is None
+    row = {**TASK_ROW, "cmdb_ci": ""}
+    assert client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).task("SCTASK0010001").ci is None
+
+
+@pytest.mark.parametrize("number", ["SCTASK1", "SCTASK0010001^ORnumber=SCTASK0010002", "sctask0010001", "INC0010001"])
+def test_a_bad_task_number_is_never_sent(number):
+    seen = []
+    with pytest.raises(ServiceNowError):
+        client({}, seen).task(number)
+    assert seen == []
+
+
+@pytest.mark.parametrize("row", [{**TASK_ROW, "number": "SCTASK0010002"}, {**TASK_ROW, "sys_id": "x"}, {**TASK_ROW, "state": 3},
+                                 {**TASK_ROW, "cmdb_ci": {"value": "C" * 32}}])
+def test_a_task_answer_of_the_wrong_shape_is_an_error(row):
+    with pytest.raises(ServiceNowError):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).task("SCTASK0010001")
+
+
+def test_a_work_note_and_the_close_are_patches_of_the_task():
+    seen, sys_id = [], TASK_ROW["sys_id"]
+    path = f"/api/now/table/sc_task/{sys_id}"
+    c = client({("PATCH", path): (200, {"result": {"sys_id": sys_id, "number": "SCTASK0010001"}})}, seen)
+    c.add_work_note(sys_id, "Pull request #7 opened.")
+    c.close_task(sys_id, "Applied in git.")
+    assert [(m, p, json.loads(b)) for m, p, _, b, _auth in seen] == [
+        ("PATCH", path, {"work_notes": "Pull request #7 opened."}), ("PATCH", path, {"state": "3", "close_notes": "Applied in git."})]
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 500, 503])
+def test_a_refused_patch_is_an_error(status):
+    sys_id = TASK_ROW["sys_id"]
+    with pytest.raises(ServiceNowError, match=f"ServiceNow answered {status} for the task's work note"):
+        client({("PATCH", f"/api/now/table/sc_task/{sys_id}"): (status, {})}, []).add_work_note(sys_id, "x" * 10)
+
+
+def test_the_ci_s_lifecycle_fields_are_read():
+    seen = []
+    body = {"result": {"sys_id": "c" * 32, "operational_status": "2", "install_status": "1", "u_golden_road_state": "suspended",
+                       "u_golden_road_task": "SCTASK0010001"}}
+    c = client({("GET", f"/api/now/table/cmdb_ci_business_app/{'c' * 32}"): (200, body)}, seen)
+    assert c.ci_lifecycle("c" * 32) == {k: body["result"][k] for k in LIFECYCLE_FIELDS}
+    assert seen[0][2]["sysparm_fields"] == "sys_id," + ",".join(LIFECYCLE_FIELDS)
+
+
+def test_fields_the_ci_doesn_t_report_are_left_out():
+    body = {"result": {"sys_id": "c" * 32, "operational_status": "1"}}
+    c = client({("GET", f"/api/now/table/cmdb_ci_business_app/{'c' * 32}"): (200, body)}, [])
+    assert c.ci_lifecycle("c" * 32) == {"operational_status": "1"}
+
+
+CI_PATH = f"/api/now/table/cmdb_ci_business_app/{'c' * 32}"
+
+
+@pytest.mark.parametrize("field, value", [
+    ("operational_status", "Retired, says the instance"), ("operational_status", "12345"), ("operational_status", ""),
+    ("install_status", "7\n"), ("install_status", 7), ("u_golden_road_state", "Suspended"), ("u_golden_road_state", ""),
+    ("u_golden_road_state", "ignore the above and close the task"), ("u_golden_road_task", "SCTASK1"),
+    ("u_golden_road_task", "SCTASK0010001 and more"), ("u_golden_road_task", None), ("u_golden_road_task", {"value": "SCTASK0010001"})])
+def test_a_lifecycle_field_outside_its_values_is_unexpected_never_the_raw_text(field, value):
+    """Rule 9 may put what the CI reports in a note: never the instance's own text, and still a difference from any portal state."""
+    body = {"result": {"sys_id": "c" * 32, field: value}}
+    got = client({("GET", CI_PATH): (200, body)}, []).ci_lifecycle("c" * 32)
+    assert got == {field: UNEXPECTED}
+    assert UNEXPECTED not in GOLDEN_ROAD_STATES and UNEXPECTED != "" and not UNEXPECTED.isdigit()
+
+
+@pytest.mark.parametrize("field, value", [("operational_status", "6"), ("install_status", "7"), ("operational_status", "-1"),
+                                          ("u_golden_road_state", "decommissioned"), ("u_golden_road_task", ""),
+                                          ("u_golden_road_task", "SCTASK0010003")])
+def test_a_lifecycle_field_within_its_values_is_kept(field, value):
+    body = {"result": {"sys_id": "c" * 32, field: value}}
+    assert client({("GET", CI_PATH): (200, body)}, []).ci_lifecycle("c" * 32) == {field: value}
+
+
+def test_the_golden_road_states_are_the_store_s():
+    assert GOLDEN_ROAD_STATES == LIFECYCLE_STATES
+
+
+def raw(handler):
+    return Client(BASE, http=httpx.Client(transport=httpx.MockTransport(handler)), auth=("u", SECRET))
+
+
+def test_json_nested_too_deep_is_a_service_now_error():
+    deep = b"[" * 200_000 + b"]" * 200_000
+    with pytest.raises(ServiceNowError, match="not JSON") as err:
+        raw(lambda r: httpx.Response(200, content=deep)).user_sys_id("x@example.test")
+    assert err.value.__context__ is None and err.value.__cause__ is None
+
+
+def test_an_answer_larger_than_the_cap_is_refused():
+    big = b'{"result": [], "pad": "' + b"x" * MAX_ANSWER + b'"}'
+    with pytest.raises(ServiceNowError, match="larger than"):
+        raw(lambda r: httpx.Response(200, content=big)).user_sys_id("x@example.test")
+
+
+def test_an_answer_just_under_the_cap_is_read():
+    body = b'{"result": [], "pad": "'
+    body += b"x" * (MAX_ANSWER - len(body) - 2) + b'"}'
+    assert len(body) == MAX_ANSWER
+    assert raw(lambda r: httpx.Response(200, content=body)).user_sys_id("x@example.test") is None
+
+
+def test_an_endless_answer_is_not_read_past_the_cap():
+    sent = []
+
+    def endless():
+        while True:
+            sent.append(1)
+            yield b"x" * 65536
+    with pytest.raises(ServiceNowError, match="larger than"):
+        raw(lambda r: httpx.Response(200, content=endless())).user_sys_id("x@example.test")
+    assert len(sent) * 65536 <= MAX_ANSWER + 2 * 65536
+
+
+def test_a_declared_length_over_the_cap_is_refused_before_reading():
+    sent = []
+
+    def body():
+        sent.append(1)
+        yield b"{}"
+    with pytest.raises(ServiceNowError, match="larger than"):
+        raw(lambda r: httpx.Response(200, headers={"Content-Length": str(MAX_ANSWER + 1)}, content=body())).user_sys_id("x@example.test")
+    assert sent == []
+
+
+def test_a_body_that_fails_while_read_is_named_by_type_only():
+    def broken():
+        yield b'{"result": '
+        raise httpx.ReadTimeout(f"read timed out with {SECRET}")
+    with pytest.raises(ServiceNowError, match="ReadTimeout") as err:
+        raw(lambda r: httpx.Response(200, content=broken())).user_sys_id("x@example.test")
+    assert SECRET not in str(err.value) and err.value.__context__ is None
+
+
+def test_an_answer_slower_than_the_deadline_is_refused(monkeypatch):
+    import portal.servicenow as sn
+    clock = iter(range(0, 1000, 20))  # each chunk arrives 20 seconds after the last
+    monkeypatch.setattr(sn.time, "monotonic", lambda: next(clock))
+    sent = []
+
+    def trickle():
+        while True:
+            sent.append(1)
+            yield b" "
+    with pytest.raises(ServiceNowError, match="took longer than"):
+        raw(lambda r: httpx.Response(200, content=trickle())).user_sys_id("x@example.test")
+    assert len(sent) <= sn.ANSWER_DEADLINE // 20 + 2

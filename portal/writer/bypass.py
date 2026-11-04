@@ -54,6 +54,22 @@ def _installation_problems(app_gh, gh, installation_id, cfg) -> list[str]:
     return problems
 
 
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,99}")
+
+
+def write_login(app_gh, installation_id, cfg) -> str | None:
+    """The write App's bot login, "<app_slug>[bot]": the author of every PR the writer opens (and the only one it adopts). From the
+    write installation, which must be cfg.app_id's; None when it can't be read."""
+    try:
+        doc = app_gh.call("GET", f"/app/installations/{installation_id}").json()
+    except (GitHubError, ValueError):
+        return None
+    slug = doc.get("app_slug") if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or doc.get("app_id") != cfg.app_id or not isinstance(slug, str) or not SLUG.fullmatch(slug):
+        return None
+    return f"{slug}[bot]"
+
+
 def _is_ours(actor, cfg) -> bool:
     return isinstance(actor, dict) and actor.get("actor_type") == "Integration" and actor.get("actor_id") == cfg.app_id
 

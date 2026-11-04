@@ -1,6 +1,7 @@
 {
   "id": 777,
   "app_id": 424242,
+  "app_slug": "golden-road-portal-writer",
   "repository_selection": "selected",
   "permissions": {
     "contents": "write",

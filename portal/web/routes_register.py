@@ -4,6 +4,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import RedirectResponse
 
 from ..binding_record import environment_of
+from ..lifecycle import decommissioned_words
 from ..registration import CLASSIFICATIONS, form_draft
 from ..store.base import Conflict
 from ..timeline import OFF, timeline
@@ -11,6 +12,7 @@ from .access import PUBLIC, REQUESTER, REQUESTER_OR_ADMIN, SIGNED_IN
 from .ownership import admin_repos_of, fresh_admin_repos, stale_message  # noqa: F401 (tests import them from here)
 from .flash import redirect
 from .render import page
+from .routes_lifecycle import request_page as lifecycle_request_page
 
 router = APIRouter()
 EMPTY = {"repo": "", "purpose": "", "data_classification": ""}
@@ -92,10 +94,17 @@ def change_target(store, repo, fresh):
     return found[0] if found else None
 
 
+def decommissioned(store, repo):
+    """The repo's LifecycleState when it is decommissioned (rule 4: no registration change or renewal for it), else None."""
+    found = store.lifecycle_state(repo) if isinstance(repo, str) and REPO.fullmatch(repo) else None
+    return found if found is not None and found.state == "decommissioned" else None
+
+
 def register_page(request, principal, status=200, form=None, errors=(), chosen=""):
     """The register form. For a repo that is already registered (its intake record is observed) the page is "Change or renew the
-    registration", pre-filled from the record when it is readable; the request it submits is the same registration request."""
-    notes, change, repos = list(errors), None, []
+    registration", pre-filled from the record when it is readable; the request it submits is the same registration request. For a
+    decommissioned repo it says so and has no submit button (the POST refuses it too)."""
+    notes, change, repos, gone = list(errors), None, [], None
     if principal.signed_in:
         state = request.app.state
         fresh, stale = fresh_admin_repos(state.store, principal.person.id, state.clock(), state.settings.repo_admins_stale_after)
@@ -108,8 +117,14 @@ def register_page(request, principal, status=200, form=None, errors=(), chosen="
             form = {**EMPTY, "repo": repo}
             if change is not None and change.problem is None:
                 form.update(purpose=change.purpose, data_classification=change.data_classification)
+        # only for one of the person's own fresh admin repos: anyone else learns no repo's decommission (its date and task)
+        asked = form.get("repo")
+        gone = decommissioned(state.store, asked) if isinstance(asked, str) and asked.lower() in {r.repo.lower() for r in fresh} else None
+        if gone is not None and decommissioned_words(gone) not in notes:
+            notes.append(decommissioned_words(gone))
     back = "/register" + (f"?repo={chosen}" if len(chosen or "") <= 201 and REPO.fullmatch(chosen or "") else "")  # where sign-in comes back to
-    return page(request, "register.html", status, repos=repos, form=form or EMPTY, errors=notes, change=change, back=back)
+    return page(request, "register.html", status, repos=repos, form=form or EMPTY, errors=notes, change=change, back=back,
+                decommissioned=gone is not None)
 
 
 @router.get("/register")
@@ -135,10 +150,15 @@ def submit(request: Request, repo: str = Form(""), purpose: str = Form(""), data
             draft, errors = None, ["You are not an admin of that repository, as the portal last saw it. Ask an admin if this is wrong."]
     if draft is None:
         return register_page(request, principal, 400, form, errors)
+    gone = decommissioned(request.app.state.store, draft["repo"])
+    if gone is not None:  # rule 4 (decided while planning: item 15): the page says why, before anything is created
+        return register_page(request, principal, 409, form, [decommissioned_words(gone)])
     try:
         now = request.app.state.clock()
         req = request.app.state.store.create_registration(person_id=principal.person.id, draft=draft, now=now, ownership_acknowledged_at=now)
-    except Conflict:
+    except Conflict as exc:
+        if exc.code == "decommissioned":  # decommissioned since the check above
+            return register_page(request, principal, 409, form, [decommissioned_words(request.app.state.store.lifecycle_state(draft["repo"]))])
         return register_page(request, principal, 409, form, ["That repository already has an open registration."])
     return redirect(f"/requests/{req.id}", "registered")
 
@@ -169,6 +189,8 @@ def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
     found = request.state.found_request
     if found.kind == "binding":  # request.html is for registrations: a connection change is shown on its app's page
         return RedirectResponse(f"/apps/{found.repo}?environment={environment_of(found) or 'test'}", status_code=303)
+    if found.kind == "lifecycle":
+        return lifecycle_request_page(request, found, principal)
     store = request.app.state.store
     context = evidence_context(store, found)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],

@@ -182,3 +182,84 @@ def test_a_renewal_with_the_same_values_is_registered_once_the_collector_reconci
     rec = portal.store.cmdb_record("acme/notes")
     assert rec.last_operation == "NO_CHANGE" and rec.last_error is None
     assert (timeline(req, entries, cmdb=rec)[-1].status, timeline(req, entries, cmdb=rec)[-1].detail) == ("done", rec.number)
+
+
+# ---- a lifecycle request (spec 2026-11-02 "Requests") ----
+
+from portal.timeline import lifecycle_timeline  # noqa: E402
+
+PR = dict(branch="portal/lifecycle-x-deploy-1", pr_number=1, pr_url="https://github.com/acme/golden-road-deploy/pull/1", head_sha="2" * 40,
+          base_sha="1" * 40)
+
+
+def life(portal, req_id):
+    store = portal.store
+    found = store.get_request(req_id)
+    return [(s.label, s.status, s.detail) for s in lifecycle_timeline(found, store.lifecycle_steps(req_id), store.lifecycle_events(req_id))]
+
+
+def planned(portal, action="suspend"):
+    from portal_fakes import lifecycle_request
+    from portal.store.base import ACTION_STEPS
+    req = lifecycle_request(portal.store, portal.people, portal.clock(), action=action)
+    portal.store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS[action], now=portal.clock())
+    return req
+
+
+def test_a_suspend_just_requested_and_planned(portal):
+    from portal_fakes import lifecycle_request
+    req = lifecycle_request(portal.store, portal.people, portal.clock(), claim=False)
+    assert life(portal, req.id) == [("Requested", "done", "SCTASK0010001"), ("Applied in git", "todo", None)]
+    portal.store.claim_approved(now=portal.clock())
+    portal.store.add_lifecycle_steps(request_id=req.id, steps=("deploy",), now=portal.clock())
+    assert life(portal, req.id) == [("Requested", "done", "SCTASK0010001"), ("Deploy repo pull request", "now", None),
+                                    ("Applied in git", "todo", None)]
+
+
+def test_a_suspend_with_its_pr_open_then_merged_and_applied(portal):
+    req = planned(portal)
+    portal.store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=portal.clock(), **PR)
+    assert life(portal, req.id)[1:] == [("Deploy repo pull request", "now", "#1"), ("Applied in git", "todo", None)]
+    portal.store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", merge_sha="3" * 40, now=portal.clock())
+    portal.store.apply_lifecycle(request_id=req.id, merge_sha="3" * 40, note="Applied in git.", now=portal.clock())
+    assert [status for _, status, _ in life(portal, req.id)] == ["done", "done", "done"]
+    assert life(portal, req.id)[-1] == ("Applied in git", "done", None)
+
+
+def test_a_failed_step_shows_its_reason(portal):
+    req = planned(portal)
+    portal.store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="failed", failure_reason="check_failed: deploy-check",
+                                     now=portal.clock())
+    assert life(portal, req.id)[1] == ("Deploy repo pull request", "failed", "check_failed: deploy-check")
+
+
+def test_an_abandoned_request_closes_its_step(portal):
+    req = planned(portal)
+    portal.store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="closed", now=portal.clock())
+    command = portal.store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=portal.people["admin"].id, now=portal.clock())
+    portal.store.abandon_lifecycle(request_id=req.id, command_id=command.id, note="Abandoned.", now=portal.clock())
+    assert life(portal, req.id)[1:] == [("Deploy repo pull request", "closed", None), ("Abandoned", "closed", None)]   # closed, as its steps: an abandon is not a failure
+
+
+def test_a_stopped_request_closes_its_steps_left(portal):
+    req = planned(portal, "decommission")
+    portal.store.set_lifecycle_state(request_id=req.id, state="decommissioned", now=portal.clock())
+    portal.store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=portal.clock())
+    command = portal.store.add_lifecycle_command(request_id=req.id, command="stop", actor_id=portal.people["admin"].id, now=portal.clock())
+    portal.store.stop_lifecycle(request_id=req.id, command_id=command.id, note="Stopped.", now=portal.clock())
+    assert life(portal, req.id)[2:] == [("Repository archived", "closed", None), ("Factory record pull request", "closed", None),
+                                        ("Stopped", "closed", None)]
+
+
+def test_a_request_refused_at_the_recheck(portal):
+    from portal_fakes import lifecycle_request
+    req = lifecycle_request(portal.store, portal.people, portal.clock())
+    portal.store.mark_failed(request_id=req.id, reason="recheck: nothing_to_suspend", now=portal.clock())
+    assert life(portal, req.id) == [("Requested", "done", "SCTASK0010001"), ("Refused", "failed", "recheck: nothing_to_suspend")]
+
+
+def test_a_decommission_lists_its_three_steps_in_order(portal):
+    req = planned(portal, "decommission")
+    assert [label for label, _, _ in life(portal, req.id)] == ["Requested", "Deploy repo pull request", "Repository archived",
+                                                               "Factory record pull request", "Applied in git"]
+    assert [status for _, status, _ in life(portal, req.id)][1:4] == ["now", "todo", "todo"]

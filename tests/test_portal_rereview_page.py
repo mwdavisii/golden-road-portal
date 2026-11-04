@@ -277,3 +277,37 @@ def test_no_cmdb_problem_no_cmdb_section(portal):
     portal.store.set_rereview_status(source="cmdb", problem=None, counts={"synced": 1}, now=T0)
     text = portal.client("admin").get("/admin/rereview").text
     assert "<h2>ServiceNow CMDB</h2>" not in text and "<strong>ServiceNow CMDB</strong>" in text
+
+
+# ---- 0.7.0: work notes ServiceNow hasn't taken for more than a day (spec 2026-11-02 "Outbox") ----
+# (the memory store keeps the time it is given, so a note is made a day old rather than the clock moved past the session's age)
+
+def test_a_note_unsent_for_more_than_a_day_is_cmdb_writeback_pending_with_its_request(portal):
+    import html
+
+    from portal_fakes import lifecycle_request
+    fresh = lifecycle_request(portal.store, portal.people, portal.clock(), repo="acme/tools")
+    text = html.unescape(portal.client("admin").get("/admin/rereview").text)
+    assert "cmdb_writeback_pending" not in text and fresh.id not in text   # not yet a day
+    req = lifecycle_request(portal.store, portal.people, portal.clock() - dt.timedelta(days=1, seconds=1))
+    [event] = portal.store.lifecycle_events(req.id)
+    portal.store.mark_lifecycle_event_failed(event_id=event.id, error="ServiceNow answered 503 for the task's work note", now=portal.clock())
+    text = html.unescape(portal.client("admin").get("/admin/rereview").text)
+    assert ('<p class="error warn">cmdb_writeback_pending: work notes for ServiceNow tasks have waited more than a day: ServiceNow refused '
+            "them or didn't answer, and the collector keeps trying.</p>") in text
+    assert (f'<a href="/requests/{req.id}" class="mono">{req.id}</a>: requested, 1 attempt, '
+            "ServiceNow answered 503 for the task's work note.</li>") in text
+    assert fresh.id not in text
+
+
+def test_a_note_never_tried_says_so_and_a_sent_one_is_not_pending(portal):
+    import html
+
+    from portal_fakes import lifecycle_request
+    req = lifecycle_request(portal.store, portal.people, portal.clock() - dt.timedelta(days=2))
+    text = html.unescape(portal.client("admin").get("/admin/rereview").text)
+    assert f"{req.id}</a>: requested, 0 attempts, not tried yet." in text
+    [event] = portal.store.lifecycle_events(req.id)
+    portal.store.mark_lifecycle_event_sent(event_id=event.id, now=portal.clock())
+    text = portal.client("admin").get("/admin/rereview").text
+    assert "cmdb_writeback_pending" not in text and f"/requests/{req.id}" not in text

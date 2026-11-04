@@ -659,3 +659,33 @@ def test_an_mcp_and_a_skill_problem_are_both_named(portal, tmp_path):
     cfg = mcfg(cloudflare=cf_with(lambda d: notes_of(d).update(status="error")),
                skills_catalog=catalog_with(tmp_path, lambda d: d["commits"][MAIN]["skills"].pop("incident-triage")))
     assert recheck(req, cfg, None, portal.store, T0) == ["mcp_server_not_ready", "skill_gone"]
+
+
+def _decommission(store, people):
+    """acme/notes decommissioned: a decommission request, its steps done, applied."""
+    from portal.store.base import ACTION_STEPS
+    life = store.create_lifecycle(request_id="r_" + "9" * 32, person_id=people["admin"].id, repo="acme/notes",
+                                  final={"action": "decommission", "task": "SCTASK0010003", "task_sys_id": "e" * 32,
+                                         "reason": "No owner confirmed the app is still used"}, note="Requested.", now=T0)
+    assert store.claim_approved(now=T0).id == life.id
+    return life, lambda: ([store.move_lifecycle_step(request_id=life.id, step=s.step, to_state="done", now=T0)
+                           for s in store.add_lifecycle_steps(request_id=life.id, steps=ACTION_STEPS["decommission"], now=T0)],
+                          store.apply_lifecycle(request_id=life.id, merge_sha=None, note="Decommissioned.", now=T0))
+
+
+@pytest.mark.parametrize("kind", ["registration", "binding"])
+def test_a_request_for_a_decommissioned_app_is_refused_before_anything_else(portal, kind):
+    """(decided while planning: item 15) a registration or binding opened before the decommission: rule 4 holds at the writer too."""
+    _, apply = _decommission(portal.store, portal.people)
+    req = (approved_request if kind == "registration" else binding_request)(portal.store, portal.people, T0)
+    cfg = writer_config(directory=fake_directory())
+    assert recheck(req, cfg, ev_of(portal, req), portal.store, T0) == []
+    apply()
+    assert recheck(req, cfg, ev_of(portal, req), portal.store, T0) == ["decommissioned"]
+    assert recheck(dc.replace(req, repo="ACME/Notes"), cfg, ev_of(portal, req), portal.store, T0)[-1] == "decommissioned", "any case"
+    assert recheck(dc.replace(req, state="approved"), cfg, ev_of(portal, req), portal.store, T0) == ["not_approved", "decommissioned"]
+
+
+def test_a_registration_rechecked_without_the_store_is_unchanged(portal):
+    req = approved_request(portal.store, portal.people, T0)
+    assert recheck(req, writer_config(), ev_of(portal, req)) == []

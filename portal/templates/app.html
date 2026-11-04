@@ -1,18 +1,20 @@
 {% extends "base.html" %}
 {% from "_ownership.html" import ownership_notice %}
+{% from "_lifecycle.html" import lifecycle_banner, lifecycle_panel %}
 {% set active = "requests" %}
 {% block title %}{{ repo }} - golden road{% endblock %}
-{% macro remove_button(params) %}{% if open_request %}<button class="danger" type="button" disabled>Remove</button>{% else %}<a class="button danger" href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ environment }}&amp;{{ params }}">Remove</a>{% endif %}{% endmacro %}
+{% macro remove_button(params) %}{% if open_request or decommissioned %}<button class="danger" type="button" disabled>Remove</button>{% else %}<a class="button danger" href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ environment }}&amp;{{ params }}">Remove</a>{% endif %}{% endmacro %}
 {% block main %}
 <p><a href="/requests">&larr; My requests</a></p>
 <span class="eyebrow">App</span>
 <h1 class="mono">{{ repo }}</h1>
+{{ lifecycle_banner(lifecycle_banner_info) }}
 {% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
 {% if cmdb and cmdb.number %}{{ ownership_notice(settings.org_name, settings.lifecycle_grace_days, number=cmdb.number, review_by=cmdb.review_by, mine=cmdb.mine, owner=cmdb.owner, unreadable=cmdb.unreadable) }}{% endif %}
 {% if cmdb and cmdb.owner_unknown %}<p class="callout warn" role="status">ServiceNow has no user with the owner's email, so {% if cmdb.number %}its owner there isn't updated yet.{% else %}this app isn't registered there yet.{% endif %}</p>{% endif %}
 {% for item in reviews %}<p class="callout warn" role="status">This app's registration {% if item.reason == "review_overdue" %}was due for review on {{ item.key }}{% else %}is due for review by {{ item.key }}{% endif %}. {% if can_change %}<a href="/register?repo={{ repo }}">Change or renew the registration</a>.{% else %}An admin of the repository can renew it.{% endif %}</p>
 {% endfor %}
-{% if record and can_change and not reviews %}<p><a href="/register?repo={{ repo }}">Change or renew the registration</a></p>{% endif %}
+{% if record and can_change and not reviews and not decommissioned %}<p><a href="/register?repo={{ repo }}">Change or renew the registration</a></p>{% endif %}
 <h2 class="visually-hidden">Registration</h2>
 {% if registration %}
 <dl class="facts summary">
@@ -26,6 +28,7 @@
 {% else %}
 <p class="callout info">No portal registration; the writer checks the factory's intake record before it records a change.</p>
 {% endif %}
+{{ lifecycle_panel(lifecycle_panel_info, owner_name, repo_name) }}
 {% if directory or settings.secret_server or settings.cloudflare or settings.skills_catalog %}
 <div class="card-head"><h2>Connections</h2>
 <nav class="tabs" aria-label="Environment">{% for env in environments %}<a href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ env }}"{% if env == environment %} aria-current="page"{% endif %}>{{ env }}</a>{% endfor %}</nav></div>
@@ -59,7 +62,7 @@
 <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
 <p class="field"><label for="principal">Service principal</label>
 <select id="principal" class="mono" name="principal_id">{% for p in principals %}<option value="{{ p.id }}"{% if identity and identity.directory_id == p.id %} selected{% endif %}>{{ p.display_name }}</option>{% endfor %}</select></p>
-<p class="actions"><button class="secondary" type="submit"{% if open_request %} disabled{% endif %}>{% if identity %}Change{% else %}Associate{% endif %}</button></p>
+<p class="actions"><button class="secondary" type="submit"{% if open_request or decommissioned %} disabled{% endif %}>{% if identity %}Change{% else %}Associate{% endif %}</button>{% if decommissioned %}<span class="hint">The app is decommissioned.</span>{% endif %}</p>
 </form>
 {% elif identity %}<p>No other service principal is tagged for this repository, so the link can't be changed here.</p>
 {% else %}<p>No service principal is tagged for this repository yet.</p>{% endif %}
@@ -80,7 +83,7 @@
 <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}">
 <p class="field"><label for="warehouse">SQL warehouse</label>
 <select id="warehouse" class="mono" name="warehouse_id">{% for w in warehouses %}<option value="{{ w.id }}"{% if data and data.directory_id == w.id %} selected{% endif %}>{{ w.display_name }}</option>{% endfor %}</select></p>
-<p class="actions"><button class="secondary" type="submit"{% if open_request %} disabled{% endif %}>{% if data %}Change{% else %}Enable{% endif %}</button></p>
+<p class="actions"><button class="secondary" type="submit"{% if open_request or decommissioned %} disabled{% endif %}>{% if data %}Change{% else %}Enable{% endif %}</button>{% if decommissioned %}<span class="hint">The app is decommissioned.</span>{% endif %}</p>
 </form>
 {% elif data %}<p>No other warehouse is granted to <span class="mono">{{ identity.directory_id }}</span>, so the connection can't be changed here.</p>
 {% else %}<p>No warehouse is granted to <span class="mono">{{ identity.directory_id }}</span> yet.</p>{% endif %}
@@ -100,7 +103,7 @@
 {% for s in current_secrets %}<tr><td class="mono">{{ s.env }}</td><td class="mono">{{ s.secret_name }}</td><td class="mono">{{ s.field_slug }}</td><td>{% if can_change %}{{ remove_button("confirm_secret=" ~ s.env) }}{% endif %}</td></tr>
 {% endfor %}</tbody></table></div>
 {% else %}<p class="empty">No secrets in {{ environment }} yet.</p>{% endif %}
-{% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add a secret</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/secrets/new?environment={{ environment }}">Add a secret</a>{% endif %}</p>{% endif %}
+{% if can_change %}<p class="actions">{% if open_request or decommissioned %}<button type="button" disabled>Add a secret</button><span class="hint">{% if decommissioned %}The app is decommissioned.{% else %}Changes are paused until the pending one lands.{% endif %}</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/secrets/new?environment={{ environment }}">Add a secret</a>{% endif %}</p>{% endif %}
 </section>
 {% endif %}
 {% if settings.cloudflare %}
@@ -115,7 +118,7 @@
 {% for s in current_servers %}<tr><td>{{ s.name }}</td><td class="mono">{{ s.server_id }}</td><td>{% if can_change %}{{ remove_button("confirm_mcp=" ~ s.server_id) }}{% endif %}</td></tr>
 {% endfor %}</tbody></table></div>
 {% else %}<p class="empty">No MCP servers in {{ environment }} yet.</p>{% endif %}
-{% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add an MCP server</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/mcp/new?environment={{ environment }}">Add an MCP server</a>{% endif %}</p>{% endif %}
+{% if can_change %}<p class="actions">{% if open_request or decommissioned %}<button type="button" disabled>Add an MCP server</button><span class="hint">{% if decommissioned %}The app is decommissioned.{% else %}Changes are paused until the pending one lands.{% endif %}</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/mcp/new?environment={{ environment }}">Add an MCP server</a>{% endif %}</p>{% endif %}
 </section>
 {% endif %}
 {% if settings.skills_catalog %}
@@ -129,11 +132,11 @@
 {% for s in current_skills %}<tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.commit[:7] }}</td><td>{% if s.name not in in_catalog %}no longer in the catalog{% elif s.commit == catalog_main %}the same{% else %}newer: <span class="mono">{{ catalog_main[:7] }}</span>{% endif %}</td>
 <td>{% if can_change and s.commit != catalog_main and s.name in in_catalog %}<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/skills/update">
 <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="environment" value="{{ environment }}"><input type="hidden" name="name" value="{{ s.name }}">
-<button class="secondary" type="submit"{% if open_request %} disabled{% endif %}>Update</button></form>{% endif %}</td>
+<button class="secondary" type="submit"{% if open_request or decommissioned %} disabled{% endif %}>Update</button></form>{% endif %}</td>
 <td>{% if can_change %}{{ remove_button("confirm_skill=" ~ s.name) }}{% endif %}</td></tr>
 {% endfor %}</tbody></table></div>
 {% else %}<p class="empty">No skills in {{ environment }} yet.</p>{% endif %}
-{% if can_change %}<p class="actions">{% if open_request %}<button type="button" disabled>Add a skill</button><span class="hint">Changes are paused until the pending one lands.</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/skills/new?environment={{ environment }}">Add a skill</a>{% endif %}</p>{% endif %}
+{% if can_change %}<p class="actions">{% if open_request or decommissioned %}<button type="button" disabled>Add a skill</button><span class="hint">{% if decommissioned %}The app is decommissioned.{% else %}Changes are paused until the pending one lands.{% endif %}</span>{% else %}<a class="button" href="/apps/{{ owner_name }}/{{ repo_name }}/skills/new?environment={{ environment }}">Add a skill</a>{% endif %}</p>{% endif %}
 </section>
 {% endif %}
 <section class="card">

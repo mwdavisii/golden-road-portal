@@ -1036,3 +1036,499 @@ def test_the_cmdb_part_has_its_own_problems(store):
         store.set_rereview_status(source="cmdb", problem="factory_unreadable", counts={}, now=T0)
     with pytest.raises(ValueError):
         store.set_rereview_status(source="intake", problem="cmdb_unreachable", counts={}, now=T0)
+
+
+from portal.store.base import ACTION_STEPS  # noqa: E402
+
+LIFE = {"action": "suspend", "task": "SCTASK0010001", "task_sys_id": "e" * 32, "reason": "Critical vulnerability; suspended until patched"}
+NOTE = "Requested in the golden road portal by Admin: suspend the app. Reason: Critical vulnerability; suspended until patched"
+
+
+def lifecycle_request(store, admin, action="suspend", repo="acme/notes", rid=None):
+    from portal.ids import new_id
+    rid = rid or new_id("r")
+    return store.create_lifecycle(request_id=rid, person_id=admin.id, repo=repo, final={**LIFE, "action": action}, note=NOTE, now=T0)
+
+
+def test_a_lifecycle_request_starts_approved_with_its_first_note(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    assert (req.kind, req.state, req.final, req.draft, req.requested_by) == ("lifecycle", "approved", {**LIFE}, {**LIFE}, admin.id)
+    [event] = store.lifecycle_events(req.id)
+    assert (event.step, event.note, event.task_sys_id, event.sent_at, event.attempts) == ("requested", NOTE, "e" * 32, None, 0)
+    created = [e for e in store.audit_for("request", req.id) if e.action == "request.created"][0]
+    assert created.reason == LIFE["reason"] and created.after["final"] == LIFE
+
+
+def test_one_lifecycle_request_open_per_app(store):
+    _, admin = people(store)
+    lifecycle_request(store, admin)
+    with pytest.raises(Conflict) as err:
+        lifecycle_request(store, admin, action="decommission", repo="ACME/notes")
+    assert err.value.code == "open_request_exists"
+    store.create_registration(person_id=admin.id, draft={**DRAFT, "repo": "acme/other"}, now=T0)  # other kinds are not held
+
+
+COMPLETED = "Suspended in git: every environment of acme/notes scales to zero. The task is closed."
+PR = dict(branch="portal/lifecycle-x-deploy-1", pr_number=7, pr_url="https://github.com/acme/golden-road-deploy/pull/7", head_sha="2" * 40,
+          base_sha="1" * 40)
+
+
+def writing_lifecycle(store, admin, action="suspend", repo="acme/notes"):
+    """A lifecycle request the writer claimed and planned: (request, its steps)."""
+    req = lifecycle_request(store, admin, action=action, repo=repo)
+    assert store.claim_approved(now=T0).id == req.id
+    return req, store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS[action], now=T0)
+
+
+def every_step_done(store, req):
+    for s in store.lifecycle_steps(req.id):
+        store.move_lifecycle_step(request_id=req.id, step=s.step, to_state="done", now=T0)
+
+
+def test_a_lifecycle_request_is_applied_or_abandoned(store):
+    _, admin = people(store)
+    req, steps = writing_lifecycle(store, admin)
+    assert [(s.step, s.position, s.state, s.attempt) for s in steps] == [("deploy", 1, "planned", 1)]
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=T0, **PR)
+    done = store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0 + HOUR, merge_sha="3" * 40)
+    assert (done.state, done.merge_sha, done.pr_number) == ("done", "3" * 40, 7)
+    applied = store.apply_lifecycle(request_id=req.id, merge_sha="3" * 40, note=COMPLETED, now=T0 + HOUR)
+    assert (applied.state, applied.merge_sha) == ("merged", "3" * 40)
+    state = store.lifecycle_state("acme/notes")
+    assert (state.state, state.task, state.request) == ("suspended", "SCTASK0010001", req.id)
+    assert [(e.step, e.note) for e in store.lifecycle_events(req.id)][-1] == ("completed", COMPLETED)
+    other = lifecycle_request(store, admin, action="resume")  # applied: a new one may open
+    store.claim_approved(now=T0)
+    assert store.mark_failed(request_id=other.id, reason="abandoned", now=T0).state == "failed"
+
+
+def test_a_step_moves_only_by_its_transitions(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    with pytest.raises(Conflict) as err:
+        store.move_lifecycle_step(request_id=req.id, step="factory", to_state="planned", now=T0)  # the deploy step isn't done
+    assert err.value.code == "wrong_state"
+    rebuilt = store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="planned", now=T0)  # a stranded branch: a new attempt
+    assert (rebuilt.state, rebuilt.attempt) == ("planned", 2)
+    failed = store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="failed", now=T0, failure_reason="check_failed: deploy-check")
+    assert failed.failure_reason == "check_failed: deploy-check"
+    again = store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="planned", now=T0)
+    assert (again.state, again.attempt, again.failure_reason, again.pr_number) == ("planned", 3, None, None)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="closed", now=T0)
+    with pytest.raises(Conflict):
+        store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="planned", now=T0)  # closed is for good
+    with pytest.raises(ValueError):
+        store.move_lifecycle_step(request_id=req.id, step="factory", to_state="pr_open", now=T0, branch="b")  # a PR names all of it
+
+
+def test_a_decommission_s_steps_go_in_rule_7_s_order(store):
+    """deploy, then archive, then factory (decided by the lead while Mike was away): a step leaves planned only once every earlier one
+    is done, but an abandon closes any of them."""
+    _, admin = people(store)
+    req, steps = writing_lifecycle(store, admin, action="decommission")
+    assert [(s.step, s.position) for s in steps] == [("deploy", 1), ("archive", 2), ("factory", 3)]
+    for step, to_state, fields in (("archive", "done", {}), ("archive", "failed", {"failure_reason": "archive: github: 404"}),
+                                   ("factory", "pr_open", PR)):
+        with pytest.raises(Conflict) as err:
+            store.move_lifecycle_step(request_id=req.id, step=step, to_state=to_state, now=T0, **fields)
+        assert err.value.code == "wrong_state"
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0, merge_sha="3" * 40)
+    with pytest.raises(Conflict):
+        store.move_lifecycle_step(request_id=req.id, step="factory", to_state="pr_open", now=T0, **PR)  # the archive isn't done
+    store.move_lifecycle_step(request_id=req.id, step="archive", to_state="done", now=T0)
+    assert store.move_lifecycle_step(request_id=req.id, step="factory", to_state="pr_open", now=T0, **PR).state == "pr_open"
+    other, _ = writing_lifecycle(store, admin, action="decommission", repo="acme/tools")
+    for step in ("factory", "archive", "deploy"):  # an abandon closes every step, in any order
+        assert store.move_lifecycle_step(request_id=other.id, step=step, to_state="closed", now=T0).state == "closed"
+
+
+def test_a_step_is_planned_and_moved_only_while_its_request_is_being_written(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    with pytest.raises(Conflict) as err:  # not claimed yet
+        store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS["suspend"], now=T0)
+    assert err.value.code == "wrong_state"
+    store.claim_approved(now=T0)
+    store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS["suspend"], now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="failed", now=T0, failure_reason="check_failed: deploy-check")
+    store.mark_failed(request_id=req.id, reason="abandoned", now=T0)
+    for to_state in ("planned", "closed"):
+        with pytest.raises(Conflict) as err:
+            store.move_lifecycle_step(request_id=req.id, step="deploy", to_state=to_state, now=T0)
+        assert err.value.code == "wrong_state"
+
+
+def test_an_open_step_s_pull_request_never_changes(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=T0, **PR)
+    for to_state, fields in (("done", {"head_sha": "4" * 40}), ("failed", {"failure_reason": "x", "pr_number": 8}), ("closed", {"branch": "b"})):
+        with pytest.raises(ValueError):
+            store.move_lifecycle_step(request_id=req.id, step="deploy", to_state=to_state, now=T0, **fields)
+    done = store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0, merge_sha="3" * 40)
+    assert {f: getattr(done, f) for f in PR} == PR
+
+
+def test_the_state_is_the_one_its_request_applies(store):
+    """Repo and task come from the request: the writer names only the request and the state its action applies."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    assert store.lifecycle_state("acme/notes") is None and store.lifecycle_states() == []
+    for state in ("active", "decommissioned"):  # a suspend applies suspended
+        with pytest.raises(Conflict) as err:
+            store.set_lifecycle_state(request_id=req.id, state=state, now=T0)
+        assert err.value.code == "wrong_state"
+    with pytest.raises(ValueError):
+        store.set_lifecycle_state(request_id=req.id, state="paused", now=T0)
+    found = store.set_lifecycle_state(request_id=req.id, state="suspended", now=T0)
+    assert found == store.lifecycle_state("ACME/Notes")
+    assert (found.repo, found.state, found.task, found.request) == ("acme/notes", "suspended", "SCTASK0010001", req.id)
+    audits = len(store.audit_for("app", "acme/notes"))
+    assert store.set_lifecycle_state(request_id=req.id, state="suspended", now=T0) == found  # again: no change, no new entry
+    assert len(store.audit_for("app", "acme/notes")) == audits == 1
+    queued = lifecycle_request(store, admin, repo="acme/tools")  # approved, not claimed
+    with pytest.raises(Conflict) as err:
+        store.set_lifecycle_state(request_id=queued.id, state="suspended", now=T0)
+    assert err.value.code == "wrong_state"
+    with pytest.raises(Conflict) as err:
+        store.set_lifecycle_state(request_id="r_" + "0" * 32, state="suspended", now=T0)
+    assert err.value.code == "not_found"
+
+
+def test_the_state_follows_the_applied_action_and_decommissioned_is_for_good(store):
+    _, admin = people(store)
+    for action, state, task in (("suspend", "suspended", "SCTASK0010001"), ("resume", "active", None),
+                                ("decommission", "decommissioned", "SCTASK0010001")):
+        req, _ = writing_lifecycle(store, admin, action=action)
+        every_step_done(store, req)
+        store.apply_lifecycle(request_id=req.id, merge_sha=None, note=COMPLETED, now=T0)
+        found = store.lifecycle_state("acme/notes")
+        assert (found.state, found.task, found.request) == (state, task, req.id)
+    with pytest.raises(Conflict) as err:
+        lifecycle_request(store, admin, action="resume")
+    assert err.value.code == "decommissioned"
+
+
+def test_apply_sets_the_state_notes_completed_and_marks_the_request_merged_at_once(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0, merge_sha="3" * 40)
+    with pytest.raises(Conflict) as err:  # the archive and the factory aren't done
+        store.apply_lifecycle(request_id=req.id, merge_sha="3" * 40, note=COMPLETED, now=T0)
+    assert err.value.code == "wrong_state"
+    store.set_lifecycle_state(request_id=req.id, state="decommissioned", now=T0)  # the deploy step's own (rule 4 from then on)
+    store.move_lifecycle_step(request_id=req.id, step="archive", to_state="done", now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="factory", to_state="done", now=T0, merge_sha="4" * 40)
+    applied = store.apply_lifecycle(request_id=req.id, merge_sha="4" * 40, note=COMPLETED, now=T0)  # the state set already: kept
+    assert (applied.state, applied.merge_sha, store.lifecycle_state("acme/notes").request) == ("merged", "4" * 40, req.id)
+    with pytest.raises(Conflict) as err:
+        store.apply_lifecycle(request_id=req.id, merge_sha="4" * 40, note=COMPLETED, now=T0)
+    assert err.value.code == "wrong_state"
+    other = lifecycle_request(store, admin, repo="acme/tools")
+    store.claim_approved(now=T0)
+    with pytest.raises(Conflict) as err:  # never applied without its steps (one refused before any is failed, not merged)
+        store.apply_lifecycle(request_id=other.id, merge_sha=None, note=COMPLETED, now=T0)
+    assert err.value.code == "wrong_state"
+
+
+def test_a_failed_apply_changes_nothing(store):
+    """One transaction: a request whose completed note is already there (as only a hand or a race could make it) is refused, and
+    neither its state nor the request moved."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    every_step_done(store, req)
+    store.add_lifecycle_event(request_id=req.id, step="completed", note=COMPLETED, now=T0)
+    with pytest.raises(Conflict) as err:
+        store.apply_lifecycle(request_id=req.id, merge_sha=None, note=COMPLETED, now=T0)
+    assert err.value.code == "event_exists"
+    assert store.lifecycle_state("acme/notes") is None and store.get_request(req.id).state == "writing"
+    assert not [e for e in store.audit_for("request", req.id) if e.action == "request.merged"]
+
+
+@pytest.mark.parametrize("kind", ["registration", "lifecycle"])
+def test_after_decommission_no_request_is_taken_for_the_repo(store, kind):
+    """Rule 4 (decided while planning: item 15)."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0, merge_sha="3" * 40)
+    store.set_lifecycle_state(request_id=req.id, state="decommissioned", now=T0)
+    with pytest.raises(Conflict) as err:
+        if kind == "registration":
+            store.create_registration(person_id=admin.id, draft={**DRAFT, "repo": "Acme/Notes"}, now=T0)
+        else:
+            lifecycle_request(store, admin, action="resume")
+    assert err.value.code == "decommissioned"
+
+
+def test_commands_one_open_at_a_time(store):
+    owner, admin = people(store)
+    req = lifecycle_request(store, admin)
+    command = store.add_lifecycle_command(request_id=req.id, command="retry", actor_id=admin.id, now=T0)
+    assert store.open_lifecycle_command(req.id) == command and command.requested_by == admin.id
+    with pytest.raises(Conflict) as err:
+        store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0)
+    assert err.value.code == "command_open"
+    store.finish_lifecycle_command(command_id=command.id, now=T0)
+    assert store.open_lifecycle_command(req.id) is None
+    assert store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0).command == "abandon"
+    with pytest.raises(ValueError):
+        store.add_lifecycle_command(request_id=req.id, command="merge", actor_id=admin.id, now=T0)
+    registration = store.create_registration(person_id=owner.id, draft={**DRAFT, "repo": "acme/tools"}, now=T0)
+    with pytest.raises(Conflict) as err:
+        store.add_lifecycle_command(request_id=registration.id, command="retry", actor_id=admin.id, now=T0)
+    assert err.value.code == "not_lifecycle"
+
+
+def test_the_outbox_keeps_order_attempts_and_errors(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    second = store.add_lifecycle_event(request_id=req.id, step="pr_opened", note="Pull request #7 opened.", now=T0)
+    first = store.lifecycle_events(req.id)[0]
+    assert [e.id for e in store.lifecycle_events(unsent=True)] == [first.id, second.id]
+    store.mark_lifecycle_event_failed(event_id=first.id, error="ServiceNow answered 503 for the task's work note", now=T0)
+    store.mark_lifecycle_event_failed(event_id=first.id, error="ServiceNow answered 503 for the task's work note", now=T0)
+    kept = store.lifecycle_events(req.id)[0]
+    assert (kept.attempts, kept.last_error, kept.sent_at) == (2, "ServiceNow answered 503 for the task's work note", None)
+    store.mark_lifecycle_event_sent(event_id=first.id, now=T0 + HOUR)
+    assert store.lifecycle_events(req.id)[0].sent_at is not None  # the database's time in Postgres (0012)
+    assert [e.id for e in store.lifecycle_events(unsent=True)] == [second.id]
+    with pytest.raises(Conflict):
+        store.mark_lifecycle_event_sent(event_id=first.id, now=T0 + 2 * HOUR)  # sent once
+    with pytest.raises(ValueError):
+        store.add_lifecycle_event(request_id=req.id, step="paused", note="x", now=T0)
+
+
+def test_a_lifecycle_request_keeps_its_pull_requests_on_its_steps(store):
+    """0012's update guard: a lifecycle request never goes pr_open (its PRs are its steps'), and only it is applied without one."""
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    store.claim_approved(now=T0)
+    with pytest.raises(Conflict) as err:
+        store.mark_pr_open(request_id=req.id, branch="portal/x", pr_number=7, pr_url="https://github.com/acme/golden-road-deploy/pull/7",
+                           head_sha="2" * 40, base_sha="1" * 40, now=T0)
+    assert err.value.code == "wrong_state"
+    store.add_lifecycle_steps(request_id=req.id, steps=ACTION_STEPS["suspend"], now=T0)
+    every_step_done(store, req)  # nothing to change in the deploy repo: no pull request at all
+    assert store.apply_lifecycle(request_id=req.id, merge_sha=None, note=COMPLETED, now=T0).merge_sha is None
+    registration = store.create_registration(person_id=admin.id, draft={**DRAFT, "repo": "acme/tools"}, now=T0)
+    for call in (lambda: store.apply_lifecycle(request_id=registration.id, merge_sha=None, note=COMPLETED, now=T0),
+                 lambda: store.set_lifecycle_state(request_id=registration.id, state="suspended", now=T0)):
+        with pytest.raises(Conflict) as err:
+            call()
+        assert err.value.code == "not_lifecycle"
+
+
+def test_a_request_s_notes_are_sent_in_order_and_unknown_ids_are_refused(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    first = store.lifecycle_events(req.id)[0]
+    second = store.add_lifecycle_event(request_id=req.id, step="pr_opened", note="Pull request #7 opened.", now=T0)
+    other = lifecycle_request(store, admin, repo="acme/tools")
+    with pytest.raises(Conflict) as err:
+        store.mark_lifecycle_event_sent(event_id=second.id, now=T0)  # the requested note is not sent yet
+    assert err.value.code == "wrong_state"
+    store.mark_lifecycle_event_sent(event_id=store.lifecycle_events(other.id)[0].id, now=T0)  # another request's notes don't wait
+    store.mark_lifecycle_event_failed(event_id=second.id, error="ServiceNow answered 503 for the task's work note", now=T0)
+    store.mark_lifecycle_event_sent(event_id=first.id, now=T0)
+    store.mark_lifecycle_event_sent(event_id=second.id, now=T0)
+    assert store.lifecycle_events(unsent=True) == []
+    for missing in (0, -1, 10**6):
+        for call in (lambda: store.mark_lifecycle_event_sent(event_id=missing, now=T0),
+                     lambda: store.mark_lifecycle_event_failed(event_id=missing, error="ServiceNow answered 503", now=T0),
+                     lambda: store.finish_lifecycle_command(command_id=missing, now=T0)):
+            with pytest.raises(Conflict) as err:
+                call()
+            assert err.value.code == "wrong_state"
+    assert [e.sent_at is not None for e in store.lifecycle_events(req.id)] == [True, True]
+
+
+def test_a_request_has_one_requested_note(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    with pytest.raises(Conflict) as err:
+        store.add_lifecycle_event(request_id=req.id, step="requested", note=NOTE, now=T0)
+    assert err.value.code == "event_exists"
+    assert [e.step for e in store.lifecycle_events(req.id)] == ["requested"]
+
+
+def test_a_command_or_a_note_for_an_unknown_request_or_by_an_unknown_person_is_not_found(store):
+    _, admin = people(store)
+    req = lifecycle_request(store, admin)
+    unknown = "r_" + "0" * 32
+    for call in (lambda: store.add_lifecycle_command(request_id=unknown, command="retry", actor_id=admin.id, now=T0),
+                 lambda: store.add_lifecycle_event(request_id=unknown, step="pr_opened", note="Pull request #7 opened.", now=T0),
+                 lambda: store.add_lifecycle_command(request_id=req.id, command="retry", actor_id="p_" + "0" * 32, now=T0)):
+        with pytest.raises(Conflict) as err:
+            call()
+        assert err.value.code == "not_found"
+    assert store.open_lifecycle_command(req.id) is None
+
+
+def test_a_step_moves_with_its_note_in_one_transaction(store):
+    """L11 never loses a note: the writer moves a step and adds the note that says so together, or neither."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    moved, event = store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="pr_open", now=T0,
+                                                        event="pr_opened", note="Pull request #7 opened.", **PR)
+    assert (moved.state, moved.pr_number) == ("pr_open", 7) and store.lifecycle_steps(req.id)[0] == moved
+    assert (event.step, event.note, event.request_id) == ("pr_opened", "Pull request #7 opened.", req.id)
+    assert [e.step for e in store.lifecycle_events(req.id)] == ["requested", "pr_opened"]
+    with pytest.raises(Conflict) as err:  # no move: no note
+        store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="pr_open", now=T0, event="pr_opened", note="Again.", **PR)
+    assert err.value.code == "wrong_state"
+    with pytest.raises(ValueError):  # no note: no move
+        store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="done", now=T0, event="paused", note="x", merge_sha="3" * 40)
+    with pytest.raises(ValueError):
+        store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="done", now=T0, event="merged", note="", merge_sha="3" * 40)
+    store.add_lifecycle_event(request_id=req.id, step="completed", note=COMPLETED, now=T0)
+    with pytest.raises(Conflict) as err:  # the note is refused after the step's row is written: the move is undone with it
+        store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="done", now=T0, event="completed", note=COMPLETED,
+                                             merge_sha="3" * 40)
+    assert err.value.code == "event_exists"
+    assert store.lifecycle_steps(req.id)[0].state == "pr_open"
+    assert [e.step for e in store.lifecycle_events(req.id)] == ["requested", "pr_opened", "completed"]
+    done, merged = store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="done", now=T0, event="merged",
+                                                        note="Merged.", merge_sha="3" * 40)
+    assert (done.state, done.merge_sha, merged.step) == ("done", "3" * 40, "merged")
+
+
+def test_a_command_the_writer_does_not_carry_out_is_finished_with_its_note(store):
+    """A refused, late or no-op command is finished with a note (the "command" step) in the same transaction: never silence."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    made = store.add_lifecycle_command(request_id=req.id, command="retry", actor_id=admin.id, now=T0)
+    store.finish_lifecycle_command(command_id=made.id, now=T0, note="Retry asked by Admin, but no step had failed: nothing changed.")
+    assert store.open_lifecycle_command(req.id) is None
+    assert [(e.step, e.note) for e in store.lifecycle_events(req.id)][-1] == (
+        "command", "Retry asked by Admin, but no step had failed: nothing changed.")
+    again = store.add_lifecycle_command(request_id=req.id, command="retry", actor_id=admin.id, now=T0)
+    with pytest.raises(ValueError):
+        store.finish_lifecycle_command(command_id=again.id, now=T0, note="")
+    assert store.open_lifecycle_command(req.id) is not None, "no note: not finished either"
+    store.finish_lifecycle_command(command_id=again.id, now=T0)  # without a note, as before
+    assert [e.step for e in store.lifecycle_events(req.id)].count("command") == 1
+
+
+def test_an_abandon_closes_its_steps_finishes_its_command_notes_it_and_fails_the_request_in_one_transaction(store):
+    """Every step not done is closed in the same transaction as the command, the note and writing -> failed: a crash between them
+    never leaves closed steps under a writing request."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=T0, **PR)
+    made = store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0)
+    other = lifecycle_request(store, admin, repo="acme/tools")
+    store.claim_approved(now=T0)
+    theirs = store.add_lifecycle_command(request_id=other.id, command="abandon", actor_id=admin.id, now=T0)
+    with pytest.raises(Conflict):  # another request's command: nothing changes, not even a step
+        store.abandon_lifecycle(request_id=req.id, command_id=theirs.id, note="Abandoned by Admin.", now=T0)
+    assert [s.state for s in store.lifecycle_steps(req.id)] == ["pr_open", "planned", "planned"]
+    with pytest.raises(ValueError):  # no note: nothing
+        store.abandon_lifecycle(request_id=req.id, command_id=made.id, note="", now=T0)
+    assert store.get_request(req.id).state == "writing" and store.open_lifecycle_command(req.id) is not None
+    failed = store.abandon_lifecycle(request_id=req.id, command_id=made.id, note="Abandoned by Admin.", now=T0)
+    assert (failed.state, failed.failure_reason) == ("failed", "abandoned")
+    assert [s.state for s in store.lifecycle_steps(req.id)] == ["closed", "closed", "closed"]
+    assert store.open_lifecycle_command(req.id) is None
+    assert [(e.step, e.note) for e in store.lifecycle_events(req.id)][-1] == ("abandoned", "Abandoned by Admin.")
+    with pytest.raises(Conflict):
+        store.abandon_lifecycle(request_id=req.id, command_id=made.id, note="Abandoned by Admin.", now=T0)
+
+
+def test_an_abandon_keeps_a_done_step_and_a_closed_one(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="archive", to_state="failed", now=T0, failure_reason="archive: not installed")
+    store.move_lifecycle_step(request_id=req.id, step="factory", to_state="closed", now=T0)
+    made = store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0)
+    store.abandon_lifecycle(request_id=req.id, command_id=made.id, note="Abandoned by Admin.", now=T0)
+    assert [(s.state, s.failure_reason) for s in store.lifecycle_steps(req.id)] == [("done", None), ("closed", None), ("closed", None)], \
+        "a closed step keeps no failure reason (0012: only a failed step has one)"
+
+
+def test_a_stop_closes_the_steps_still_to_do_finishes_its_command_notes_it_and_fails_the_request_in_one_transaction(store):
+    """I-1: a decommission whose deploy step is done ends failed "stopped": its remaining steps closed, the stop command finished and
+    its "stopped" note, all at once. The state the deploy step set stays."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    store.set_lifecycle_state(request_id=req.id, state="decommissioned", now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="done", now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="archive", to_state="failed", now=T0, failure_reason="archive: github: 404")
+    abandon = store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0)
+    with pytest.raises(Conflict):  # an abandon is not a stop
+        store.stop_lifecycle(request_id=req.id, command_id=abandon.id, note="Stopped by Admin.", now=T0)
+    store.finish_lifecycle_command(command_id=abandon.id, now=T0)
+    made = store.add_lifecycle_command(request_id=req.id, command="stop", actor_id=admin.id, now=T0)
+    assert made.command == "stop"
+    with pytest.raises(ValueError):  # no note: nothing
+        store.stop_lifecycle(request_id=req.id, command_id=made.id, note="", now=T0)
+    assert store.get_request(req.id).state == "writing" and store.open_lifecycle_command(req.id) is not None
+    failed = store.stop_lifecycle(request_id=req.id, command_id=made.id, note="Stopped by Admin.", now=T0)
+    assert (failed.state, failed.failure_reason) == ("failed", "stopped")
+    assert [s.state for s in store.lifecycle_steps(req.id)] == ["done", "closed", "closed"]
+    assert store.open_lifecycle_command(req.id) is None
+    assert [(e.step, e.note) for e in store.lifecycle_events(req.id)][-1] == ("stopped", "Stopped by Admin.")
+    assert store.lifecycle_state("acme/notes").state == "decommissioned"
+    with pytest.raises(Conflict):
+        store.stop_lifecycle(request_id=req.id, command_id=made.id, note="Stopped by Admin.", now=T0)
+
+
+def test_a_stop_is_only_for_a_decommission_whose_deploy_step_is_done(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    made = store.add_lifecycle_command(request_id=req.id, command="stop", actor_id=admin.id, now=T0)
+    with pytest.raises(Conflict):
+        store.stop_lifecycle(request_id=req.id, command_id=made.id, note="Stopped by Admin.", now=T0)
+    assert [s.state for s in store.lifecycle_steps(req.id)] == ["planned", "planned", "planned"]
+    suspend, _ = writing_lifecycle(store, admin, repo="acme/tools")
+    store.move_lifecycle_step(request_id=suspend.id, step="deploy", to_state="done", now=T0)
+    theirs = store.add_lifecycle_command(request_id=suspend.id, command="stop", actor_id=admin.id, now=T0)
+    with pytest.raises(Conflict):
+        store.stop_lifecycle(request_id=suspend.id, command_id=theirs.id, note="Stopped by Admin.", now=T0)
+    assert store.get_request(suspend.id).state == "writing" and store.open_lifecycle_command(suspend.id) is not None
+
+
+def test_a_retry_moves_its_step_notes_it_and_finishes_its_command_in_one_transaction(store):
+    """I-3: never a retried step whose command is still open (the next pass would retry it again), nor a finished command whose step
+    never moved."""
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=T0, **PR)
+    made = store.add_lifecycle_command(request_id=req.id, command="retry", actor_id=admin.id, now=T0)
+    note = "Retried by Admin: the deploy step starts again (attempt 2)."
+    with pytest.raises(Conflict) as err:  # the step hasn't failed: nothing changes
+        store.retry_lifecycle(request_id=req.id, command_id=made.id, step="deploy", note=note, now=T0)
+    assert err.value.code == "wrong_state"
+    assert store.open_lifecycle_command(req.id) is not None and "retried" not in [e.step for e in store.lifecycle_events(req.id)]
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="failed", now=T0, failure_reason="check_failed: deploy-check")
+    with pytest.raises(ValueError):  # no note: nothing
+        store.retry_lifecycle(request_id=req.id, command_id=made.id, step="deploy", note="", now=T0)
+    other, _ = writing_lifecycle(store, admin, repo="acme/tools")
+    theirs = store.add_lifecycle_command(request_id=other.id, command="retry", actor_id=admin.id, now=T0)
+    for wrong in (theirs.id, 0, 10**6):  # another request's command, or none
+        with pytest.raises(Conflict) as err:
+            store.retry_lifecycle(request_id=req.id, command_id=wrong, step="deploy", note=note, now=T0)
+        assert err.value.code == "wrong_state"
+    assert store.lifecycle_steps(req.id)[0].state == "failed" and store.open_lifecycle_command(req.id).id == made.id
+    assert "retried" not in [e.step for e in store.lifecycle_events(req.id)]
+    moved = store.retry_lifecycle(request_id=req.id, command_id=made.id, step="deploy", note=note, now=T0)
+    assert (moved.state, moved.attempt, moved.pr_number, moved.failure_reason) == ("planned", 2, None, None)
+    assert store.lifecycle_steps(req.id)[0] == moved and store.open_lifecycle_command(req.id) is None
+    assert [(e.step, e.note) for e in store.lifecycle_events(req.id)][-1] == ("retried", note)
+    with pytest.raises(Conflict):  # finished: never twice
+        store.retry_lifecycle(request_id=req.id, command_id=made.id, step="deploy", note=note, now=T0)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="failed", now=T0, failure_reason="check_failed: deploy-check")
+    abandon = store.add_lifecycle_command(request_id=req.id, command="abandon", actor_id=admin.id, now=T0)
+    with pytest.raises(Conflict) as err:  # an abandon is not a retry
+        store.retry_lifecycle(request_id=req.id, command_id=abandon.id, step="deploy", note=note, now=T0)
+    assert err.value.code == "wrong_state" and store.lifecycle_steps(req.id)[0].state == "failed"
+
+
+def test_a_rebuild_is_a_note_of_its_own(store):
+    _, admin = people(store)
+    req, _ = writing_lifecycle(store, admin)
+    store.move_lifecycle_step(request_id=req.id, step="deploy", to_state="pr_open", now=T0, **PR)
+    moved, event = store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="planned", now=T0, event="rebuilt",
+                                                        note="Pull request #7 closed: main moved, so the writer rebuilds it.")
+    assert (moved.state, moved.attempt, event.step) == ("planned", 2, "rebuilt")

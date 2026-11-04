@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.internal/schemas/lifecycle.v1.json",
+  "title": "lifecycle/v1",
+  "description": "apps/<owner>/<repo>/<env>/lifecycle.yaml in golden-road-deploy, written by the portal's writer when the platform suspends the app (spec 2026-11-02 L3). While it is there golden-road compose sets the Deployment's replicas to 0; resume deletes it. Its repo and environment are its directory's: deploy-check refuses another.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "environment", "state", "task", "reason", "requested_by", "requested_at", "request"],
+  "$defs": {"single_line": {"not": {"pattern": "[\\r\\n]"}}},
+  "properties": {
+    "schema": {"const": "lifecycle/v1"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "environment": {"enum": ["test", "prod"]},
+    "state": {"const": "suspended", "description": "The only state: resume deletes the file."},
+    "task": {"type": "string", "pattern": "^SCTASK[0-9]{7}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "reason": {"type": "string", "minLength": 10, "maxLength": 1000, "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "requested_by": {"type": "string", "pattern": "^p_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "requested_at": {"type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "allOf": [{"$ref": "#/$defs/single_line"}]},
+    "request": {"type": "string", "pattern": "^r_[0-9a-f]{32}$", "allOf": [{"$ref": "#/$defs/single_line"}]}
+  }
+}

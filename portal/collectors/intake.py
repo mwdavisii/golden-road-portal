@@ -176,16 +176,22 @@ def observe(gh, factory_repo, commit, cached) -> list[IntakeObserved]:
     return rows
 
 
+DECOMMISSIONED_NOTE = "Closed by the platform: the app is decommissioned."
+
+
 def sync_date_items(store, rows, *, today, due_soon_days, now) -> tuple[int, int]:
     """(opened, closed): each readable intake/v2 record gets the date reason its review_by gives today (spec R3); an open date item whose
     record no longer gives it, with that date, closes by itself. Kept as they are: the items of a repo whose record can't be read this
     pass or was rewritten as intake/v1 (a broken or older file must not clear an overdue review); collect_intake doesn't call this at
-    all when every record is gone at once. A closed item never reopens for the same date (the store refuses: item_exists)."""
+    all when every record is gone at once. A closed item never reopens for the same date (the store refuses: item_exists).
+    A decommissioned app (the portal's lifecycle_state, spec 2026-11-02; decided while planning: item 13) is no longer due for review:
+    it wants no date reason and its open date items close with DECOMMISSIONED_NOTE, whatever its record says."""
     by_repo = {r.repo.lower(): r for r in rows}
-    held = {key for key, r in by_repo.items() if r.problem is not None or r.schema == "intake/v1"}
+    gone = {s.repo.lower() for s in store.lifecycle_states() if s.state == "decommissioned"}
+    held = {key for key, r in by_repo.items() if (r.problem is not None or r.schema == "intake/v1") and key not in gone}
     wanted = {}
     for key, r in by_repo.items():
-        reason = date_reason(r.review_by, today, due_soon_days) if r.problem is None and r.schema == "intake/v2" else None
+        reason = date_reason(r.review_by, today, due_soon_days) if r.problem is None and r.schema == "intake/v2" and key not in gone else None
         if reason:
             wanted[(key, reason)] = (r.repo, r.review_by.isoformat())
     opened = closed = 0
@@ -198,7 +204,8 @@ def sync_date_items(store, rows, *, today, due_soon_days, now) -> tuple[int, int
             still_open.add((item.repo.lower(), item.reason))
             continue
         try:
-            store.auto_close_rereview_item(item_id=item.id, note=auto_close_note(by_repo.get(item.repo.lower()), item, today, due_soon_days), now=now)
+            note = DECOMMISSIONED_NOTE if item.repo.lower() in gone else auto_close_note(by_repo.get(item.repo.lower()), item, today, due_soon_days)
+            store.auto_close_rereview_item(item_id=item.id, note=note, now=now)
             closed += 1
         except Conflict:
             continue  # closed meanwhile by an admin

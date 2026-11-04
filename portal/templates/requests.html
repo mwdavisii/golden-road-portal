@@ -17,7 +17,7 @@
 <table class="requests">
 <thead><tr><th scope="col">Repository</th><th scope="col">Kind</th><th scope="col">State</th><th scope="col">Submitted</th></tr></thead>
 <tbody>
-{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}?environment={{ environment_of(r) }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections ({{ environment_of(r) }}){% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ STATE_LABELS.get(r.state, r.state) }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
+{% for r in requests %}<tr><td class="mono">{% if r.kind != "binding" %}<a href="/requests/{{ r.id }}">{{ r.repo }}</a>{% elif r.repo in app_names %}<a href="/apps/{{ r.repo }}?environment={{ environment_of(r) }}">{{ r.repo }}</a>{% else %}{{ r.repo }}{% endif %}</td><td>{% if r.kind == "binding" %}Connections ({{ environment_of(r) }}){% elif r.kind == "lifecycle" %}Lifecycle ({{ r.final.action }}){% else %}Registration{% endif %}</td><td><span class="badge state-{{ r.state }}">{{ STATE_LABELS.get(r.state, r.state) }}</span></td><td class="when">{{ r.created_at.strftime("%Y-%m-%d") }}</td></tr>
 {% endfor %}
 </tbody>
 </table>
