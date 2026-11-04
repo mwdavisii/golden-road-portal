@@ -595,9 +595,10 @@ class RepoWorld:
         """The call carries an RS256 App JWT issued by the lifecycle App (its signature is the real GitHub's to check)."""
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         try:
-            claims = jwt.decode(token, options={"verify_signature": False})
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
             return jwt.get_unverified_header(token).get("alg") == "RS256" and claims.get("iss") == str(self.lifecycle_app_id)
-        except jwt.PyJWTError:
+        except (jwt.PyJWTError, IndexError, ValueError):
             return False
 
     def _pr_view(self, repo, pull):

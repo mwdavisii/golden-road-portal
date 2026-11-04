@@ -666,23 +666,37 @@ def test_a_step_moves_only_while_its_request_is_being_written(pg_db):
                       (rid(2),))
 
 
+# Each statement is a literal (Semgrep refuses composed SQL); the column is the only thing that differs.
+CHANGE_PR = {
+    "branch": "UPDATE lifecycle_step SET state = %s, failure_reason = %s, branch = %s WHERE request_id = %s",
+    "pr_number": "UPDATE lifecycle_step SET state = %s, failure_reason = %s, pr_number = %s WHERE request_id = %s",
+    "pr_url": "UPDATE lifecycle_step SET state = %s, failure_reason = %s, pr_url = %s WHERE request_id = %s",
+    "head_sha": "UPDATE lifecycle_step SET state = %s, failure_reason = %s, head_sha = %s WHERE request_id = %s",
+    "base_sha": "UPDATE lifecycle_step SET state = %s, failure_reason = %s, base_sha = %s WHERE request_id = %s",
+}
+
+
 @pytest.mark.parametrize("column, value", [("branch", "other"), ("pr_number", 8), ("pr_url", "https://github.com/x/y/pull/8"),
                                            ("head_sha", "4" * 40), ("base_sha", "5" * 40)])
-@pytest.mark.parametrize("to_state, extra", [("done", sql.SQL("")), ("failed", sql.SQL(", failure_reason = 'x'")), ("closed", sql.SQL(""))])
-def test_an_open_step_s_pull_request_never_changes(pg_db, column, value, to_state, extra):
+@pytest.mark.parametrize("to_state, reason", [("done", None), ("failed", "x"), ("closed", None)])
+def test_an_open_step_s_pull_request_never_changes(pg_db, column, value, to_state, reason):
     pid = person(pg_db, "admin")
     steps(pg_db, pid, action="suspend")
     with conn_as(pg_db, "portal_writer") as c:
         c.execute("UPDATE lifecycle_step SET state = 'pr_open', branch = 'b', pr_number = 7, pr_url = 'https://github.com/x/y/pull/7', "
                   "head_sha = %s, base_sha = %s WHERE request_id = %s", ("2" * 40, "1" * 40, rid(1)))
-        statement = sql.SQL("UPDATE lifecycle_step SET state = {state}, {column} = {value}{extra} WHERE request_id = {request}").format(
-            state=sql.Literal(to_state), column=sql.Identifier(column), value=sql.Literal(value), extra=extra, request=sql.Literal(rid(1)))
         with pytest.raises(errors.RaiseException) as err:
-            c.execute(statement)
+            c.execute(CHANGE_PR[column], (to_state, reason, value, rid(1)))
         assert "never changes" in str(err.value)
-        c.execute(sql.SQL("UPDATE lifecycle_step SET state = {state}{extra} WHERE request_id = {request}").format(
-            state=sql.Literal(to_state), extra=extra, request=sql.Literal(rid(1))))
+        c.execute("UPDATE lifecycle_step SET state = %s, failure_reason = %s WHERE request_id = %s", (to_state, reason, rid(1)))
         assert c.execute("SELECT branch, pr_number FROM lifecycle_step").fetchone() == ("b", 7)
+
+
+PLANNED_WITH_PR = {
+    "pr_url": "INSERT INTO lifecycle_step (request_id, step, position, state, updated_at, pr_url) VALUES (%s, 'deploy', 1, 'planned', now(), %s)",
+    "head_sha": "INSERT INTO lifecycle_step (request_id, step, position, state, updated_at, head_sha) VALUES (%s, 'deploy', 1, 'planned', now(), %s)",
+    "base_sha": "INSERT INTO lifecycle_step (request_id, step, position, state, updated_at, base_sha) VALUES (%s, 'deploy', 1, 'planned', now(), %s)",
+}
 
 
 @pytest.mark.parametrize("column, value", [("pr_url", "https://github.com/x/y/pull/7"), ("head_sha", "2" * 40), ("base_sha", "1" * 40)])
@@ -693,9 +707,7 @@ def test_a_planned_step_has_no_pull_request(pg_db, column, value):
     writing(pg_db, rid(1))
     with conn_as(pg_db, "portal_writer") as c:
         with pytest.raises(errors.CheckViolation):
-            c.execute(sql.SQL("INSERT INTO lifecycle_step (request_id, step, position, state, updated_at, {column}) "
-                              "VALUES ({request}, 'deploy', 1, 'planned', now(), {value})").format(
-                column=sql.Identifier(column), request=sql.Literal(rid(1)), value=sql.Literal(value)))
+            c.execute(PLANNED_WITH_PR[column], (rid(1), value))
 
 
 # ---- the collector's write-back (spec 2026-11-02 L11) as the collector's role ----
