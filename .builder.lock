@@ -3,10 +3,10 @@
     "AGENTS.md": "793bf2339ff29d717e0df7cbd6afffff06edbe844c6f1a3bf177c0833066844f",
     "CLAUDE.md": "80335c8c80902767fd3e773e3411f3e25b118b411de6e71de97616c818b5f1b7"
   },
-  "builder_version": "0.6.1",
+  "builder_version": "0.7.0",
   "files": {
     ".dockerignore": "16db3544cb06ccea08c36be035d48d045628f77baf1fc24f23f8472896d68ede",
-    "Dockerfile": "694028a5a547a9852bb52700638dc8ab2372a4aa56c4e57fd8d53cabb626047c",
+    "Dockerfile": "1114c956a1c78c98dbe558cf8682ae80d5f3ebaa3e241740271faecbcb411e24",
     "_platform/__init__.py": "44d60d96d8ea7bf72f6d79c09aa40f1a0257b59c788efae75c91796356efed77",
     "_platform/authz-policy.json": "bb368722ab6b01a4dfe6d487194e9bac05442e5765ec728225db2165d3e81188",
     "_platform/authz.py": "8d9b934260887fad674d58e3da6ec7b2f351ad6752140647ad674ea60e90df5e",

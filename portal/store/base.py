@@ -16,7 +16,7 @@ LINK_SOURCES = ("github-oauth", "admin")
 
 
 class Conflict(Exception):
-    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable."""
+    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable, decommissioned, command_open, not_lifecycle."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -451,6 +451,136 @@ def check_cmdb_error(repo, error) -> None:
         raise ValueError("a CMDB error names its repo and one of the known errors")
 
 
+# ---- lifecycle (spec 2026-11-02, migration 0012): a request's steps, the commands the web asks the writer for, the outbox ----
+
+LIFECYCLE_ACTIONS = ("suspend", "resume", "decommission")
+LIFECYCLE_STATES = ("active", "suspended", "decommissioned")
+# Rule 7's order. A decommission archives the repository before the factory PR (decided by the lead while Mike was away): archived, the
+# app's release workflow can't add an environment back to the deploy repo while the factory record still says it is live. A step leaves
+# planned only once every earlier one is done (both stores and 0012's step guard).
+ACTION_STEPS = {"suspend": ("deploy",), "resume": ("deploy",), "decommission": ("deploy", "archive", "factory")}
+STATE_AFTER = {"suspend": "suspended", "resume": "active", "decommission": "decommissioned"}  # the state each action applies
+STEP_STATES = ("planned", "pr_open", "done", "failed", "closed")
+# Every move a step may make (0012's lifecycle_step guard holds the same): done and closed are for good; back to planned is a retry
+# (from failed) or a rebuild on a new main (from pr_open, or from planned: a branch left on an old main by a pass that stopped before it
+# recorded its PR), and starts a new attempt with no pull request.
+STEP_TRANSITIONS = frozenset({("planned", "pr_open"), ("planned", "done"), ("pr_open", "done"), ("planned", "failed"), ("pr_open", "failed"),
+                              ("pr_open", "planned"), ("failed", "planned"), ("planned", "planned"), ("planned", "closed"), ("pr_open", "closed"),
+                              ("failed", "closed")})
+# "command": a command the writer finished without carrying it out (refused: not an admin; too late; nothing to retry), said in a note;
+# "rebuilt": main moved, so the writer closed its pull request and starts the step again on a new attempt; "stopped": a decommission an
+# admin stopped after its deploy merge (the task stays open)
+EVENT_STEPS = ("requested", "pr_opened", "merged", "factory_merged", "archived", "failed", "retried", "abandoned", "completed",
+               "ci_corrected", "command", "rebuilt", "stopped")
+# stop: the way out of a decommission whose deploy step is done (too late to abandon) but whose archive or factory step can't finish
+COMMANDS = ("retry", "abandon", "stop")
+TASK_NUMBER = re.compile(r"SCTASK[0-9]{7}")
+PERSON_ID = re.compile(r"p_[0-9a-f]{32}")
+MIN_REASON, MAX_REASON = 10, 1000
+MAX_EVENT_NOTE = 3000  # a work note: the reason (1000) and what the platform did, with room
+MAX_STEP_REASON = 300
+LIFECYCLE_KEYS = frozenset({"action", "task", "task_sys_id", "reason"})
+
+
+@dc.dataclass(frozen=True)
+class LifecycleState:
+    """What the platform applied to an app, in git (L12). No row is an active app that never had a lifecycle action."""
+    repo: str
+    state: str  # active, suspended or decommissioned (for good)
+    task: str | None  # the ServiceNow task of the action that set it; None when active
+    since: dt.datetime
+    request: str  # the lifecycle request that set it: rule 9's "latest lifecycle task"
+
+
+@dc.dataclass(frozen=True)
+class LifecycleStep:
+    request_id: str
+    step: str  # deploy, archive or factory
+    position: int  # 1, 2, 3: ACTION_STEPS's order
+    state: str  # one of STEP_STATES
+    attempt: int = 1
+    branch: str | None = None
+    pr_number: int | None = None
+    pr_url: str | None = None
+    head_sha: str | None = None  # the commit the step's PR was opened with: the only one merged
+    base_sha: str | None = None
+    merge_sha: str | None = None
+    failure_reason: str | None = None
+    updated_at: dt.datetime | None = None
+
+
+@dc.dataclass(frozen=True)
+class LifecycleCommand:
+    """What an admin asked the writer to do with a lifecycle request (the web holds no GitHub credential): retry its failed step,
+    abandon it (rule 8), or stop a decommission after its deploy merge. At most one open per request."""
+    id: int
+    request_id: str
+    command: str  # retry, abandon or stop
+    requested_by: str
+    requested_at: dt.datetime
+    done_at: dt.datetime | None = None
+
+
+@dc.dataclass(frozen=True)
+class LifecycleEvent:
+    """One step of a lifecycle request, as a work note for its ServiceNow task (the outbox, L11). The collector sends a request's events
+    in id order and marks each sent; a failure keeps it unsent with its attempts and last error, and the next pass tries again."""
+    id: int
+    request_id: str
+    step: str  # one of EVENT_STEPS; completed closes the task
+    note: str
+    task_sys_id: str  # the request's task, set by the store from the request
+    created_at: dt.datetime
+    sent_at: dt.datetime | None = None
+    attempts: int = 0
+    last_error: str | None = None
+
+
+def check_lifecycle(request_id, person_id, repo, final) -> None:
+    """A lifecycle request's id has the portal's format, it names a person and a repo, and its record is exactly an action, a task (SCTASK
+    and 7 digits), the task's 32-hex sys_id and a one-line reason of 10 to 1000 characters (0012's insert guard holds the same)."""
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        raise ValueError("a lifecycle request's id is not a portal request id")
+    if not isinstance(person_id, str) or not PERSON_ID.fullmatch(person_id) or not isinstance(repo, str) or not REPO_NAME.fullmatch(repo):
+        raise ValueError("a lifecycle request names its person and its repo")
+    reason = final.get("reason") if isinstance(final, dict) else None
+    if (not isinstance(final, dict) or set(final) != LIFECYCLE_KEYS or final["action"] not in LIFECYCLE_ACTIONS
+            or not isinstance(final["task"], str) or not TASK_NUMBER.fullmatch(final["task"])
+            or not isinstance(final["task_sys_id"], str) or not SYS_ID.fullmatch(final["task_sys_id"])
+            or not isinstance(reason, str) or not MIN_REASON <= len(reason) <= MAX_REASON or "\n" in reason or "\r" in reason):
+        raise ValueError("a lifecycle request's record is an action, a task, the task's sys_id and a one-line reason of 10 to 1000 characters")
+
+
+def check_event(step, note) -> None:
+    if step not in EVENT_STEPS or not isinstance(note, str) or not 1 <= len(note) <= MAX_EVENT_NOTE:
+        raise ValueError(f"a lifecycle event names a known step and a note of 1 to {MAX_EVENT_NOTE} characters")
+
+
+PR_FIELDS = ("branch", "pr_number", "pr_url", "head_sha", "base_sha")
+
+
+def moved_step(kept, to_state, now, fields):
+    """The step after one of STEP_TRANSITIONS, with only the fields that move may set: pr_open needs all of PR_FIELDS, done may name
+    its merge commit (an archive or an empty deploy step has none), failed needs its reason, and planned starts a new attempt with
+    no pull request (a retry or a rebuild); closed drops a failed step's reason. Raises ValueError for anything else."""
+    allowed = {"pr_open": set(PR_FIELDS), "done": {"merge_sha"}, "failed": {"failure_reason"}, "planned": set(), "closed": set()}[to_state]
+    if set(fields) - allowed:
+        raise ValueError(f"a step moving to {to_state} sets only {sorted(allowed)}")
+    if to_state == "pr_open" and (set(fields) != set(PR_FIELDS) or not SHA40.fullmatch(fields["head_sha"] or "")
+                                  or not SHA40.fullmatch(fields["base_sha"] or "") or type(fields["pr_number"]) is not int):
+        raise ValueError("an open step's pull request names its branch, number, URL and its head and base commits")
+    if to_state == "done" and fields.get("merge_sha") is not None and not SHA40.fullmatch(fields["merge_sha"]):
+        raise ValueError("a merge commit is 40 hex characters")
+    if to_state == "failed" and not (isinstance(fields.get("failure_reason"), str) and 1 <= len(fields["failure_reason"]) <= MAX_STEP_REASON):
+        raise ValueError("a failed step records a reason of 1 to 300 characters")
+    if to_state == "planned":
+        return dc.replace(kept, state="planned", attempt=kept.attempt + 1, failure_reason=None, merge_sha=None, updated_at=now,
+                          **{f: None for f in PR_FIELDS})
+    if to_state == "closed":  # a failed step's reason goes with its state (0012: only a failed step has one)
+        return dc.replace(kept, state="closed", failure_reason=None, updated_at=now)
+    return dc.replace(kept, state=to_state, updated_at=now, **fields)
+
+
 class Store(Protocol):
     def sign_in(self, *, issuer, subject, display_name, email, groups, roles, now, max_age) -> tuple[Person, str, str]: ...
     def get_session(self, token, *, now, idle) -> Session | None: ...
@@ -519,3 +649,35 @@ class Store(Protocol):
     def record_cmdb_error(self, *, repo, error, now) -> None: ...  # keeps the CI's sys_id, number and hash
     def cmdb_records(self) -> list[CmdbRecord]: ...  # by lower(repo)
     def cmdb_record(self, repo) -> CmdbRecord | None: ...  # any case
+    def create_lifecycle(self, *, request_id, person_id, repo, final, note, now) -> Request: ...  # approved; its "requested" event too
+    def lifecycle_state(self, repo) -> LifecycleState | None: ...  # any case
+    def lifecycle_states(self) -> list[LifecycleState]: ...  # by lower(repo)
+    # the writer's, while the request is writing: the state its action applies (STATE_AFTER), to the request's repo with its task (none for
+    # active); the same again from the same request is kept as it is; decommissioned is for good
+    def set_lifecycle_state(self, *, request_id, state, now) -> LifecycleState: ...
+    def add_lifecycle_steps(self, *, request_id, steps, now) -> list[LifecycleStep]: ...  # all planned, in order; the request writing
+    def lifecycle_steps(self, request_id) -> list[LifecycleStep]: ...  # by position
+    # one of STEP_TRANSITIONS, while the request is writing; leaving planned (but for closed) once every earlier step is done
+    def move_lifecycle_step(self, *, request_id, step, to_state, now, **fields) -> LifecycleStep: ...
+    # move_lifecycle_step and add_lifecycle_event(step=event, note=note) in one transaction: both or neither (L11 never loses a note)
+    def move_lifecycle_step_with_event(self, *, request_id, step, to_state, now, event, note, **fields) -> tuple[LifecycleStep, LifecycleEvent]: ...
+    def add_lifecycle_command(self, *, request_id, command, actor_id, now) -> LifecycleCommand: ...
+    def open_lifecycle_command(self, request_id) -> LifecycleCommand | None: ...
+    def finish_lifecycle_command(self, *, command_id, now, note=None) -> None: ...  # with note: its "command" note, in one transaction
+    # a retry carried out, in one transaction: the failed step back to planned (a new attempt), its "retried" note, and the retry command
+    # finished; the step must have failed and the command be this request's open retry, or nothing changes
+    def retry_lifecycle(self, *, request_id, command_id, step, note, now) -> LifecycleStep: ...
+    # an abandon carried out, in one transaction: every step not done closed, the command finished, its "abandoned" note, and writing ->
+    # failed ("abandoned")
+    def abandon_lifecycle(self, *, request_id, command_id, note, now) -> Request: ...
+    # a stop carried out, the same way (its "stopped" note, writing -> failed "stopped"); only for a decommission whose deploy step is
+    # done: the state it set stays
+    def stop_lifecycle(self, *, request_id, command_id, note, now) -> Request: ...
+    def add_lifecycle_event(self, *, request_id, step, note, now) -> LifecycleEvent: ...
+    def lifecycle_events(self, request_id=None, *, unsent=False) -> list[LifecycleEvent]: ...  # by id
+    def mark_lifecycle_event_sent(self, *, event_id, now) -> None: ...  # in order: never while an earlier one of its request is unsent
+    def mark_lifecycle_event_failed(self, *, event_id, error, now) -> None: ...  # attempts + 1, the error kept
+    def writeback_lock(self): ...  # a context manager: True while this pass alone sends the outbox, False when another pass does
+    # once every step is done, in one transaction: the state its action applies (set_lifecycle_state's, kept if this request set it
+    # already), its completed note (closes the task), and writing -> merged with the last merge commit (or None: no step had a PR)
+    def apply_lifecycle(self, *, request_id, merge_sha, note, now) -> Request: ...

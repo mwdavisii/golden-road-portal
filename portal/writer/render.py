@@ -1,6 +1,7 @@
 """The file and the pull request the writer creates. The approver, the time and the justification are in both (P18). Text that
 came from people (names, justifications) sits in code spans or fences, so it can't mention anyone or add markup."""
 
+import datetime as dt
 import re
 
 import yaml
@@ -170,3 +171,54 @@ def pr_body(request, requester, approver, target, platform_user=None, current=No
         *_override_lines(f, approver),
         f"{WRITER_MERGES} Change this record through the portal.",
     ])
+
+
+# ---- lifecycle (spec 2026-11-02) ----
+
+Z = "%Y-%m-%dT%H:%M:%SZ"
+LIFECYCLE_HEADER = ("# Written by the golden road portal (request {id}). The platform suspended this environment for ServiceNow task {task}.\n"
+                    "# Resume it through the portal: golden-road compose keeps the Deployment at zero replicas while this file is here.\n")
+
+
+def utc(when) -> str:
+    """A stored time as lifecycle/v1 and intake/v2 write it: UTC, to the second."""
+    return when.astimezone(dt.UTC).strftime(Z)
+
+
+def lifecycle_yaml(request, environment: str) -> str:
+    """A suspend's lifecycle.yaml (lifecycle/v1) for one environment. requested_at is the request's creation time, so a rebuilt or resumed
+    step writes the same bytes (decided while planning: item 16)."""
+    doc = {"schema": "lifecycle/v1", "repo": request.repo, "environment": environment, "state": "suspended", "task": request.final["task"],
+           "reason": request.final["reason"], "requested_by": request.requested_by, "requested_at": utc(request.created_at),
+           "request": request.id}
+    return LIFECYCLE_HEADER.format(id=request.id, task=request.final["task"]) + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=1000)
+
+
+LIFECYCLE_TITLES = {("suspend", "deploy"): "Suspend {repo}", ("resume", "deploy"): "Resume {repo}",
+                    ("decommission", "deploy"): "Decommission {repo}: remove it from the deploy repo",
+                    ("decommission", "factory"): "Decommission {repo}: mark its intake record decommissioned"}
+
+
+def lifecycle_title(request, step: str) -> str:
+    words = LIFECYCLE_TITLES[(request.final["action"], step)].format(repo=request.repo)
+    return f"{words} (ServiceNow {request.final['task']}, portal request {request.id})"
+
+
+def lifecycle_body(request, step: str, requester, paths, writer_merges: bool) -> str:
+    """What the reviewer reads: who asked, for which task and why, every file, and who merges. Text from people is fenced or in code spans."""
+    action = request.final["action"]
+    verb = {"suspend": "suspends", "resume": "resumes"}.get(action, "decommissions")
+    lines = [f"The platform {verb} `{request.repo}` for ServiceNow task `{request.final['task']}`, asked in the portal by {_name(requester)} "
+             f"(`{request.requested_by}`), portal request `{request.id}`. Reason:",
+             fenced(request.final["reason"]), "", "Files:", *(f"- `{p}`" for p in paths), ""]
+    if writer_merges:
+        lines.append("Written by the golden road portal's writer. The writer merges it once deploy-check passes, and only if it changes "
+                     "nothing but lifecycle.yaml and the Deployment's replicas (spec L5). Don't push to the branch: the writer then never merges it.")
+    elif step == "deploy":
+        lines.append("Written by the golden road portal's writer. A platform reviewer reviews and merges it: it must delete "
+                     f"`apps/{request.repo}/` and each environment's two adapters under `clusters/`, and nothing else. Once it merges, the "
+                     "decommission can't be undone; the writer then archives the repository and opens the factory PR.")
+    else:
+        lines.append("Written by the golden road portal's writer. A security code owner of `intake/` reviews and merges it: it adds only the "
+                     "`decommissioned` key. The app was already removed from the deploy repo and its repository archived.")
+    return "\n".join(lines)

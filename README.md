@@ -11,7 +11,7 @@ One image, three entry points, plus the migration runner:
 | Process | Command | Credentials |
 |---|---|---|
 | web | `portal.main:app` (the generated `_platform/entry.py` wraps it) | database as `portal_web`; OIDC client secret; the read App's OAuth client secret |
-| writer | `python -m portal.writer` | database as `portal_writer`; the write App's key |
+| writer | `python -m portal.writer` | database as `portal_writer`; the write App's key; the lifecycle App's key (0.7.0, optional) |
 | collector | `python -m portal.collectors` | database as `portal_collector`; the read App's key |
 | migrations | `python -m portal.migrate` | `PORTAL_MIGRATE_DATABASE_URL` as `portal_owner` |
 
@@ -26,6 +26,8 @@ Trade-off: an unconfigured pod reports healthy (Kubernetes probes and the previe
 ## Database roles
 
 The database administrator creates `portal_owner` (owns the database and runs migrations), `portal_web`, `portal_writer` and `portal_collector`, each with LOGIN, before the first migration. The migration grants each role only its process's work: the audit log is insert and read only for `portal_web` and `portal_writer`, and a trigger refuses any change to it, even by the owner. Each process gets its own `PORTAL_DATABASE_URL`.
+
+No portal process needs a temporary table, so the administrator also runs `REVOKE TEMPORARY ON DATABASE <database> FROM PUBLIC` (Postgres grants it to every role by default). Since `0012` every trigger function pins `search_path = public, pg_temp`, so a temporary table can't stand in for a table a guard reads; the revoke takes that attempt away altogether.
 
 ## Authorization (a recorded deviation, P14)
 
@@ -55,7 +57,7 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD` | Optional; each environment's gateway host, the same as `platform.json`'s `mcp_gateways` (`configure.py --mcp-gateway-test`, `--mcp-gateway-prod`). Empty is the placeholder, `mcp-test.example.com` or `mcp.example.com`; the two must differ. The writer must get the same values |
 | `PORTAL_MCP_PROCESS_URL` | Optional; an `https://` page that says how to ask for a server to be added to a gateway (linked on the app page) |
 | `PORTAL_SKILLS_CATALOG` | Optional; `mock` turns on each app's skills from the platform's catalog (`portal/mock_skills_catalog.json`); unset, the app page shows none. The writer must get the same value |
-| `PORTAL_SERVICENOW` | Optional; `mock` shows the collector's CMDB records (the app page's card, the request's Registered in ServiceNow step). The collector reads it too |
+| `PORTAL_SERVICENOW` | Optional; `mock` shows the collector's CMDB records (the app page's card, the request's Registered in ServiceNow step) and turns on the lifecycle actions (the web checks each task against it). The collector reads it too |
 | `PORTAL_ORG_NAME` | Optional; the organization's name in the ownership notice (one line, 1 to 100 characters; empty is "the organization") |
 | `PORTAL_LIFECYCLE_GRACE_DAYS` | Optional; the days the ownership notice gives (0 to 36500, default 30; `0` leaves the day count out, it never means "no time") |
 | `PORTAL_CLOUDFLARE_ACCOUNT_ID`, `PORTAL_SERVICENOW_URL` | Must stay unset: they are for a real Cloudflare account and a real ServiceNow instance, which there are none of yet. Set, each process that reads them stops (the web both, the writer the account id, the collector the URL) |
@@ -129,7 +131,8 @@ bindings per environment (one open request per kind, repo and environment; the i
 (below): the record a change replaces on its evidence, the collector's caches (`intake_observed`, `rereview_run`, `rereview_event`,
 `rereview_failed_run`, `rereview_watermark`, `rereview_source`) and the re-review items. Only `portal_collector` writes the caches
 and opens items; `portal_web` may only close an item, never for an app the closer owns; the collector's audit entries are `system`
-ones about items only, each written once. `0011` is the CMDB record and the ownership acknowledgement (below).
+ones about items only, each written once. `0011` is the CMDB record and the ownership acknowledgement (below),
+and `0012` the lifecycle (below): the `lifecycle` kind, its state, steps, commands and outbox.
 
 Migrations are forward-only: there are no down migrations. After `0006` an older image still handles registrations, but its
 writer fails every binding request it claims (it knows only registrations). Don't roll the image back once bindings exist; if you
@@ -249,18 +252,92 @@ owner is unknown is not sent: a CI with no owner is an orphaned app. An `intake/
 purpose is cut at 1000 characters for `short_description`. The problems are `cmdb_unreachable` (ServiceNow didn't answer; the
 rest wait for the next pass), `cmdb_owner_unknown` and `cmdb_refused` (an item came back with errors), each shown on the
 Re-review page with the repos whose last attempt failed. The log line is `collectors: cmdb: N synced, M unchanged`. Nothing
-changes the owner in ServiceNow from the portal, and nothing retires a CI.
+changes the owner in ServiceNow from the portal; from 0.7.0 a decommission retires the CI (below).
 
 **What owning the app means.** One template, `_ownership.html`: patching, validation, leaving, with `PORTAL_ORG_NAME` and
 `PORTAL_LIFECYCLE_GRACE_DAYS`. The register form shows it with a required checkbox, "I understand what owning this app means"; a
 submission without it is refused and nothing is stored. The approval screen shows when it was acknowledged ("Not recorded" for a
 request from before 0.6.0). Once the collector has a CI number, the app page shows it as a card, and the request's timeline gains
-the step Registered in ServiceNow. Mock only: nothing suspends, asks, tasks or decommissions.
+the step Registered in ServiceNow. The ownership notice itself suspends nothing: from 0.7.0 a portal admin applies ServiceNow's
+decision (below).
 
 Migration `0011` adds `cmdb_record` (repo, `sys_id`, number, the synced fields' hash, the last good sync and the last error; only
 `portal_collector` writes it, the web reads it), `request.ownership_acknowledged_at` (NULL for every request before it; registrations
 only; never changed after the insert), the `cmdb` part on `rereview_source`, and the collector's read of a person's email. It is
 forward-only, as `0010` is.
+
+## Lifecycle: suspend, resume and decommission (0.7.0, mock ServiceNow)
+
+Mock only: nothing calls a real ServiceNow, and "applied" means applied in git (a merged PR, an archived repository); nothing reads
+the cluster. The rules for readers are `docs/lifecycle.md`.
+
+**Who and the task check.** Only a portal admin (the `admin` role) sees the app page's Lifecycle panel and its Suspend, Resume and
+Decommission buttons; everyone sees the banner. Each form takes a ServiceNow task (`SCTASK` and 7 digits) and a one-line reason of
+10 to 1000 characters. The web checks the task with
+`GET /api/now/table/sc_task?sysparm_query=number=<task>&sysparm_fields=sys_id,number,state,cmdb_ci&sysparm_limit=1`: it must exist,
+be open (state 1 or 2), and name the app's CI (the `sys_id` the collector's CMDB sync recorded). ServiceNow not answering refuses the
+request ("The task can't be checked now"). A task the portal is closing (its `completed` note is stored, sent or not) is refused as
+closed. One lifecycle request is open per app, and a decommissioned app takes no request of any kind.
+
+**What each action writes.** A suspend adds `lifecycle.yaml` (`lifecycle/v1`) beside each environment's `bindings.yaml` in
+`golden-road-deploy` and recomposes `composed.yaml` with the Deployment's `replicas: 0`, in one PR for every environment with a
+release; a resume deletes `lifecycle.yaml` and recomposes. A decommission has three steps, in this order: the deploy repo PR deletes
+`apps/<owner>/<repo>/` and each environment's two adapters (only an adapter that reconciles the app's own path: `adapter_not_ours`
+otherwise; another spelling of the app's directory is `case_mismatch`), and a platform reviewer merges it; then the writer archives
+the repository with the lifecycle App; then a factory PR adds `decommissioned` to the intake record, and a security code owner merges
+it. Archiving before the factory PR stops the app's release workflow from adding an environment back. An app outside `PORTAL_ORG`
+(`not_in_org`) and the six platform repositories are never decommissioned. Every lifecycle PR is built on the target repo's current
+`main` on `portal/lifecycle-<request>-<step>-<attempt>`; if `main` moves first the writer closes it and rebuilds the step on a new
+branch (a "rebuilt" note), so a reviewer's approval is lost whenever the deploy repo's `main` moves.
+
+**L5.** The writer merges a suspend or resume PR itself, prod included, only after it re-reads the PR: exactly `lifecycle.yaml` and
+`composed.yaml` in each environment, added (suspend) or removed (resume), this request's `lifecycle.yaml`, and `composed.yaml`
+different only in the Deployment's `replicas` (0, or back to `base/manifests.yaml`'s value). Anything else fails the step
+`l5_refused: <what it found>` and closes the PR. The decommission's two PRs always wait for a person.
+
+**The lifecycle App.** Administration: write, installed on app repos only. The writer first asks, as the App, for its installation
+on each of the six platform repositories (each must be a 404, or the step fails `lifecycle_app_on_platform_repo: <repo>`), then for
+the app repository's, and mints a token for that one repository with only `administration: write` (a token GitHub grants wider or
+narrower is revoked unused). The token makes exactly three calls: `GET /repos/{owner}/{repo}` (already archived: the step is done),
+`PATCH /repos/{owner}/{repo}` with `{"archived": true}`, and `DELETE /installation/token`. A failure is `archive: github: <status>
+<method> <path>`; GitHub not answering waits for the next pass.
+
+**The outbox.** Every step queues a work note in `lifecycle_events` (requested, PR opened, merged, factory record merged,
+repository archived, failed, retried, rebuilt, abandoned, stopped, a command's outcome, and `ci_corrected`). The collector sends them after its
+CMDB part, per request in order: `PATCH /api/now/table/sc_task/<sys_id>` with `{"work_notes": "<note>"}`, and for the last one
+`{"state": "3", "close_notes": "<summary>"}` (Closed Complete). Each note ends with the request's link on `PORTAL_BASE_URL`, and is
+neutralised first: control and format characters are dropped and `[code]` tags broken, so a reason can't render as HTML. A failure
+keeps the note unsent with its attempts and the client's error, and stops that request's later notes for the pass; there is no attempt
+cap. A note is marked sent after ServiceNow took it, so a collector that stops in between sends it again (at least once). A note
+waiting over a day shows as `cmdb_writeback_pending` on the Re-review page. One pass sends at a time (an advisory lock: the log says
+`skipped: another collector is sending the notes`); the lock covers the write-back only. The log line is
+`collectors: lifecycle write-back: N sent`.
+
+**The CI's fields.** The CMDB sync sends `operational_status`, `install_status`, `u_golden_road_state` and `u_golden_road_task` with the
+CI (Active 1, 1, `active`, empty; Suspended 2, 1, `suspended`, the task; Decommissioned 6, 7, `decommissioned`, the task). For each CI
+otherwise unchanged it reads them back: `GET /api/now/table/cmdb_ci_business_app/<sys_id>?sysparm_fields=sys_id,operational_status,install_status,u_golden_road_state,u_golden_road_task`.
+That is one more ServiceNow request per CI per pass, with no cap (no budgets). A field a person changed in ServiceNow is written back
+and noted on the task of the request that set the state (rule 9: ServiceNow follows the portal). A CI whose owner matches no ServiceNow
+user any more (`cmdb_owner_unknown`) still gets its lifecycle fields, reconciled without `owned_by`. `cmdb_refused` now also covers a 4xx
+on one CI (a CI deleted in ServiceNow: the next pass creates it again), a write-back the instance doesn't keep, and a correction note
+the store refused. A decommissioned app's review-date items close themselves ("Closed by the platform: the app is decommissioned.").
+
+**Migration `0012`** adds the request kind `lifecycle`, `lifecycle_state`, `lifecycle_step`, `lifecycle_command` (Retry, Abandon
+and Stop, asked by the web, carried out by the writer) and `lifecycle_events`, with guards: each process role writes only its own rows and
+notes, steps move in order, nothing is deleted, and no request is taken for a decommissioned repo. Decommissioned is for good for
+every process role; only `portal_owner` can set it back to active (`docs/roles/platform-team.md`, procedure 18), and only once
+the decommission is applied in git or stopped. Forward-only, as
+`0010` and `0011` are.
+
+**Settings.** `PORTAL_LIFECYCLE_APP_ID` and `PORTAL_LIFECYCLE_APP_KEY_FILE`, the writer's only, both or neither: without them a
+decommission is refused (`no_lifecycle_app`); suspend and resume need neither. The writer refuses to start when the lifecycle App's
+id is the write App's. The collector needs `PORTAL_BASE_URL` while `PORTAL_SERVICENOW` is set (it exits 2 without it). In mock
+mode the web checks tasks against its own mock; against a real instance it would need the integration user's read on `sc_task`
+(a recorded gap).
+
+**The demo page.** `/mock/servicenow/tasks/<number>` (admins, mock only) shows a fixture task (`SCTASK0010001` to `SCTASK0010006`) with
+the notes the collector sent replayed in order, and Closed Complete once the close was sent. The request page links it, and shows
+the timeline, the pull requests, Retry or abandon, and "What ServiceNow was told".
 
 ## Development
 

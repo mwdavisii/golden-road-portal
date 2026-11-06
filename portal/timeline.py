@@ -8,7 +8,7 @@ the error's word when the last attempt after the merge failed, and now while the
 import dataclasses as dc
 import datetime as dt
 
-STATUS_WORDS = {"done": "Done", "now": "Now", "todo": "Not yet", "failed": "Failed"}
+STATUS_WORDS = {"done": "Done", "now": "Now", "todo": "Not yet", "failed": "Failed", "closed": "Closed"}
 RECORDING = ("approved", "writing", "pr_open")  # approved and on its way into the factory
 OFF = object()  # timeline(cmdb=OFF): ServiceNow is not set up here, so there is no CMDB step (None: set up, nothing recorded yet)
 
@@ -16,7 +16,7 @@ OFF = object()  # timeline(cmdb=OFF): ServiceNow is not set up here, so there is
 @dc.dataclass(frozen=True)
 class Step:
     label: str
-    status: str  # done, now, todo or failed
+    status: str  # done, now, todo, failed or closed (a lifecycle step an abandon or a stop closed)
     at: dt.datetime | None
     detail: str | None = None  # the CI's number, or the error's word (Registered in ServiceNow)
 
@@ -57,3 +57,34 @@ def timeline(request, entries, cmdb=OFF) -> list[Step]:
     if cmdb is not OFF:
         steps.append(_cmdb_step(request, entries, cmdb))
     return steps
+
+
+# ---- a lifecycle request (spec 2026-11-02 "Requests") ----
+
+STEP_LABELS = {"deploy": "Deploy repo pull request", "factory": "Factory record pull request", "archive": "Repository archived"}
+STEP_STATUS = {"planned": "todo", "pr_open": "now", "done": "done", "failed": "failed", "closed": "closed"}
+ENDED = {"abandoned": "Abandoned", "stopped": "Stopped"}  # a request an admin ended (its failure reason): its last step
+
+
+def lifecycle_timeline(request, steps, events) -> list[Step]:
+    """A lifecycle request's timeline: Requested (with its task), each step with its state (a PR step's detail is its PR number, a failed
+    one's its reason), then Applied in git, or Abandoned, or Stopped, or Refused (a request the writer failed before any step, with its reason).
+    While the request is writing, its first step not done is Now."""
+    requested = next((e.created_at for e in events if e.step == "requested"), request.created_at)
+    out = [Step("Requested", "done", requested, request.final["task"])]
+    current = next((s.step for s in steps if s.state not in ("done", "closed")), None)
+    for s in steps:
+        status = STEP_STATUS[s.state]
+        if s.state == "planned" and s.step == current and request.state == "writing":
+            status = "now"
+        detail = s.failure_reason if s.state == "failed" else (f"#{s.pr_number}" if s.pr_number else None)
+        out.append(Step(STEP_LABELS[s.step], status, s.updated_at if s.state != "planned" else None, detail))
+    if request.state == "merged":
+        out.append(Step("Applied in git", "done", request.updated_at))
+    elif request.state == "failed":
+        ended = ENDED.get(request.failure_reason)
+        # an abandon or a stop closes the request as it closes its steps (the status word Closed); a refusal is a failure
+        out.append(Step(ended or "Refused", "closed" if ended else "failed", request.updated_at, None if ended else request.failure_reason))
+    else:
+        out.append(Step("Applied in git", "todo", None))
+    return out

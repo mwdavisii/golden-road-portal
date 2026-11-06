@@ -327,3 +327,10 @@ def test_a_servicenow_url_is_refused_while_only_the_mock_exists(servicenow):
     url = "https://example-instance.service-now.com"
     s, problems = Settings.check({**ENV, "PORTAL_SERVICENOW": servicenow, "PORTAL_SERVICENOW_URL": url})
     assert s is None and set(problems) == {"PORTAL_SERVICENOW_URL"} and url not in problems["PORTAL_SERVICENOW_URL"]
+
+
+def test_the_mock_servicenow_for_the_web_s_task_check_knows_the_org():
+    s, problems = Settings.check({**ENV, "PORTAL_SERVICENOW": "mock"})
+    assert problems == {} and s.servicenow is True and s.servicenow_api.org == "acme"
+    s, problems = Settings.check(ENV)
+    assert problems == {} and s.servicenow is False and s.servicenow_api is None

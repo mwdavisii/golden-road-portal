@@ -135,7 +135,7 @@ def test_the_fixture_parses_through_parse():
     lambda d: d["users"][0]["servers"].append("unknown"), lambda d: d["portals"][0].update(hostname="Not A Host"),
     lambda d: d["portals"][0]["servers"][0].update(hostname="bad_host"), lambda d: d["portals"][0]["servers"][0].update(server_id="Notes"),
     lambda d: d["portals"][0]["servers"][0].update(server_id="-notes"), lambda d: d["portals"][0]["servers"][0].update(server_id="n" * 65),
-    lambda d: d["portals"][0]["servers"][0].update(name="No\x07tes"), lambda d: d["portals"][0].update(name="bad‮name"),
+    lambda d: d["portals"][0]["servers"][0].update(name="No\x07tes"), lambda d: d["portals"][0].update(name="bad\u202ename"),
     lambda d: d["portals"][1].update(hostname="MCP-TEST.example.com"),  # two portals with one hostname
     lambda d: d["portals"][1].update(environment="test"), lambda d: d["portals"][0].update(environment="stage"),
     lambda d: d["portals"][0]["servers"][0].update(on_behalf="false"), lambda d: d["portals"][0]["servers"][0].update(tools=["x"]),

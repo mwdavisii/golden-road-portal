@@ -7,5 +7,19 @@
   "users": [
     {"sys_id": "6816f79cc0a8016401c5a33be04be441", "user_name": "mwdavisii", "email": "mwdavisii@example.com"},
     {"sys_id": "5137153cc611227c000bbd1bd8cd2005", "user_name": "other", "email": "other@example.com"}
+  ],
+  "tasks": [
+    {"number": "SCTASK0010001", "sys_id": "5ca1ab1e000040008000000000010001", "state": "1", "ci": "hello-app",
+     "short_description": "Suspend hello-app: critical vulnerability (demo)"},
+    {"number": "SCTASK0010002", "sys_id": "5ca1ab1e000040008000000000010002", "state": "2", "ci": "hello-app",
+     "short_description": "Resume hello-app once patched (demo)"},
+    {"number": "SCTASK0010003", "sys_id": "5ca1ab1e000040008000000000010003", "state": "1", "ci": "hello-app",
+     "short_description": "Decommission hello-app (demo: kept for a refusal; decommission lifecycle-demo instead)"},
+    {"number": "SCTASK0010004", "sys_id": "5ca1ab1e000040008000000000010004", "state": "3", "ci": "hello-app",
+     "short_description": "A closed task (demo: refused)"},
+    {"number": "SCTASK0010005", "sys_id": "5ca1ab1e000040008000000000010005", "state": "1", "ci": "other-app",
+     "short_description": "A task for another CI (demo: refused)"},
+    {"number": "SCTASK0010006", "sys_id": "5ca1ab1e000040008000000000010006", "state": "1", "ci": "lifecycle-demo",
+     "short_description": "Decommission lifecycle-demo (demo)"}
   ]
 }

@@ -4,7 +4,7 @@ import httpx
 import pytest
 from portal_fakes import FakeGitHub, transport, writer_config
 
-from portal.github.client import GitHub
+from portal.github.client import GitHub, GitHubError
 from portal.writer.bypass import check_bypass
 
 R = "/repos/acme/scorecard-factory"
@@ -137,8 +137,11 @@ def test_a_write_installation_with_actions_read_passes_and_with_actions_write_do
 def test_the_allowed_permissions_cover_every_endpoint_the_writer_calls():
     """A permission the writer needs but the startup check forbids would make it 403 forever or refuse to start."""
     from portal.writer.bypass import ALLOWED_PERMISSIONS
-    from portal_fakes import PERMISSION_LEVELS, PERMISSION_RULES
+    from portal_fakes import LIFECYCLE_APP_ONLY, PERMISSION_LEVELS, PERMISSION_RULES
     for method, pattern, permission, level in PERMISSION_RULES:
+        if (method, pattern) in LIFECYCLE_APP_ONLY:  # the archive (spec 2026-11-02 L9): the write App is never allowed it
+            assert PERMISSION_LEVELS.get(ALLOWED_PERMISSIONS.get(permission), 0) < PERMISSION_LEVELS[level], (method, pattern)
+            continue
         assert permission in ALLOWED_PERMISSIONS and PERMISSION_LEVELS[ALLOWED_PERMISSIONS[permission]] >= PERMISSION_LEVELS[level], (method, pattern)
     assert set(ALLOWED_PERMISSIONS) == {permission for _, _, permission, _ in PERMISSION_RULES}, "nothing is allowed that the writer does not use"
 
@@ -223,3 +226,16 @@ def test_a_target_with_no_required_check_named_is_a_problem_not_a_pass():
     c = GitHub("https://api.github.com", httpx.Client(transport=transport(recorded())), lambda: "token")
     problems = check_bypass(c, c, 777, writer_config(deploy_checks=()))
     assert "no required check is named for acme/golden-road-deploy" in problems
+
+
+def test_the_write_installation_can_t_archive_a_repository():
+    """Spec 2026-11-02 L9: PATCH /repos/{owner}/{repo} needs administration: write, which the write installation never has."""
+    import httpx as _httpx
+    gh = FakeGitHub()
+    gh.on("PATCH", "/repos/acme/notes", (200, {"archived": True}))
+    gh.on("DELETE", R + "/contents/intake/acme/notes.yaml", (200, {"commit": {"sha": "3" * 40}}))
+    c = GitHub("https://api.github.com", _httpx.Client(transport=transport(gh)), lambda: "token")
+    with pytest.raises(GitHubError) as raised:
+        c.call("PATCH", "/repos/acme/notes", json={"archived": True})
+    assert raised.value.status == 403
+    assert c.call("DELETE", R + "/contents/intake/acme/notes.yaml", json={}).status_code == 200, "a deletion needs contents: write"

@@ -1,6 +1,7 @@
 """PostgresStore: the Store on Postgres (psycopg 3). Each method runs in one transaction (the pool's connection context commits
 on success and rolls back on error), and each change writes its audit row in that same transaction."""
 
+import contextlib
 import secrets
 
 from psycopg import errors
@@ -9,12 +10,17 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ..ids import new_id
+from .base import (ACTION_STEPS, COMMANDS, LIFECYCLE_STATES, MAX_STEP_REASON, SHA40, STATE_AFTER, STEP_TRANSITIONS, LifecycleCommand,
+                   LifecycleEvent, LifecycleState, LifecycleStep, check_event, check_lifecycle, moved_step)
 from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, CmdbRecord, Conflict, Evidence,
                    FailedRun, IntakeObserved, ItemEvent, check_cmdb_error, check_cmdb_sync,
                    Link, LoginState, Person, RepoAdmin, Request, RereviewEvent, RereviewItem, RereviewStatus, Session, check_approval,
                    check_binding, check_failed_run, check_item, check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row,
                    item_event, token_hash, PendingEvent, Watermark)
 
+# pg_try_advisory_lock's key for the collector's write-back pass: one pass sends the outbox at a time (two collectors, or a --once beside
+# the pod, would send a note twice). Any bigint no other part of the portal uses; "grwb" in ASCII.
+WRITEBACK_LOCK = 0x67727762
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason) "
          "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
@@ -56,6 +62,24 @@ def _event(r):
                          r["scorecard_version"], tuple(r["signals"]), r["run_repo"], r["run_id"], r["observed_at"], r["source"])
 
 
+def _lifecycle_state(r):
+    return LifecycleState(r["repo"], r["state"], r["task"], r["since"], r["request"])
+
+
+def _step(r):
+    return LifecycleStep(r["request_id"], r["step"], r["position"], r["state"], r["attempt"], r["branch"], r["pr_number"], r["pr_url"],
+                         r["head_sha"], r["base_sha"], r["merge_sha"], r["failure_reason"], r["updated_at"])
+
+
+def _command(r):
+    return LifecycleCommand(r["id"], r["request_id"], r["command"], r["requested_by"], r["requested_at"], r["done_at"])
+
+
+def _lifecycle_event(r):
+    return LifecycleEvent(r["id"], r["request_id"], r["step"], r["note"], r["task_sys_id"], r["created_at"], r["sent_at"], r["attempts"],
+                          r["last_error"])
+
+
 def _item(r, events=()):
     return RereviewItem(r["id"], r["repo"], r["reason"], r["key"], r["opened_at"], r["closed_at"], r["close_kind"], r["closed_by"],
                         r["close_note"], tuple(events))
@@ -64,7 +88,16 @@ def _item(r, events=()):
 # What 0010's re-review triggers say, as the Conflict the store's own checks give: the triggers fire only when a check above them
 # raced a concurrent change, or a process role asked for what only the other may do.
 TRIGGER_CONFLICTS = (("owns the app", "own_app"), ("can't be read", "record_unreadable"), ("closed once", "closed"), ("joins only an open", "closed"),
-                     ("closes an item as a person", "wrong_role"), ("closes only a date item", "wrong_role"))
+                     ("closes an item as a person", "wrong_role"), ("closes only a date item", "wrong_role"),
+                     # 0012's lifecycle guards
+                     ("is decommissioned", "decommissioned"), ("for good", "decommissioned"), ("illegal lifecycle step transition", "wrong_state"),
+                     ("sent once", "wrong_state"), ("only marked done", "wrong_state"), ("is for a lifecycle request", "not_lifecycle"),
+                     ("belongs to a lifecycle request", "not_lifecycle"), ("names the lifecycle request", "not_lifecycle"),
+                     ("keeps its pull requests on its steps", "wrong_state"), ("only a lifecycle request", "not_lifecycle"),
+                     ("names no such request", "not_found"), ("isn't this role's", "wrong_role"), ("after every earlier one", "wrong_state"),
+                     ("the one its request applies", "wrong_state"), ("while its request is being written", "wrong_state"),
+                     ("after every earlier step is done", "wrong_state"), ("recorded when it opens", "wrong_state"),
+                     ("every one of its steps is done", "wrong_state"))
 ITEM_INDEXES = {"rereview_item_once": "item_exists", "rereview_item_one_open": "item_open"}
 
 
@@ -262,6 +295,8 @@ class PostgresStore:
                                            (*values, ownership_acknowledged_at)).fetchone()
             except errors.UniqueViolation:
                 raise Conflict("open_request_exists") from None
+            except errors.RaiseException as exc:  # 0012: the app is decommissioned
+                raise _trigger_conflict(exc) from None
             self._log(conn, now, "person", person_id, "request.created", "request", row["id"], None,
                       {"state": "pending", "repo": draft["repo"]}, "registration submitted")
             return _request(row)
@@ -278,6 +313,8 @@ class PostgresStore:
                 raise Conflict("request_exists" if exc.diag.constraint_name == "request_pkey" else "open_request_exists") from None
             except errors.ForeignKeyViolation:
                 raise Conflict("unknown_person") from None
+            except errors.RaiseException as exc:  # 0012: the app is decommissioned
+                raise _trigger_conflict(exc) from None
             self._log(conn, now, "person", person_id, "request.created", "request", row["id"], {"binding": dict(current) if current else None},
                       {"state": "approved", "repo": final["repo"], "final": dict(final)}, "connection change requested in the portal")
             return _request(row)
@@ -416,7 +453,8 @@ class PostgresStore:
 
     def mark_pr_open(self, *, request_id, branch, pr_number, pr_url, head_sha, base_sha, now):
         with self.pool.connection() as conn:
-            if self._locked(conn, request_id)["state"] != "writing":
+            locked = self._locked(conn, request_id)
+            if locked["state"] != "writing" or locked["kind"] == "lifecycle":  # a lifecycle request's PRs are its steps' (0012)
                 raise Conflict("wrong_state")
             row = conn.execute("UPDATE request SET state = 'pr_open', updated_at = %s, branch = %s, pr_number = %s, pr_url = %s, head_sha = %s, base_sha = %s "
                                "WHERE id = %s RETURNING *", (now, branch, pr_number, pr_url, head_sha, base_sha, request_id)).fetchone()
@@ -744,3 +782,282 @@ class PostgresStore:
         with self.pool.connection() as conn:
             row = conn.execute("SELECT * FROM cmdb_record WHERE lower(repo) = lower(%s)", (str(repo),)).fetchone()
         return _cmdb(row) if row else None
+
+    # ---- lifecycle (spec 2026-11-02, migration 0012; the database's times: since, updated_at, requested_at, created_at, sent_at) ----
+
+    def create_lifecycle(self, *, request_id, person_id, repo, final, note, now):
+        check_lifecycle(request_id, person_id, repo, final)
+        check_event("requested", note)
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, final, requested_by, created_at, updated_at) "
+                                       "VALUES (%s, 'lifecycle', %s, 'approved', %s, %s, %s, %s, %s) RETURNING *",
+                                       (request_id, repo, Jsonb(dict(final)), Jsonb(dict(final)), person_id, now, now)).fetchone()
+                    conn.execute("INSERT INTO lifecycle_events (request_id, step, note) VALUES (%s, 'requested', %s)", (request_id, note))
+            except errors.UniqueViolation as exc:
+                raise Conflict("request_exists" if exc.diag.constraint_name == "request_pkey" else "open_request_exists") from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("unknown_person") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "person", person_id, "request.created", "request", request_id, None,
+                      {"state": "approved", "repo": repo, "final": dict(final)}, final["reason"])
+            return _request(row)
+
+    def lifecycle_state(self, repo):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM lifecycle_state WHERE lower(repo) = lower(%s)", (str(repo),)).fetchone()
+        return _lifecycle_state(row) if row else None
+
+    def lifecycle_states(self):
+        with self.pool.connection() as conn:
+            return [_lifecycle_state(r) for r in conn.execute("SELECT * FROM lifecycle_state ORDER BY lower(repo)").fetchall()]
+
+    def _writing_lifecycle(self, conn, request_id):
+        req = self._locked(conn, request_id)
+        if req["kind"] != "lifecycle":
+            raise Conflict("not_lifecycle")
+        if req["state"] != "writing":
+            raise Conflict("wrong_state")
+        return req
+
+    def _set_state(self, conn, req, state, now):
+        """The state req's action applies, to its repo with its task, in conn's transaction (0012's guard holds the same)."""
+        if state != STATE_AFTER[req["final"]["action"]]:
+            raise Conflict("wrong_state")
+        kept = conn.execute("SELECT * FROM lifecycle_state WHERE lower(repo) = lower(%s) FOR UPDATE", (req["repo"],)).fetchone()
+        if kept is not None and kept["request"] == req["id"] and kept["state"] == state:
+            return _lifecycle_state(kept)  # set already by this request (a pass that stopped between two writes sets it again)
+        if kept is not None and kept["state"] == "decommissioned":  # 0012 lets only a hand-run UPDATE as the owner bring it back
+            raise Conflict("decommissioned")
+        task = None if state == "active" else req["final"]["task"]
+        try:
+            with conn.transaction():
+                row = conn.execute("INSERT INTO lifecycle_state (repo, state, task, since, request) VALUES (%s, %s, %s, now(), %s) "
+                                   "ON CONFLICT (lower(repo)) DO UPDATE SET state = EXCLUDED.state, task = EXCLUDED.task, "
+                                   "request = EXCLUDED.request RETURNING *", (req["repo"], state, task, req["id"])).fetchone()
+        except errors.RaiseException as exc:
+            raise _trigger_conflict(exc) from None
+        self._log(conn, now, "writer", None, "lifecycle.state", "app", row["repo"], {"state": kept["state"]} if kept else None,
+                  {"state": state, "task": task, "request": req["id"]}, f"the platform applied {state} in git")
+        return _lifecycle_state(row)
+
+    def set_lifecycle_state(self, *, request_id, state, now):
+        if state not in LIFECYCLE_STATES:
+            raise ValueError("a lifecycle state is active, suspended or decommissioned")
+        with self.pool.connection() as conn:
+            return self._set_state(conn, self._writing_lifecycle(conn, request_id), state, now)
+
+    def add_lifecycle_steps(self, *, request_id, steps, now):
+        with self.pool.connection() as conn:
+            req = self._writing_lifecycle(conn, request_id)
+            if tuple(steps) != ACTION_STEPS[req["final"]["action"]]:
+                raise Conflict("wrong_state")
+            try:
+                with conn.transaction():
+                    rows = [conn.execute("INSERT INTO lifecycle_step (request_id, step, position, state, updated_at) "
+                                         "VALUES (%s, %s, %s, 'planned', now()) RETURNING *", (request_id, name, i + 1)).fetchone()
+                            for i, name in enumerate(steps)]
+            except errors.UniqueViolation:
+                raise Conflict("wrong_state") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            return [_step(r) for r in rows]
+
+    def lifecycle_steps(self, request_id):
+        with self.pool.connection() as conn:
+            return [_step(r) for r in conn.execute("SELECT * FROM lifecycle_step WHERE request_id = %s ORDER BY position",
+                                                   (request_id,)).fetchall()]
+
+    def move_lifecycle_step(self, *, request_id, step, to_state, now, **fields):
+        with self.pool.connection() as conn:
+            return self._move_step(conn, request_id, step, to_state, now, fields)
+
+    def move_lifecycle_step_with_event(self, *, request_id, step, to_state, now, event, note, **fields):
+        check_event(event, note)
+        with self.pool.connection() as conn:  # one transaction: the step's move and its note, or neither
+            moved = self._move_step(conn, request_id, step, to_state, now, fields)
+            return moved, self._insert_event(conn, request_id, event, note)
+
+    def _move_step(self, conn, request_id, step, to_state, now, fields):
+        req = conn.execute("SELECT kind, state FROM request WHERE id = %s FOR UPDATE", (request_id,)).fetchone()  # the request first, as apply
+        kept = conn.execute("SELECT * FROM lifecycle_step WHERE request_id = %s AND step = %s FOR UPDATE", (request_id, step)).fetchone()
+        if req is None or kept is None:
+            raise Conflict("not_found")
+        if (kept["state"], to_state) not in STEP_TRANSITIONS:
+            raise Conflict("wrong_state")
+        new = moved_step(_step(kept), to_state, now, fields)
+        if req["state"] != "writing":  # its kind is lifecycle: it has a step
+            raise Conflict("wrong_state")
+        if kept["state"] == "planned" and to_state != "closed" and conn.execute(
+                "SELECT 1 FROM lifecycle_step WHERE request_id = %s AND position < %s AND state <> 'done'",
+                (request_id, kept["position"])).fetchone():
+            raise Conflict("wrong_state")  # rule 7: every earlier step is done first
+        try:
+            with conn.transaction():
+                row = conn.execute("UPDATE lifecycle_step SET state = %s, attempt = %s, branch = %s, pr_number = %s, pr_url = %s, "
+                                   "head_sha = %s, base_sha = %s, merge_sha = %s, failure_reason = %s WHERE request_id = %s AND step = %s "
+                                   "RETURNING *", (new.state, new.attempt, new.branch, new.pr_number, new.pr_url, new.head_sha,
+                                                   new.base_sha, new.merge_sha, new.failure_reason, request_id, step)).fetchone()
+        except errors.RaiseException as exc:
+            raise _trigger_conflict(exc) from None
+        return _step(row)
+
+    def add_lifecycle_command(self, *, request_id, command, actor_id, now):
+        if command not in COMMANDS:
+            raise ValueError("a lifecycle command is retry, abandon or stop")
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():  # requested_at is the trigger's (the web may insert only these three columns)
+                    row = conn.execute("INSERT INTO lifecycle_command (request_id, command, requested_by) VALUES (%s, %s, %s) RETURNING *",
+                                       (request_id, command, actor_id)).fetchone()
+            except errors.UniqueViolation:
+                raise Conflict("command_open") from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("not_found") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "person", actor_id, f"lifecycle.{command}", "request", request_id, None, {"command": command},
+                      f"{command} asked in the portal")
+            return _command(row)
+
+    def open_lifecycle_command(self, request_id):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM lifecycle_command WHERE request_id = %s AND done_at IS NULL", (request_id,)).fetchone()
+        return _command(row) if row else None
+
+    def finish_lifecycle_command(self, *, command_id, now, note=None):
+        if note is not None:
+            check_event("command", note)
+        with self.pool.connection() as conn:  # one transaction: the command finished and its note
+            row = conn.execute("UPDATE lifecycle_command SET done_at = now() WHERE id = %s AND done_at IS NULL RETURNING request_id",
+                               (command_id,)).fetchone()
+            if row is None:
+                raise Conflict("wrong_state")
+            if note is not None:
+                self._insert_event(conn, row["request_id"], "command", note)
+
+    def retry_lifecycle(self, *, request_id, command_id, step, note, now):
+        check_event("retried", note)
+        with self.pool.connection() as conn:  # one transaction: the step back to planned, its retried note and the command, or none
+            self._writing_lifecycle(conn, request_id)  # the request first, as every move
+            kept = conn.execute("SELECT state FROM lifecycle_step WHERE request_id = %s AND step = %s FOR UPDATE", (request_id, step)).fetchone()
+            if kept is None or kept["state"] != "failed":
+                raise Conflict("wrong_state")
+            if conn.execute("UPDATE lifecycle_command SET done_at = now() WHERE id = %s AND request_id = %s AND command = 'retry' "
+                            "AND done_at IS NULL RETURNING id", (command_id, request_id)).fetchone() is None:
+                raise Conflict("wrong_state")
+            moved = self._move_step(conn, request_id, step, "planned", now, {})
+            self._insert_event(conn, request_id, "retried", note)
+            return moved
+
+    def abandon_lifecycle(self, *, request_id, command_id, note, now):
+        return self._end_lifecycle(request_id, command_id, "abandon", "abandoned", note, now)
+
+    def stop_lifecycle(self, *, request_id, command_id, note, now):
+        return self._end_lifecycle(request_id, command_id, "stop", "stopped", note, now)
+
+    def _end_lifecycle(self, request_id, command_id, command, ended, note, now):
+        """An abandon or a stop carried out (ended: abandoned or stopped), as MemoryStore._end_lifecycle."""
+        check_event(ended, note)
+        with self.pool.connection() as conn:  # one transaction: the steps closed, the command, the note and writing -> failed
+            req = self._writing_lifecycle(conn, request_id)
+            if command == "stop" and (req["final"]["action"] != "decommission" or conn.execute(
+                    "SELECT 1 FROM lifecycle_step WHERE request_id = %s AND step = 'deploy' AND state = 'done'", (request_id,)).fetchone() is None):
+                raise Conflict("wrong_state")  # a stop is for a decommission whose deploy step is done
+            if conn.execute("UPDATE lifecycle_command SET done_at = now() WHERE id = %s AND request_id = %s AND command = %s "
+                            "AND done_at IS NULL RETURNING id", (command_id, request_id, command)).fetchone() is None:
+                raise Conflict("wrong_state")
+            for row in conn.execute("SELECT step FROM lifecycle_step WHERE request_id = %s AND state NOT IN ('closed', 'done') "
+                                    "ORDER BY position", (request_id,)).fetchall():
+                self._move_step(conn, request_id, row["step"], "closed", now, {})
+            self._insert_event(conn, request_id, ended, note)
+            try:
+                with conn.transaction():
+                    row = conn.execute("UPDATE request SET state = 'failed', updated_at = %s, failure_reason = %s WHERE id = %s "
+                                       "RETURNING *", (now, ended, request_id)).fetchone()
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "writer", None, "request.failed", "request", request_id, {"state": "writing"},
+                      {"state": "failed", "failure_reason": ended}, ended)
+            return _request(row)
+
+    def add_lifecycle_event(self, *, request_id, step, note, now):
+        check_event(step, note)
+        with self.pool.connection() as conn:
+            return self._insert_event(conn, request_id, step, note)
+
+    @staticmethod
+    def _insert_event(conn, request_id, step, note):
+        try:
+            with conn.transaction():
+                row = conn.execute("INSERT INTO lifecycle_events (request_id, step, note) VALUES (%s, %s, %s) RETURNING *",
+                                   (request_id, step, note)).fetchone()
+        except errors.UniqueViolation:  # a request's one requested (or completed) note
+            raise Conflict("event_exists") from None
+        except errors.ForeignKeyViolation:
+            raise Conflict("not_found") from None
+        except errors.RaiseException as exc:
+            raise _trigger_conflict(exc) from None
+        return _lifecycle_event(row)
+
+    def lifecycle_events(self, request_id=None, *, unsent=False):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM lifecycle_events WHERE (%s::text IS NULL OR request_id = %s) AND (NOT %s OR sent_at IS NULL) "
+                                "ORDER BY id", (request_id, request_id, bool(unsent))).fetchall()
+        return [_lifecycle_event(r) for r in rows]
+
+    def mark_lifecycle_event_sent(self, *, event_id, now):
+        with self.pool.connection() as conn:
+            # in order: never while an earlier note of the request is unsent (0012's guard holds the same)
+            if conn.execute("UPDATE lifecycle_events SET sent_at = now() WHERE id = %s AND sent_at IS NULL AND NOT EXISTS "
+                            "(SELECT 1 FROM lifecycle_events e WHERE e.request_id = lifecycle_events.request_id "
+                            "AND e.id < lifecycle_events.id AND e.sent_at IS NULL) RETURNING id", (event_id,)).fetchone() is None:
+                raise Conflict("wrong_state")
+
+    @contextlib.contextmanager
+    def writeback_lock(self):
+        """True while this pass holds the write-back's session advisory lock (on one pooled connection, released before the connection
+        goes back to the pool), False when another session holds it: that pass is skipped. A collector that dies releases it with its
+        connection."""
+        with self.pool.connection() as conn:
+            held = conn.execute("SELECT pg_try_advisory_lock(%s) AS held", (WRITEBACK_LOCK,)).fetchone()["held"]
+            conn.commit()  # the session lock outlives the transaction: no transaction left open for the whole pass
+            try:
+                yield held
+            finally:
+                if held:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (WRITEBACK_LOCK,))
+
+    def mark_lifecycle_event_failed(self, *, event_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("an event's error is 1 to 300 characters")
+        with self.pool.connection() as conn:
+            if conn.execute("UPDATE lifecycle_events SET attempts = attempts + 1, last_error = %s WHERE id = %s AND sent_at IS NULL RETURNING id",
+                            (error, event_id)).fetchone() is None:
+                raise Conflict("wrong_state")
+
+    def apply_lifecycle(self, *, request_id, merge_sha, note, now):
+        if merge_sha is not None and (not isinstance(merge_sha, str) or not SHA40.fullmatch(merge_sha)):
+            raise ValueError("an applied lifecycle request records its last merge commit (or none: no step needed a PR)")
+        check_event("completed", note)
+        with self.pool.connection() as conn:  # one transaction: the state, the completed note and the merge, or none of them
+            req = self._writing_lifecycle(conn, request_id)
+            states = [r["state"] for r in conn.execute("SELECT state FROM lifecycle_step WHERE request_id = %s FOR UPDATE",
+                                                        (request_id,)).fetchall()]
+            if not states or any(state != "done" for state in states):
+                raise Conflict("wrong_state")
+            self._set_state(conn, req, STATE_AFTER[req["final"]["action"]], now)
+            try:
+                with conn.transaction():
+                    conn.execute("INSERT INTO lifecycle_events (request_id, step, note) VALUES (%s, 'completed', %s)", (request_id, note))
+                    row = conn.execute("UPDATE request SET state = 'merged', updated_at = %s, merge_sha = %s WHERE id = %s RETURNING *",
+                                       (now, merge_sha, request_id)).fetchone()
+            except errors.UniqueViolation:  # its one completed note
+                raise Conflict("event_exists") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "writer", None, "request.merged", "request", request_id, {"state": "writing"},
+                      {"state": "merged", "merge_sha": merge_sha}, "the lifecycle action is applied in git")
+            return _request(row)

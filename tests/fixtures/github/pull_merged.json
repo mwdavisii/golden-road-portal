@@ -15,5 +15,9 @@
     "ref": "main",
     "sha": "1111111111111111111111111111111111111111"
   },
-  "merged_at": "2026-10-23T12:00:00Z"
+  "merged_at": "2026-10-23T12:00:00Z",
+  "user": {
+    "login": "golden-road-portal-writer[bot]",
+    "type": "Bot"
+  }
 }

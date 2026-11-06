@@ -243,7 +243,8 @@ def _cmdb_run(tmp_path, monkeypatch, env_changes):
     monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
     monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 1, "unreadable": 0, "opened": 0, "closed": 0})
     monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
-    code, err = run_main(["--once"], {k: v for k, v in {**env_with(tmp_path), **env_changes}.items() if v is not None})
+    env = {**env_with(tmp_path), "PORTAL_BASE_URL": "https://portal.example.test", **env_changes}
+    code, err = run_main(["--once"], {k: v for k, v in env.items() if v is not None})
     return code, err, store
 
 
@@ -294,4 +295,56 @@ def test_a_cmdb_part_that_raises_is_failed_and_the_pass_goes_on(tmp_path, monkey
     monkeypatch.setattr(entry, "collect_cmdb", boom)
     code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
     assert code == 1 and "collectors: cmdb failed: RuntimeError" in err and "own words" not in err
+    assert store.rereview_status()["cmdb"].problem == "failed" and "collectors: re-review events:" in err
+
+
+# ---- 0.7.0: the lifecycle write-back (spec 2026-11-02 L11), right after the cmdb part ----
+
+def test_with_the_mock_service_now_the_write_back_needs_the_portal_s_base_url(tmp_path, monkeypatch):
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock", "PORTAL_BASE_URL": None})
+    assert code == 2 and "PORTAL_BASE_URL is not set: the ServiceNow notes link the portal's request" in err
+    assert "cmdb" not in store.rereview_status()
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock", "PORTAL_BASE_URL": "https://portal.example.test/x"})
+    assert code == 2 and "PORTAL_BASE_URL" in err
+
+
+def test_without_service_now_the_base_url_is_not_needed(tmp_path, monkeypatch):
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_BASE_URL": None})
+    assert code == 0 and "write-back" not in err
+
+
+def test_the_write_back_runs_after_the_cmdb_part_and_says_what_it_sent(tmp_path, monkeypatch):
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and "collectors: lifecycle write-back: 0 sent\n" in err
+    assert err.index("collectors: cmdb:") < err.index("collectors: lifecycle write-back:") < err.index("collectors: re-review events:")
+
+
+def test_the_write_back_line_says_what_failed_and_waits(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    seen = {}
+
+    def fake(store, servicenow, **k):
+        seen.update(k)
+        return {"sent": 2, "failed": 1, "waiting": 3}
+    monkeypatch.setattr(entry, "collect_writeback", fake)
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock", "PORTAL_BASE_URL": "https://Portal.example.test:443/"})
+    assert code == 0 and "collectors: lifecycle write-back: 2 sent (1 failed: will retry; 3 waiting behind them)" in err
+    assert seen["base_url"] == "https://portal.example.test"
+
+
+def test_a_write_back_another_collector_is_sending_is_skipped_and_says_so(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    monkeypatch.setattr(entry, "collect_writeback", lambda store, servicenow, **k: {"sent": 0, "failed": 0, "waiting": 0, "busy": True})
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and "collectors: lifecycle write-back: skipped: another collector is sending the notes\n" in err
+
+
+def test_a_write_back_that_raises_is_the_cmdb_part_failed_and_the_pass_goes_on(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+
+    def boom(store, servicenow, **k):
+        raise RuntimeError("the instance's own words")
+    monkeypatch.setattr(entry, "collect_writeback", boom)
+    code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 1 and "collectors: lifecycle write-back failed: RuntimeError" in err and "own words" not in err
     assert store.rereview_status()["cmdb"].problem == "failed" and "collectors: re-review events:" in err

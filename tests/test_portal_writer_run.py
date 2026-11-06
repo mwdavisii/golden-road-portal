@@ -583,6 +583,7 @@ D = "/repos/acme/golden-road-deploy"
 ENV_DIR = "apps/acme/notes/test"
 BPATH, CPATH, APATH = f"{ENV_DIR}/bindings.yaml", f"{ENV_DIR}/composed.yaml", f"{ENV_DIR}/cloudflare-access.yaml"
 BFILE, CFILE, AFILE = f"{D}/contents/{BPATH}", f"{D}/contents/{CPATH}", f"{D}/contents/{APATH}"
+LFILE = f"{D}/contents/{ENV_DIR}/lifecycle.yaml"  # a suspended environment's (spec 2026-11-02): a binding reads it, never writes it
 RELFILE, MANFILE = f"{D}/contents/{ENV_DIR}/release.yaml", f"{D}/contents/{ENV_DIR}/base/manifests.yaml"
 OLD_BLOB, OLD_COMPOSED_BLOB, MID = "e" * 40, "d" * 40, "4" * 40   # MID: the branch's first commit (bindings.yaml)
 IMAGE = "ghcr.io/acme/notes@sha256:" + "b" * 64
@@ -625,11 +626,12 @@ NOT_FOUND = (404, {"message": "Not Found"})
 OLD_ACCESS_BLOB = "a" * 40
 
 
-def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), release=None, manifests=None, existing_access=None):
+def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), release=None, manifests=None, existing_access=None,
+                  existing_lifecycle=None):
     """GitHub for the writer's first pass on a binding: the repo's intake record is in the factory (unless `intake` says otherwise),
     the environment has a release pinned (release.yaml and base/manifests.yaml, unless a test changes them), and no bindings.yaml,
     composed.yaml or cloudflare-access.yaml yet, or `existing` / `existing_composed` / `existing_access` (bytes) at OLD_BLOB /
-    OLD_COMPOSED_BLOB / OLD_ACCESS_BLOB."""
+    OLD_COMPOSED_BLOB / OLD_ACCESS_BLOB. The environment runs (no lifecycle.yaml) unless `existing_lifecycle` (bytes) suspends it."""
     gh = FakeGitHub()
     gh.on("GET", R, (200, gh.fixture("repo_factory")))
     gh.on("GET", R + "/git/ref/heads/main", (200, gh.fixture("ref_main")))
@@ -641,6 +643,7 @@ def bgh_for_write(existing=None, existing_composed=None, intake=(200, None), rel
     gh.on("GET", BFILE, NOT_FOUND if existing is None else file_answer(existing, OLD_BLOB))
     gh.on("GET", CFILE, NOT_FOUND if existing_composed is None else file_answer(existing_composed, OLD_COMPOSED_BLOB))
     gh.on("GET", AFILE, NOT_FOUND if existing_access is None else file_answer(existing_access, OLD_ACCESS_BLOB))
+    gh.on("GET", LFILE, NOT_FOUND if existing_lifecycle is None else file_answer(existing_lifecycle))
     gh.on("POST", D + "/git/refs", (201, {"ref": "refs/heads/portal/request-x"}))
     gh.on("PUT", BFILE, (201 if existing is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": MID}}))
     gh.on("PUT", CFILE, (201 if existing_composed is None else 200, {"content": {"sha": "f" * 40}, "commit": {"sha": HEAD}}))
@@ -705,10 +708,10 @@ def test_a_first_binding_writes_bindings_then_composed_in_the_deploy_repo_and_me
     pr = json.loads(gh.called("POST", D + "/pulls")[0]["body"])
     assert pr["title"] == f"Connections for acme/notes (test) (portal request {req.id})" and "`sp-notes`" in pr["body"]
     assert {c["path"] for c in gh.calls} <= {R, R + "/git/ref/heads/main", FILE, D, D + "/git/ref/heads/main", RELFILE, MANFILE, BFILE, CFILE,
-                                             AFILE, D + "/git/refs", D + "/pulls"}, "only the two files are written"
+                                             AFILE, LFILE, D + "/git/refs", D + "/pulls"}, "only the two files are written"
     assert not gh.called("PUT", AFILE) and gh.called("GET", AFILE)[0]["query"]["ref"] == BASE, "no mcp: the access file is only read"
     assert not gh.called("PUT", FILE) and gh.called("GET", FILE)[0]["query"]["ref"] == BASE, "the intake record is only read, in the factory"
-    for path in (RELFILE, MANFILE, BFILE, CFILE):
+    for path in (RELFILE, MANFILE, BFILE, CFILE, LFILE):
         assert gh.called("GET", path)[0]["query"]["ref"] == BASE, f"{path} is read at the base commit"
     gh = badvancing(req)
     run_once(portal.store, client(gh), bcfg(), T0)
@@ -719,7 +722,7 @@ def test_a_first_binding_writes_bindings_then_composed_in_the_deploy_repo_and_me
         assert gh.called("GET", path)[-1]["query"]["ref"] == "3" * 40, f"{path} is confirmed at the merge commit"
 
 
-PROD = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "A": AFILE, "REL": RELFILE, "MAN": MANFILE}.items()}
+PROD = {k: v.replace("/test/", "/prod/") for k, v in {"B": BFILE, "C": CFILE, "A": AFILE, "REL": RELFILE, "MAN": MANFILE, "L": LFILE}.items()}
 PROD_RELEASE = release_doc(environment="prod", namespace="notes-prod", release="prod-20261029130000-abcdef1")
 
 
@@ -731,6 +734,7 @@ def pgh_for_write():
     gh.on("GET", PROD["B"], NOT_FOUND)
     gh.on("GET", PROD["C"], NOT_FOUND)
     gh.on("GET", PROD["A"], NOT_FOUND)
+    gh.on("GET", PROD["L"], NOT_FOUND)
     gh.on("PUT", PROD["B"], (201, {"commit": {"sha": MID}}))
     gh.on("PUT", PROD["C"], (201, {"commit": {"sha": HEAD}}))
     return gh
@@ -1693,6 +1697,128 @@ def test_a_binding_for_an_owner_with_no_token_name_is_refused_before_anything_is
     gh.on("GET", f"{d}/bindings.yaml", NOT_FOUND)
     gh.on("GET", f"{d}/release.yaml", file_answer(release_yaml(repo="acme_x/notes")))
     gh.on("GET", f"{d}/base/manifests.yaml", file_answer(MANIFESTS))
+    gh.on("GET", f"{d}/lifecycle.yaml", NOT_FOUND)
     with pytest.raises(Refused, match="compose_refused"):
         _files_to_write(client(gh), mcfg(), req, target, "main", BASE, binding_yaml(final, req.id).encode())
     assert not puts(gh) and not gh.called("POST", D + "/git/refs")
+
+
+# ---- lifecycle (spec 2026-11-02): rule 5 for a binding, the decommissioned recheck, the check-run loop ----
+
+from portal.store.base import ACTION_STEPS  # noqa: E402
+from portal.writer.allowlist import target_for  # noqa: E402
+from portal.writer.run import check_conclusions  # noqa: E402
+
+SUSPENDED_DOC = {"schema": "lifecycle/v1", "repo": "acme/notes", "environment": "test", "state": "suspended", "task": "SCTASK0010001",
+                 "reason": "Critical vulnerability; suspended until patched", "requested_by": "p_" + "a" * 32,
+                 "requested_at": "2026-11-02T22:00:00Z", "request": "r_" + "d" * 32}
+
+
+def test_a_binding_of_a_suspended_environment_keeps_it_at_zero(portal):
+    """Rule 5: the binding PR composes with the environment's lifecycle.yaml."""
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing_lifecycle=yaml.safe_dump(SUSPENDED_DOC).encode())
+    run_once(portal.store, client(gh), writer_config(directory=fake_directory()), T0)
+    assert portal.store.get_request(req.id).state == "pr_open"
+    written = next(base64.b64decode(body["content"]) for path, body in puts(gh) if path == CFILE)
+    deployment = next(o for o in yaml.safe_load_all(written) if o and o["kind"] == "Deployment")
+    assert deployment["spec"]["replicas"] == 0 and not gh.called("PUT", LFILE), "a binding never writes lifecycle.yaml"
+    assert gh.called("GET", LFILE)[0]["query"]["ref"] == BASE, "lifecycle.yaml is read at the base commit"
+
+
+def test_a_binding_of_a_running_environment_composes_as_before(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write()
+    run_once(portal.store, client(gh), writer_config(directory=fake_directory()), T0)
+    assert next(body for path, body in puts(gh) if path == CFILE)["content"] == base64.b64encode(composed(req)).decode()
+
+
+@pytest.mark.parametrize("doc", [{**SUSPENDED_DOC, "environment": "prod"}, {**SUSPENDED_DOC, "repo": "acme/other"},
+                                 {**SUSPENDED_DOC, "state": "running"}, {k: v for k, v in SUSPENDED_DOC.items() if k != "task"}],
+                         ids=["other-environment", "other-repo", "unknown-state", "invalid"])
+def test_a_lifecycle_yaml_that_is_not_this_environment_s_is_compose_refused(portal, doc):
+    req = binding_request(portal.store, portal.people, T0)
+    gh = bgh_for_write(existing_lifecycle=yaml.safe_dump(doc).encode())
+    run_once(portal.store, client(gh), writer_config(directory=fake_directory()), T0)
+    assert portal.store.get_request(req.id).failure_reason == "compose_refused" and not puts(gh)
+
+
+def test_a_lifecycle_yaml_over_the_cap_or_with_anchors_is_compose_refused(portal):
+    from portal.writer.run import MAX_BINDING_BYTES, Refused, compose_bytes
+    text = yaml.safe_dump(SUSPENDED_DOC)
+    for raw in ((text + "#" * MAX_BINDING_BYTES).encode(), ("x: &a 1\n" + text).encode()):
+        with pytest.raises(Refused, match="compose_refused"):
+            compose_bytes("acme/notes", "test", release_yaml(), MANIFESTS, None, None, raw)
+
+
+def decommissioned(portal):
+    """acme/notes decommissioned in the portal: a decommission request applied (every step done)."""
+    life = portal.store.create_lifecycle(request_id="r_" + "9" * 32, person_id=portal.people["admin"].id, repo="acme/notes",
+                                         final={"action": "decommission", "task": "SCTASK0010003", "task_sys_id": "e" * 32,
+                                                "reason": "No owner confirmed the app is still used"}, note="Requested.", now=T0)
+    return life
+
+
+def apply(portal, life):
+    for step in portal.store.add_lifecycle_steps(request_id=life.id, steps=ACTION_STEPS["decommission"], now=T0):
+        portal.store.move_lifecycle_step(request_id=life.id, step=step.step, to_state="done", now=T0)
+    portal.store.apply_lifecycle(request_id=life.id, merge_sha=None, note="Decommissioned.", now=T0)
+    assert portal.store.lifecycle_state("acme/notes").state == "decommissioned"
+
+
+def test_a_registration_or_binding_of_a_decommissioned_app_is_refused(portal):
+    """(decided while planning: item 15) opened before the decommission, written after it."""
+    life = decommissioned(portal)
+    assert portal.store.claim_approved(now=T0).id == life.id
+    req = binding_request(portal.store, portal.people, T0)  # opened before the decommission is applied
+    apply(portal, life)
+    gh = FakeGitHub()
+    run_once(portal.store, client(gh), writer_config(directory=fake_directory()), T0)
+    assert portal.store.get_request(req.id).failure_reason == "recheck: decommissioned" and gh.calls == []
+
+
+def test_a_registration_approved_after_the_decommission_is_refused(portal):
+    """(item 15) the seeded registration of acme/notes was pending before the decommission; approved after it, the writer refuses it."""
+    life = decommissioned(portal)
+    assert portal.store.claim_approved(now=T0).id == life.id
+    apply(portal, life)
+    req = approved_request(portal.store, portal.people, T0)
+    assert req.kind == "registration" and req.state == "writing"
+    gh = FakeGitHub()
+    run_once(portal.store, client(gh), writer_config(), T0)
+    assert portal.store.get_request(req.id).failure_reason == "recheck: decommissioned" and gh.calls == []
+
+
+def test_a_suspended_app_s_binding_is_not_refused_by_the_recheck(portal):
+    """Rule 4 refuses a decommissioned app only: a suspended one keeps its bindings (and stays at zero, rule 5)."""
+    life = portal.store.create_lifecycle(request_id="r_" + "8" * 32, person_id=portal.people["admin"].id, repo="acme/notes",
+                                         final={"action": "suspend", "task": "SCTASK0010001", "task_sys_id": "e" * 32,
+                                                "reason": "Critical vulnerability; suspended until patched"}, note="Requested.", now=T0)
+    assert portal.store.claim_approved(now=T0).id == life.id
+    portal.store.add_lifecycle_steps(request_id=life.id, steps=ACTION_STEPS["suspend"], now=T0)
+    portal.store.set_lifecycle_state(request_id=life.id, state="suspended", now=T0)
+    req = binding_request(portal.store, portal.people, T0)
+    from portal.writer.recheck import recheck
+    assert recheck(req, writer_config(directory=fake_directory()), None, portal.store, T0) == []
+
+
+def test_check_conclusions_is_the_advance_loop(portal):
+    req = binding_request(portal.store, portal.people, T0)
+    run_once(portal.store, client(bgh_for_write()), bcfg(), T0)
+    req = portal.store.get_request(req.id)
+    gh = badvancing(req)
+    assert check_conclusions(client(gh), bcfg(), target_for("acme", req), req, "main") == {"deploy-check": "success"}
+    assert gh.called("GET", D + "/actions/runs"), "each run is traced to the PR's workflow run"
+
+
+def test_a_pr_for_an_app_decommissioned_meanwhile_is_never_merged(portal):
+    """Rule 4 is checked again right before the writer merges, not only when the request was claimed: a decommission's deploy PR merged
+    after this registration's PR opened."""
+    from portal_fakes import lifecycle_request
+    req = open_pr(portal)
+    life = lifecycle_request(portal.store, portal.people, T0, action="decommission", task="SCTASK0010003")
+    portal.store.set_lifecycle_state(request_id=life.id, state="decommissioned", now=T0)
+    gh = advancing(req=req)
+    run_once(portal.store, client(gh), writer_config(), T0)
+    after = portal.store.get_request(req.id)
+    assert (after.state, after.failure_reason) == ("failed", "decommissioned") and not gh.called("PUT", R + "/pulls/12/merge")

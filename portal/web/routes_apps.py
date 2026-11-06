@@ -18,11 +18,13 @@ from ..binding_record import (ENVIRONMENTS, BindingRefused, CloudflareUnavailabl
                               secret_tokens)
 from ..bindings import effects
 from ..ids import new_id
+from ..lifecycle import decommissioned_words
 from ..secretserver import SecretServerError
 from ..store.base import DATE_REASONS, Conflict
 from .access import ADMIN, APP_ADMIN
 from .flash import redirect
 from .render import page
+from .routes_lifecycle import banner, panel
 from .secret_steps import DIGITS, SECRET_SERVER_DOWN
 
 router = APIRouter()
@@ -133,6 +135,7 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
     records = state.store.intake_observed(repo)  # the factory's record (spec 2026-10-31 R7): its open date reasons are the owner's banner
     reviews = [i for i in state.store.rereview_items() if i.repo.lower() == repo.lower() and i.reason in DATE_REASONS]
     record = records[0] if records else None
+    lifecycle_state = state.store.lifecycle_state(repo)
     return page(request, "app.html", status, repo=repo, owner_name=owner_name, repo_name=repo_name, registration=registration, directory=directory,
                 record=record, reviews=reviews, cmdb=cmdb_card(state.store, state.settings, repo, record, request.state.principal.person.id),
                 environment=environment, environments=ENVIRONMENTS, current=current, open_request=open_one, failed=failed,
@@ -149,7 +152,10 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
                               and current["mcp"]["gateway"] != state.settings.mcp_gateways[environment],
                 effects=effects(shown), shown_secrets=sorted((shown or {}).get("secrets") or [], key=lambda s: s["env"]),
                 current_secrets=sorted((current or {}).get("secrets") or [], key=lambda s: s["env"]),
-                errors=list(errors), confirm=confirm)
+                errors=list(errors), confirm=confirm,
+                decommissioned=lifecycle_state is not None and lifecycle_state.state == "decommissioned",
+                lifecycle_banner_info=banner(state.store, lifecycle_state),
+                lifecycle_panel_info=panel(state.store, state.settings, repo, request.state.principal))
 
 
 @router.get("/apps/{owner}/{repo}")
@@ -191,6 +197,9 @@ def _change(request, principal, environment, flash_key, confirmed=None, folder=N
         return _bad_environment(request)
     if not request.state.app_repo_admin:  # the writer records a change only for the repo's admin (its recheck); say so now
         return app_page(request, environment, 403, [NOT_REPO_ADMIN])
+    lifecycle_state = state.store.lifecycle_state(repo)
+    if lifecycle_state is not None and lifecycle_state.state == "decommissioned":  # rule 4: nothing more for this repo (item 15)
+        return app_page(request, environment, 409, [decommissioned_words(lifecycle_state)])
     current, open_one, _, _ = binding_state(state.store, repo, environment)
     if open_one is not None:
         return app_page(request, environment, 409, [IN_PROGRESS])
@@ -224,6 +233,8 @@ def _change(request, principal, environment, flash_key, confirmed=None, folder=N
     try:
         state.store.create_binding(request_id=request_id, person_id=principal.person.id, final=final, now=now, current=current)
     except Conflict as exc:
+        if exc.code == "decommissioned":  # decommissioned since the check above
+            return app_page(request, environment, 409, [decommissioned_words(state.store.lifecycle_state(repo))])
         if exc.code != "open_request_exists":  # request_exists, unknown_person: a bug, not a race the person can retry
             raise
         return app_page(request, environment, 409, [IN_PROGRESS])

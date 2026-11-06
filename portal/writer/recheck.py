@@ -1,7 +1,8 @@
 """The writer trusts nothing it reads from the database (Security, writer): every claimed request is checked again. A registration
 against its approval and the platform's evidence; a binding (which nobody approves) against the directory, its secrets against
 Secret Server as the platform's account, its MCP servers against Cloudflare and its skills against the catalog (spec 2026-10-31),
-and the requester's admin rights on the repo as the collector last saw them."""
+and the requester's admin rights on the repo as the collector last saw them. Neither is written for a decommissioned app (spec 2026-11-02
+rule 4): a request opened before the decommission, or approved after it, is refused here (decided while planning: item 15)."""
 
 from .. import env_names
 from ..binding_record import MOCK_PASSWORD, MOCK_SERVER
@@ -41,8 +42,13 @@ def _floor_problems(request, final, evidence) -> list[str]:
 
 def recheck(request, cfg, evidence, store=None, now=None) -> list[str]:
     """The problems with a claimed request, or [] when the writer may write it. store and now are needed for a binding (the
-    requester's admin rights); without them a binding fails closed."""
+    requester's admin rights); without them a binding fails closed. With the store, a request for a decommissioned app is only
+    "decommissioned", before anything else is checked."""
     problems = [] if request.state == "writing" else ["not_approved"]
+    if store is not None and request.kind in ("registration", "binding"):
+        state = store.lifecycle_state(request.repo)  # any case
+        if state is not None and state.state == "decommissioned":
+            return problems + ["decommissioned"]
     if request.kind == "registration":
         return problems + _registration(request, cfg, evidence)
     if request.kind == "binding":

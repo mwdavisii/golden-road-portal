@@ -1,0 +1,12 @@
+{# The app page's lifecycle parts (spec 2026-11-02 "The portal"): the banner everyone reads, and the admin's panel. #}
+{% macro lifecycle_banner(b) %}{% if b %}<p class="callout {% if b.kind == 'decommissioned' %}error{% else %}warn{% endif %}" role="status">{{ b.text }}</p>{% endif %}{% endmacro %}
+{% macro lifecycle_panel(p, owner_name, repo_name) %}{% if p %}
+<section class="card" aria-labelledby="lifecycle-title">
+<div class="card-head"><h2 id="lifecycle-title">Lifecycle</h2><span class="badge">{{ p.label }}</span></div>
+{% if p.open %}<p class="callout info">A lifecycle request is open: <a href="/requests/{{ p.open.id }}">{{ p.open.final.action }} for {{ p.open.final.task }}</a>.</p>{% endif %}
+<p class="meta">The decision is ServiceNow's: open the task for the platform team there, then apply it here.</p>
+<ul class="lifecycle-actions">
+{% for a in p.actions %}<li class="actions">{% if a.refused %}<button type="button" class="{% if a.action == 'decommission' %}danger{% else %}secondary{% endif %}" disabled>{{ a.words }}</button><span class="hint">{{ a.refused }}</span>{% else %}<a class="button {% if a.action == 'decommission' %}danger{% else %}secondary{% endif %}" href="/apps/{{ owner_name }}/{{ repo_name }}/lifecycle/{{ a.action }}">{{ a.words }}</a>{% endif %}</li>
+{% endfor %}
+</ul>
+</section>{% endif %}{% endmacro %}

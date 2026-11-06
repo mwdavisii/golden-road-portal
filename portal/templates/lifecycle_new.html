@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}{{ words }} {{ repo }} - golden road{% endblock %}
+{% block main %}
+<p><a href="/apps/{{ owner_name }}/{{ repo_name }}">&larr; {{ repo }}</a></p>
+<span class="eyebrow">Lifecycle</span>
+<h1>{{ words }} <span class="mono">{{ repo }}</span></h1>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+{% if not refused %}
+<section class="card">
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/lifecycle/{{ action }}">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="field"><label for="task">ServiceNow task</label>
+<input id="task" class="mono" name="task" value="{{ form.get('task', '') }}" pattern="SCTASK[0-9]{7}" maxlength="13" required autocomplete="off">
+<span class="hint">The task ServiceNow opened for the platform team, SCTASK and 7 digits. It must be open and name this app's CI.</span></p>
+<p class="field"><label for="reason">Reason</label>
+<textarea id="reason" name="reason" rows="3" minlength="10" maxlength="1000" required data-counter="reason-count" data-min="10">{{ form.get('reason', '') }}</textarea>
+<span class="counter" id="reason-count"></span>
+<span class="hint">One line: it goes into the request, the audit log and the task's first work note, and it is committed to git (the pull requests, and a suspend's lifecycle.yaml), where anyone who can read the repo sees it. Name the task; leave a vulnerability's details out.</span></p>
+{% if action == "suspend" %}
+<p class="callout info">Every environment scales to zero. Nothing is deleted: the Service, the policies, the secrets and the skills stay, so Resume brings the app back as it was reviewed. The writer merges the change itself, prod included, only if it changes nothing but the replicas.</p>
+{% elif action == "resume" %}
+<p class="callout info">Every suspended environment comes back as it was reviewed.</p>
+{% else %}
+<section class="confirm" aria-labelledby="confirm-title">
+<h3 id="confirm-title">Decommission {{ repo }}? This can't be undone.</h3>
+<p><strong>Goes:</strong></p>
+<ul>
+<li>the app's directory in golden-road-deploy (every environment: release, bindings, composed, cloudflare-access.yaml, lifecycle.yaml) and both adapters per environment; the cluster's reconcile then removes the workloads, the ExternalSecret, the skills ConfigMap and the namespace's contents</li>
+<li>the app's Cloudflare tokens (the Cloudflare reconcile job revokes them)</li>
+<li>the intake record is marked decommissioned</li>
+<li>the repository is archived (read-only; its code kept for audit)</li>
+</ul>
+<p><strong>Stays:</strong></p>
+<ul>
+<li>the images in ghcr (the signed releases are the audit trail)</li>
+<li>the Delinea secret values (the owner's)</li>
+<li>the Azure identity and the Databricks principal (the owner's to delete, with their admins)</li>
+</ul>
+<p class="field"><label for="confirm_repo">Type the repository's name to confirm</label>
+<input id="confirm_repo" class="mono" name="confirm_repo" value="{{ form.get('confirm_repo', '') }}" required autocomplete="off" placeholder="{{ repo }}"></p>
+<p class="hint">A platform reviewer merges the deploy repo PR, and a security code owner the factory PR.</p>
+</section>
+{% endif %}
+<p class="actions"><button class="{% if action == 'decommission' %}danger solid{% else %}gold{% endif %}" type="submit">{{ words }}</button><a class="button secondary" href="/apps/{{ owner_name }}/{{ repo_name }}">Cancel</a></p>
+</form>
+</section>
+{% endif %}
+{% endblock %}

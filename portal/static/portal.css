@@ -328,3 +328,9 @@ h2.repo { font: 600 18px/1.3 var(--mono); letter-spacing: -.01em; overflow-wrap:
 .field.acknowledge > label { display: flex; gap: 10px; align-items: flex-start; font-weight: 650; margin: 0; }
 .field.acknowledge input { margin-top: 3px; }
 .step-detail { font: 600 12.5px/1.2 var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+/* the lifecycle (spec 2026-11-02): the admin's panel lists each action with why it is refused; a closed step (abandoned) is not done */
+.lifecycle-actions { list-style: none; margin: 0; padding: 0; }
+.lifecycle-actions .actions { margin: 10px 0 0; }
+.step-closed .step-label { color: var(--muted-2); text-decoration: line-through; }
+.task-history { list-style: none; margin: 0; padding: 0; }
+.task-history h3 { margin: 12px 0 6px; font-size: 14px; }

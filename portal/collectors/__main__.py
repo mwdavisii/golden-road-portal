@@ -4,8 +4,9 @@ environment, and every PORTAL_COLLECT_INTERVAL seconds records the repo admins a
 factory's intake records and opens or closes the review-date items (PORTAL_REVIEW_DUE_SOON_DAYS), and reads the scorecard's re-review
 events from run artifacts onto the re-review list (PORTAL_REREVIEW_SIGNALS). Without actions: read, the events part is skipped and the
 Re-review page says so. With PORTAL_SERVICENOW=mock, a fifth part after intake syncs each new or changed intake record to ServiceNow CMDB as
-a business application (the mock's CI table is seeded from the records the portal kept); unset, the part doesn't run. It never prints a
-credential."""
+a business application (the mock's CI table is seeded from the records the portal kept), then sends the lifecycle notes (the
+outbox) to their ServiceNow tasks, in order, each linking its request on PORTAL_BASE_URL (spec 2026-11-02 L11); unset, neither runs. It
+never prints a credential."""
 
 import datetime as dt
 import logging
@@ -19,12 +20,13 @@ import httpx
 from ..github.appauth import InstallationToken
 from ..github.client import GitHub, GitHubError
 from ..rereview import BadSetting, parse_days, parse_signals
-from ..settings import HOST, ORG, SettingsError, github_bases, no_servicenow_url, servicenow_from
+from ..settings import HOST, ORG, SettingsError, https_url, github_bases, no_servicenow_url, servicenow_from
 from .cmdb import collect_cmdb, seed_mock
 from .events import ARTIFACT_HOSTS, collect_events
 from .evidence import collect_evidence
 from .intake import collect_intake
 from .repo_admins import collect
+from .writeback import collect_writeback
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs each request's URL at INFO, and a storage URL carries a signature
 
@@ -65,7 +67,11 @@ def main(argv=None, env=os.environ) -> int:
         signals = parse_signals(env.get("PORTAL_REREVIEW_SIGNALS", ""))
         hosts = artifact_hosts(env.get("PORTAL_ARTIFACT_HOSTS", ""))
         no_servicenow_url(env.get("PORTAL_SERVICENOW_URL", ""))
-        servicenow = servicenow_from(env.get("PORTAL_SERVICENOW", ""))
+        servicenow = servicenow_from(env.get("PORTAL_SERVICENOW", ""), org)
+        base_url = None
+        if servicenow is not None:  # the web's own rule for its base URL
+            base_url = https_url("PORTAL_BASE_URL", env.get("PORTAL_BASE_URL") or _missing(
+                "PORTAL_BASE_URL", "the ServiceNow notes link the portal's request"), root_only=True)
         try:
             key = Path(key_file).read_bytes()
         except OSError:
@@ -91,6 +97,9 @@ def main(argv=None, env=os.environ) -> int:
             failed = False
             cmdb = (("cmdb", "cmdb", lambda: _cmdb_note(collect_cmdb(store, servicenow, github_web=github_web, now=dt.datetime.now(dt.UTC)))),) \
                 if servicenow is not None else ()
+            # the write-back is the ServiceNow part's second step: its status line is cmdb's (a write-back that raises is cmdb failed)
+            writeback = (("lifecycle write-back", "cmdb", lambda: _writeback_note(collect_writeback(
+                store, servicenow, base_url=base_url, now=dt.datetime.now(dt.UTC)))),) if servicenow is not None else ()
             for name, part, run in (
                     ("repo_admins", "repo_admins", lambda: f"{collect(gh, store, now=dt.datetime.now(dt.UTC))} rows"),
                     ("evidence", "evidence", lambda: _evidence_note(collect_evidence(gh, store, org=org, gateway_hosts=gateway_hosts,
@@ -98,6 +107,7 @@ def main(argv=None, env=os.environ) -> int:
                     ("intake", "intake", lambda: _intake_note(collect_intake(gh, store, org=org, today=dt.datetime.now(dt.UTC).date(),
                                                                    due_soon_days=due_soon, now=dt.datetime.now(dt.UTC)))),
                     *cmdb,
+                    *writeback,
                     ("re-review events", "events", lambda: _events_note(collect_events(gh, store, org=org, signals=signals, now=dt.datetime.now(dt.UTC),
                                                                              actions_readable=actions_readable(token), artifact_hosts=hosts)))):
                 ok = _part(name, run)
@@ -180,8 +190,19 @@ def _cmdb_note(result) -> str:
         note += f" ({result['owner_unknown']} owner unknown)"
     if result.get("refused"):
         note += f" ({result['refused']} refused)"
+    if result.get("corrected"):
+        note += f" ({result['corrected']} corrected from ServiceNow edits)"
     if result.get("problem") == "cmdb_unreachable":
         note += " (cmdb_unreachable: will retry)"
+    return note
+
+
+def _writeback_note(result) -> str:
+    if result.get("busy"):
+        return "skipped: another collector is sending the notes"
+    note = f"{result['sent']} sent"
+    if result.get("failed"):
+        note += f" ({result['failed']} failed: will retry; {result['waiting']} waiting behind them)"
     return note
 
 
@@ -204,8 +225,8 @@ def _hosts(raw):
     return tuple(hosts)
 
 
-def _missing(name):
-    raise SettingsError(f"{name} is not set")
+def _missing(name, why=""):
+    raise SettingsError(f"{name} is not set" + (f": {why}" if why else ""))
 
 
 if __name__ == "__main__":

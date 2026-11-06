@@ -88,6 +88,9 @@ PAGES = [("anonymous", "/"), ("anonymous", "/register"), ("owner", "/"), ("owner
          ("admin", "/admin/rereview"), ("owner", "/apps/acme/notes?banner=1"),   # the page ignores the query: it only names this case
          ("owner", "/register?repo=acme/notes"), ("admin", "/admin/approvals?ack=1"),   # the ownership notice; the acknowledgement
          ("owner", "/apps/acme/notes?cmdb=1"), ("owner", "/requests/{merged}"), ("admin", "/admin/rereview?cmdb=1"),   # the CMDB card, step, problems
+         ("admin", "/apps/acme/notes/lifecycle/suspend"), ("admin", "/apps/acme/notes/lifecycle/decommission"),   # the lifecycle forms
+         ("owner", "/apps/acme/notes?lifecycle=suspended"), ("admin", "/apps/acme/notes?lifecycle=suspended"),   # the banner, the panel
+         ("admin", "/requests/{lifecycle}"), ("admin", "/mock/servicenow/tasks/SCTASK0010001"),   # the request page, the mock task page
          ("other", "/requests/{request}")]   # the last is the error page (404, through base.html)
 
 
@@ -119,7 +122,9 @@ RENDERS = {"/apps/acme/notes?confirm=azure-identity": "Remove the Azure identity
            "/apps/acme/notes?banner=1": "Change or renew the registration",
            "/register?repo=acme/notes": '<section class="card ownership"', "/admin/approvals?ack=1": "Ownership acknowledged <time",
            "/apps/acme/notes?cmdb=1": 'is registered in ServiceNow (<span class="mono">APM0001001</span>)',
-           "/requests/{merged}": '<span class="step-detail">APM0001001</span>', "/admin/rereview?cmdb=1": "<h2>ServiceNow CMDB</h2>"}
+           "/requests/{merged}": '<span class="step-detail">APM0001001</span>', "/admin/rereview?cmdb=1": "<h2>ServiceNow CMDB</h2>",
+           "/apps/acme/notes/lifecycle/suspend": 'name="task"', "/apps/acme/notes?lifecycle=suspended": "Suspended by the platform",
+           "/requests/{lifecycle}": "What ServiceNow was told", "/mock/servicenow/tasks/SCTASK0010001": "<h3>Work note</h3>", "/apps/acme/notes/lifecycle/decommission": 'name="confirm_repo"'}
 
 
 def prepare(portal, path):
@@ -187,6 +192,16 @@ def prepare(portal, path):
     if "skills=old" in path:   # the page ignores the query: it only names this case, a skill pinned before the catalog's main
         from test_portal_skill_steps import pinned_old_and_merged
         pinned_old_and_merged(portal)
+    if "/lifecycle/" in path or "lifecycle=" in path:
+        from test_portal_lifecycle_pages import with_lifecycle
+        with_lifecycle(portal)
+    if path in ("/requests/{lifecycle}", "/mock/servicenow/tasks/SCTASK0010001"):   # a request with sent notes, one a script
+        from test_portal_lifecycle_pages import with_lifecycle, sent_notes_for
+        with_lifecycle(portal)
+        portal.seeds["lifecycle"] = sent_notes_for(portal, note="A note with <script>alert(1)</script> in it.").id
+    if "lifecycle=suspended" in path:   # the page ignores the query: it only names this case
+        from test_portal_lifecycle_pages import applied
+        applied(portal)
     if "confirm=" in path:
         from test_portal_apps import link_identity_and_merge
         link_identity_and_merge(portal)
@@ -200,7 +215,7 @@ def test_every_rendered_page_has_no_inline_style_or_script(portal, who, path):
         from portal.web.flash import FLASH_COOKIE
         client.cookies.set(FLASH_COOKIE, path.split("flash=", 1)[1], domain="portal.example.test")
     response = client.get(path.format(request=portal.seeds["request"], sent_back=portal.seeds["request"], change=portal.seeds.get("change"),
-                                     merged=portal.seeds.get("merged")))
+                                     merged=portal.seeds.get("merged"), lifecycle=portal.seeds.get("lifecycle")))
     assert RENDERS.get(path, "") in response.text, (path, RENDERS.get(path))
     flash_set = [c for c in response.headers.get_list("set-cookie") if c.startswith("__Host-portal-flash=")]
     assert all("Max-Age=0" in c for c in flash_set), flash_set   # a GET page only ever clears the toast, never sets one

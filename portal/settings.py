@@ -32,7 +32,7 @@ def github_bases(host: str) -> tuple[str, str]:
     return f"https://{host}", f"https://{host}/api/v3"
 
 
-def _https(name: str, value: str, *, root_only: bool = False, query: bool = False) -> str:
+def https_url(name: str, value: str, *, root_only: bool = False, query: bool = False) -> str:
     parts = urlsplit(value)
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or (parts.query and not query) \
             or parts.fragment or "#" in value:
@@ -110,23 +110,23 @@ def no_servicenow_url(value: str) -> None:
                             "unset (PORTAL_SERVICENOW=mock needs no URL)")
 
 
-def servicenow_from(value: str):
-    """PORTAL_SERVICENOW: unset is None (no CMDB sync, no CMDB card), mock is portal.servicenow_mock over mock_servicenow.json.
-    Shared by the web and the collector."""
+def servicenow_from(value: str, org: str = ""):
+    """PORTAL_SERVICENOW: unset is None (no CMDB sync, no CMDB card), mock is portal.servicenow_mock over mock_servicenow.json, for
+    org (PORTAL_ORG: the fixture's tasks name the CIs of its repositories). Shared by the web and the collector."""
     if value == "":
         return None
     if value != "mock":
         raise SettingsError("PORTAL_SERVICENOW must be mock or unset (the only ServiceNow there is is the mock)")
     from .servicenow_mock import MockServiceNowError, load_mock
     try:
-        return load_mock()
+        return load_mock(org=org or None)
     except MockServiceNowError:
         raise SettingsError("PORTAL_SERVICENOW is mock, but the mock ServiceNow is not valid") from None
 
 
 def servicenow_on(value: str) -> bool:
-    """PORTAL_SERVICENOW for the web: mock or unset, as the collector reads it. The web never calls ServiceNow; on, it shows what the
-    collector recorded (the app page's CMDB card, the timeline's step)."""
+    """PORTAL_SERVICENOW for the web: mock or unset, as the collector reads it. The web calls ServiceNow only to check a lifecycle
+    task (spec 2026-11-02 rule 2); on, it also shows the collector's CMDB records (the app page's CMDB card, the timeline's step)."""
     if value not in ("", "mock"):
         raise SettingsError("PORTAL_SERVICENOW must be mock or unset (the only ServiceNow there is is the mock)")
     return value == "mock"
@@ -217,6 +217,8 @@ class Settings:
     mcp_process_url: str = ""  # where the platform's process for adding an MCP server to a gateway is described
     skills_catalog: object = None  # portal.skills_catalog.MockSkillsCatalog when PORTAL_SKILLS_CATALOG=mock; None hides app skills
     servicenow: bool = False  # PORTAL_SERVICENOW=mock: show the collector's CMDB records (the app page's card, the timeline's step)
+    # the mock ServiceNow (PORTAL_SERVICENOW=mock): the request-time task check (decided while planning: item 8) and the demo's task page
+    servicenow_api: object = None
     org_name: str = DEFAULT_ORG_NAME  # PORTAL_ORG_NAME: named in the ownership notice
     lifecycle_grace_days: int = 30  # PORTAL_LIFECYCLE_GRACE_DAYS: the notice's day count; 0 hides it (never "no time")
 
@@ -338,12 +340,12 @@ class Settings:
             return value
 
         def link_ok(name):
-            return lambda value: _https(name, value, query=True) if value else ""  # a wiki page link may need its query
+            return lambda value: https_url(name, value, query=True) if value else ""  # a wiki page link may need its query
 
         values = dict(
-            base_url=need("PORTAL_BASE_URL", lambda v: _https("PORTAL_BASE_URL", v, root_only=True)),
+            base_url=need("PORTAL_BASE_URL", lambda v: https_url("PORTAL_BASE_URL", v, root_only=True)),
             org=need("PORTAL_ORG", org_ok), github_host=need("PORTAL_GITHUB_HOST", host_ok),
-            oidc_issuer=need("PORTAL_OIDC_ISSUER", lambda v: _https("PORTAL_OIDC_ISSUER", v)),
+            oidc_issuer=need("PORTAL_OIDC_ISSUER", lambda v: https_url("PORTAL_OIDC_ISSUER", v)),
             oidc_client_id=need("PORTAL_OIDC_CLIENT_ID"), oidc_client_secret=need("PORTAL_OIDC_CLIENT_SECRET"),
             role_groups=need("PORTAL_ROLE_GROUPS", parse_role_groups),
             github_oauth_client_id=need("PORTAL_GITHUB_OAUTH_CLIENT_ID"),
@@ -370,7 +372,9 @@ class Settings:
                       mcp_process_url=get("PORTAL_MCP_PROCESS_URL", link_ok("PORTAL_MCP_PROCESS_URL"), ""),
                       skills_catalog=get("PORTAL_SKILLS_CATALOG", skills_catalog_from, ""))
         get("PORTAL_CLOUDFLARE_ACCOUNT_ID", no_cloudflare_account, "")
-        values.update(servicenow=get("PORTAL_SERVICENOW", servicenow_on, ""), org_name=get("PORTAL_ORG_NAME", org_name_ok, ""),
+        values.update(servicenow=get("PORTAL_SERVICENOW", servicenow_on, ""),
+                      servicenow_api=get("PORTAL_SERVICENOW", lambda v: servicenow_from(v, values["org"] or ""), ""),
+                      org_name=get("PORTAL_ORG_NAME", org_name_ok, ""),
                       lifecycle_grace_days=get("PORTAL_LIFECYCLE_GRACE_DAYS", grace_days_ok, ""))
         get("PORTAL_SERVICENOW_URL", no_servicenow_url, "")
         stale = get("PORTAL_REPO_ADMINS_STALE_AFTER", stale_ok, "600")

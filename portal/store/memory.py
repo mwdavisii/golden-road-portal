@@ -1,12 +1,15 @@
 """MemoryStore: the Store in one process, for tests and local runs. A lock makes each method atomic, like a transaction."""
 
 import collections
+import contextlib
 import dataclasses as dc
 import secrets
 import threading
 
 from ..ids import new_id
-from .base import (DATE_REASONS, LINK_SOURCES, OPEN_STATES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, CmdbRecord, Conflict,
+from .base import (ACTION_STEPS, COMMANDS, DATE_REASONS, LIFECYCLE_STATES, MAX_STEP_REASON, SHA40, STATE_AFTER, STEP_TRANSITIONS,
+                   LINK_SOURCES, OPEN_STATES, PROBLEMS, REPO_NAME, RUN_OUTCOMES, AuditEntry, Awaiting, CmdbRecord, Conflict,
+                   LifecycleCommand, LifecycleEvent, LifecycleState, LifecycleStep, check_event, check_lifecycle, moved_step,
                    Evidence, ItemEvent, FailedRun, Link, Person, RepoAdmin, Request, RereviewItem, RereviewStatus, Session, check_approval,
                    check_binding, check_cmdb_error, check_cmdb_sync, check_failed_run, check_item,
                    check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row, item_event, open_key,
@@ -35,6 +38,10 @@ class MemoryStore:
         self._failed = {}  # (lower(repo), run id) -> FailedRun
         self._stuck = {}  # (lower(repo), run id) -> passes GitHub couldn't answer for it
         self._cmdb = {}  # lower(repo) -> CmdbRecord
+        self._lifecycle = {}  # lower(repo) -> LifecycleState
+        self._steps = {}  # (request_id, step) -> LifecycleStep
+        self._commands = []  # LifecycleCommand, by id
+        self._lifecycle_events = []  # LifecycleEvent, by id
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -176,9 +183,15 @@ class MemoryStore:
 
     # ---- requests ----
 
+    def _not_decommissioned(self, repo):
+        found = self._lifecycle.get(repo.lower())
+        if found is not None and found.state == "decommissioned":
+            raise Conflict("decommissioned")
+
     def create_registration(self, *, person_id, draft, now, ownership_acknowledged_at=None):
         repo = draft["repo"]
         with self._lock:
+            self._not_decommissioned(repo)
             key = open_key("registration", repo, draft)
             if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
                 raise Conflict("open_request_exists")
@@ -193,6 +206,7 @@ class MemoryStore:
         check_binding(request_id, person_id, final)
         repo = final["repo"]
         with self._lock:
+            self._not_decommissioned(repo)
             if person_id not in self._people:
                 raise Conflict("unknown_person")
             if request_id in self._requests:
@@ -326,6 +340,8 @@ class MemoryStore:
 
     def mark_pr_open(self, *, request_id, branch, pr_number, pr_url, head_sha, base_sha, now):
         with self._lock:
+            if self._need(request_id).kind == "lifecycle":  # its pull requests are on its steps (0012)
+                raise Conflict("wrong_state")
             return self._move(request_id, ("writing",), "pr_open", now, "the writer opened the pull request",
                               branch=branch, pr_number=pr_number, pr_url=pr_url, head_sha=head_sha, base_sha=base_sha)
 
@@ -565,3 +581,244 @@ class MemoryStore:
     def cmdb_record(self, repo):
         with self._lock:
             return self._cmdb.get(str(repo).lower())
+
+    # ---- lifecycle (spec 2026-11-02) ----
+
+    def create_lifecycle(self, *, request_id, person_id, repo, final, note, now):
+        check_lifecycle(request_id, person_id, repo, final)
+        check_event("requested", note)
+        with self._lock:
+            self._not_decommissioned(repo)
+            if person_id not in self._people:
+                raise Conflict("unknown_person")
+            if request_id in self._requests:
+                raise Conflict("request_exists")
+            key = open_key("lifecycle", repo, final)
+            if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
+                raise Conflict("open_request_exists")
+            req = Request(request_id, "lifecycle", repo, "approved", dict(final), person_id, now, now, final=dict(final))
+            self._requests[req.id] = req
+            self._log(now, "person", person_id, "request.created", "request", req.id, None,
+                      {"state": "approved", "repo": repo, "final": dict(final)}, final["reason"])
+            self._event(req, "requested", note, now)
+            return req
+
+    def lifecycle_state(self, repo):
+        with self._lock:
+            return self._lifecycle.get(str(repo).lower())
+
+    def lifecycle_states(self):
+        with self._lock:
+            return [self._lifecycle[k] for k in sorted(self._lifecycle)]
+
+    def _writing_lifecycle(self, request_id):
+        req = self._need(request_id)
+        if req.kind != "lifecycle":
+            raise Conflict("not_lifecycle")
+        if req.state != "writing":
+            raise Conflict("wrong_state")
+        return req
+
+    def _set_state(self, req, state, now):
+        if state != STATE_AFTER[req.final["action"]]:
+            raise Conflict("wrong_state")
+        kept = self._lifecycle.get(req.repo.lower())
+        if kept is not None and kept.request == req.id and kept.state == state:
+            return kept  # set already by this request (a pass that stopped between two writes sets it again)
+        if kept is not None and kept.state == "decommissioned":
+            raise Conflict("decommissioned")
+        task = None if state == "active" else req.final["task"]
+        new = LifecycleState(kept.repo if kept else req.repo, state, task, now, req.id)
+        self._lifecycle[req.repo.lower()] = new
+        self._log(now, "writer", None, "lifecycle.state", "app", new.repo, {"state": kept.state} if kept else None,
+                  {"state": state, "task": task, "request": req.id}, f"the platform applied {state} in git")
+        return new
+
+    def set_lifecycle_state(self, *, request_id, state, now):
+        if state not in LIFECYCLE_STATES:
+            raise ValueError("a lifecycle state is active, suspended or decommissioned")
+        with self._lock:
+            return self._set_state(self._writing_lifecycle(request_id), state, now)
+
+    def add_lifecycle_steps(self, *, request_id, steps, now):
+        with self._lock:
+            req = self._writing_lifecycle(request_id)
+            if tuple(steps) != ACTION_STEPS[req.final["action"]] or any(k[0] == request_id for k in self._steps):
+                raise Conflict("wrong_state")
+            made = [LifecycleStep(request_id, name, i + 1, "planned", updated_at=now) for i, name in enumerate(steps)]
+            for s in made:
+                self._steps[(request_id, s.step)] = s
+            return made
+
+    def lifecycle_steps(self, request_id):
+        with self._lock:
+            return sorted((s for k, s in self._steps.items() if k[0] == request_id), key=lambda s: s.position)
+
+    def _moved(self, request_id, step, to_state, now, fields):
+        """The step after the move, every check made; nothing written."""
+        kept = self._steps.get((request_id, step))
+        if kept is None:
+            raise Conflict("not_found")
+        if (kept.state, to_state) not in STEP_TRANSITIONS:
+            raise Conflict("wrong_state")
+        new = moved_step(kept, to_state, now, fields)
+        self._writing_lifecycle(request_id)
+        if kept.state == "planned" and to_state != "closed" and any(
+                s.position < kept.position and s.state != "done" for s in self.lifecycle_steps(request_id)):
+            raise Conflict("wrong_state")  # rule 7: every earlier step is done first
+        return new
+
+    def move_lifecycle_step(self, *, request_id, step, to_state, now, **fields):
+        with self._lock:
+            new = self._moved(request_id, step, to_state, now, fields)
+            self._steps[(request_id, step)] = new
+            return new
+
+    def move_lifecycle_step_with_event(self, *, request_id, step, to_state, now, event, note, **fields):
+        check_event(event, note)
+        with self._lock:  # every check before the first write: both or neither, as Postgres's one transaction
+            new = self._moved(request_id, step, to_state, now, fields)
+            req = self._need(request_id)
+            if event in ("requested", "completed") and any(e.request_id == req.id and e.step == event for e in self._lifecycle_events):
+                raise Conflict("event_exists")
+            self._steps[(request_id, step)] = new
+            return new, self._event(req, event, note, now)
+
+    def add_lifecycle_command(self, *, request_id, command, actor_id, now):
+        if command not in COMMANDS:
+            raise ValueError("a lifecycle command is retry, abandon or stop")
+        with self._lock:
+            req = self._need(request_id)
+            if req.kind != "lifecycle":
+                raise Conflict("not_lifecycle")
+            if actor_id not in self._people:
+                raise Conflict("not_found")
+            if any(c.request_id == request_id and c.done_at is None for c in self._commands):
+                raise Conflict("command_open")
+            made = LifecycleCommand(len(self._commands) + 1, request_id, command, actor_id, now)
+            self._commands.append(made)
+            self._log(now, "person", actor_id, f"lifecycle.{command}", "request", request_id, None, {"command": command},
+                      f"{command} asked in the portal")
+            return made
+
+    def open_lifecycle_command(self, request_id):
+        with self._lock:
+            return next((c for c in self._commands if c.request_id == request_id and c.done_at is None), None)
+
+    @staticmethod
+    def _nth(rows, row_id):
+        """The row with that id (ids are 1, 2, ... in order), or Conflict("wrong_state") as Postgres's UPDATE of no row."""
+        if type(row_id) is not int or not 1 <= row_id <= len(rows):
+            raise Conflict("wrong_state")
+        return rows[row_id - 1]
+
+    def finish_lifecycle_command(self, *, command_id, now, note=None):
+        if note is not None:
+            check_event("command", note)
+        with self._lock:
+            kept = self._nth(self._commands, command_id)
+            if kept.done_at is not None:
+                raise Conflict("wrong_state")
+            self._commands[command_id - 1] = dc.replace(kept, done_at=now)
+            if note is not None:
+                self._event(self._need(kept.request_id), "command", note, now)
+
+    def _open_command(self, request_id, command_id, command):
+        kept = self._nth(self._commands, command_id)
+        if kept.request_id != request_id or kept.command != command or kept.done_at is not None:
+            raise Conflict("wrong_state")
+        return kept
+
+    def retry_lifecycle(self, *, request_id, command_id, step, note, now):
+        check_event("retried", note)
+        with self._lock:  # every check before the first write: all of it or nothing, as Postgres's one transaction
+            self._writing_lifecycle(request_id)
+            kept = self._open_command(request_id, command_id, "retry")
+            current = self._steps.get((request_id, step))
+            if current is None or current.state != "failed":
+                raise Conflict("wrong_state")
+            new = self._moved(request_id, step, "planned", now, {})
+            self._steps[(request_id, step)] = new
+            self._commands[command_id - 1] = dc.replace(kept, done_at=now)
+            self._event(self._need(request_id), "retried", note, now)
+            return new
+
+    def abandon_lifecycle(self, *, request_id, command_id, note, now):
+        return self._end_lifecycle(request_id, command_id, "abandon", "abandoned", note, now)
+
+    def stop_lifecycle(self, *, request_id, command_id, note, now):
+        return self._end_lifecycle(request_id, command_id, "stop", "stopped", note, now)
+
+    def _end_lifecycle(self, request_id, command_id, command, ended, note, now):
+        """An abandon or a stop carried out: every step not done closed, the command finished, its note (ended: abandoned or stopped)
+        and writing -> failed (ended)."""
+        check_event(ended, note)
+        with self._lock:  # every check before the first write: all of it or nothing, as Postgres's one transaction
+            req = self._writing_lifecycle(request_id)
+            kept = self._open_command(request_id, command_id, command)
+            steps = self.lifecycle_steps(request_id)
+            if command == "stop" and (req.final["action"] != "decommission" or steps[0].state != "done"):
+                raise Conflict("wrong_state")  # a stop is for a decommission whose deploy step is done
+            closed = [self._moved(request_id, s.step, "closed", now, {}) for s in steps if s.state not in ("closed", "done")]
+            for s in closed:
+                self._steps[(request_id, s.step)] = s
+            self._commands[command_id - 1] = dc.replace(kept, done_at=now)
+            self._event(self._need(request_id), ended, note, now)
+            return self._move(request_id, ("writing",), "failed", now, ended, failure_reason=ended)
+
+    def _event(self, req, step, note, now):
+        # no roles here (0012 holds each role to its own steps): one requested and one completed note per request
+        if step in ("requested", "completed") and any(e.request_id == req.id and e.step == step for e in self._lifecycle_events):
+            raise Conflict("event_exists")
+        made = LifecycleEvent(len(self._lifecycle_events) + 1, req.id, step, note, req.final["task_sys_id"], now)
+        self._lifecycle_events.append(made)
+        return made
+
+    def add_lifecycle_event(self, *, request_id, step, note, now):
+        check_event(step, note)
+        with self._lock:
+            req = self._need(request_id)
+            if req.kind != "lifecycle":
+                raise Conflict("not_lifecycle")
+            return self._event(req, step, note, now)
+
+    def lifecycle_events(self, request_id=None, *, unsent=False):
+        with self._lock:
+            return [e for e in self._lifecycle_events if (request_id is None or e.request_id == request_id) and (not unsent or e.sent_at is None)]
+
+    def mark_lifecycle_event_sent(self, *, event_id, now):
+        with self._lock:
+            kept = self._nth(self._lifecycle_events, event_id)
+            if kept.sent_at is not None or any(e.request_id == kept.request_id and e.id < kept.id and e.sent_at is None
+                                               for e in self._lifecycle_events):  # in order, as 0012's guard
+                raise Conflict("wrong_state")
+            self._lifecycle_events[event_id - 1] = dc.replace(kept, sent_at=now)
+
+    @contextlib.contextmanager
+    def writeback_lock(self):
+        """One process holds a MemoryStore: the lock is always free."""
+        yield True
+
+    def mark_lifecycle_event_failed(self, *, event_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("an event's error is 1 to 300 characters")
+        with self._lock:
+            kept = self._nth(self._lifecycle_events, event_id)
+            if kept.sent_at is not None:
+                raise Conflict("wrong_state")
+            self._lifecycle_events[event_id - 1] = dc.replace(kept, attempts=kept.attempts + 1, last_error=error)
+
+    def apply_lifecycle(self, *, request_id, merge_sha, note, now):
+        if merge_sha is not None and (not isinstance(merge_sha, str) or not SHA40.fullmatch(merge_sha)):
+            raise ValueError("an applied lifecycle request records its last merge commit (or none: no step needed a PR)")
+        check_event("completed", note)
+        with self._lock:  # every check before the first write: all of it or nothing, as Postgres's one transaction
+            req = self._writing_lifecycle(request_id)
+            steps = self.lifecycle_steps(request_id)
+            if not steps or any(s.state != "done" for s in steps):
+                raise Conflict("wrong_state")
+            if any(e.request_id == request_id and e.step == "completed" for e in self._lifecycle_events):
+                raise Conflict("event_exists")
+            self._set_state(req, STATE_AFTER[req.final["action"]], now)
+            self._event(req, "completed", note, now)
+            return self._move(request_id, ("writing",), "merged", now, "the lifecycle action is applied in git", merge_sha=merge_sha)
