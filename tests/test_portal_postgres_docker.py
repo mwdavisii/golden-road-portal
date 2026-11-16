@@ -436,3 +436,25 @@ def test_0009_applies_to_a_database_migrated_through_0008_that_has_audit_rows(pg
     finally:
         with psycopg.connect(pg_server.dsn(), autocommit=True) as conn:
             conn.execute(sql.Composed([sql.SQL("DROP DATABASE "), sql.Identifier(name), sql.SQL(" WITH (FORCE)")]))
+
+
+def test_the_store_survives_a_database_restart(pg_db, pg_server):
+    """A restart (a patch release, a node drain) ends every pooled connection: the next request must get a live one, not a 500."""
+    import datetime as dt
+    from portal.store.base import LoginState
+    from portal.store.postgres import PostgresStore
+    now = dt.datetime(2026, 11, 6, 12, tzinfo=dt.UTC)
+    s = PostgresStore(pg_db())
+    try:
+        assert s.list_people() == []  # the pool now holds an idle connection
+        with s.pool.connection() as conn:
+            name = conn.execute("SELECT current_database()").fetchone()["current_database"]
+        with psycopg.connect(pg_server.dsn(), autocommit=True) as admin:  # as a shutdown does: "terminating connection due to administrator command"
+            ended = admin.execute("SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                                  "WHERE datname = %s AND pid <> pg_backend_pid()) t", (name,)).fetchone()[0]
+        assert ended >= 1
+        for i in range(5):
+            s.put_login_state(f"state-{i}", LoginState("oidc", "n", "v", "/", None), expires_at=now + dt.timedelta(minutes=10))
+        assert s.list_people() == []
+    finally:
+        s.close()
