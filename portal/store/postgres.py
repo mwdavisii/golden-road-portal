@@ -114,7 +114,9 @@ def _json(value):
 
 class PostgresStore:
     def __init__(self, conninfo: str, *, min_size: int = 1, max_size: int = 5):
-        self.pool = ConnectionPool(conninfo, min_size=min_size, max_size=max_size,
+        # check: a database restart (a patch release, a node drain) ends every idle connection; without it the pool hands each
+        # dead one to a request, which fails with AdminShutdown. The check costs a round trip per checkout.
+        self.pool = ConnectionPool(conninfo, min_size=min_size, max_size=max_size, check=ConnectionPool.check_connection,
                                    kwargs={"row_factory": dict_row, "options": "-c TimeZone=UTC"}, open=True)
 
     def close(self):
