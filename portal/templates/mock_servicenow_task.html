@@ -2,12 +2,33 @@
 {% block title %}Mock ServiceNow task {{ task.number }} - golden road{% endblock %}
 {% block main %}
 <span class="eyebrow">Mock ServiceNow task</span>
-<div class="card-head"><h1 class="mono">{{ task.number }}</h1><span class="badge">{% if task.open %}Open{% else %}Closed Complete{% endif %}</span></div>
+<div class="card-head"><h1 class="mono">{{ task.number }}</h1><span class="badge">{{ state_label }}</span></div>
 <p class="callout info">This is the mock ServiceNow's task, rebuilt from the notes the collector sent.</p>
 <dl class="facts">
 <div><dt>Short description</dt><dd>{{ task.short_description }}</dd></div>
 <div><dt>Configuration item</dt><dd class="mono">{{ task.ci }}</dd></div>
+{% if description %}<div><dt>Description</dt><dd><pre class="prose">{{ description }}</pre></dd></div>{% endif %}
 </dl>
+{% if decide %}
+<section class="card" aria-labelledby="decide-title">
+<h2 id="decide-title">Mock: acting as the ServiceNow approver</h2>
+{% if decide.own %}<p class="callout info">You asked for this service principal, so another admin decides its task.</p>
+{% else %}
+<form method="post" action="/mock/servicenow/tasks/{{ task.number }}/approve">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="field"><label for="approve-notes">Close notes (optional)</label>
+<textarea id="approve-notes" name="close_notes" rows="2" maxlength="2000"></textarea></p>
+<p class="actions"><button class="gold" type="submit">Approve</button></p>
+</form>
+<form method="post" action="/mock/servicenow/tasks/{{ task.number }}/reject">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="field"><label for="reject-notes">Why it is rejected</label>
+<textarea id="reject-notes" name="close_notes" rows="2" maxlength="2000" required></textarea></p>
+<p class="actions"><button class="danger solid" type="submit">Reject</button></p>
+</form>
+{% endif %}
+</section>
+{% endif %}
 <section aria-labelledby="history-title">
 <h2 id="history-title">History</h2>
 {% if history %}

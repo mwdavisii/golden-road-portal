@@ -25,6 +25,8 @@ MESSAGES = {
     "retry": "Retry requested: the writer tries the step again on its next pass",
     "abandon": "Abandon requested: the writer closes the pull requests on its next pass",
     "stop": "Stop requested: the writer closes the steps still to do on its next pass",
+    "service_principal": "Service principal requested: the collector creates it, or opens its ServiceNow task, on its next pass",
+    "task_decided": "Decision stored: the collector reads the task on its next pass",
 }
 
 

@@ -8,6 +8,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Form, Query, Request
 
 from ..binding_record import ENVIRONMENTS
+from ..directory import overlay
 from ..ids import new_id
 from .access import APP_ADMIN
 from .render import page
@@ -42,7 +43,8 @@ def new_skill(request: Request, owner: str, repo: str, tab: str = Query("test"),
         current, open_one, _, _ = binding_state(state.store, request.state.app_repo, environment)
         if open_one is not None:
             return app_page(request, environment, 409, [IN_PROGRESS])
-        binding = {"current": current, "repo": request.state.app_repo, "org": state.settings.org, "directory": state.settings.directory,
+        directory = overlay(state.settings.directory, state.store, state.settings.org)  # created principals too (S8), as _change
+        binding = {"current": current, "repo": request.state.app_repo, "org": state.settings.org, "directory": directory,
                    "person_id": principal.person.id, "request_id": new_id("r"), "now": state.clock(), "environment": environment,
                    "mcp_gateway": state.settings.mcp_gateways[environment]}
     groups = tuple(principal.session.groups)

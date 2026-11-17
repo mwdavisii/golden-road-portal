@@ -326,3 +326,71 @@ def test_the_lifecycle_pages_on_postgres_as_the_web_s_role(pg_db):
     finally:
         for s in (web, writer, collector):
             s.close()
+
+
+def test_the_service_principal_pages_on_postgres_as_the_web_s_role(pg_db):
+    """Spec 2026-11-16 through the web's routes as portal_web, the collector's passes as portal_collector between: the form's POST
+    (a pending request), the card, the request page, the mock approver's Approve, the mock task page, and the created principal in
+    the link list."""
+    import dataclasses
+    from portal_fakes import fake_catalog, fake_directory, mock_servicenow
+
+    from portal.collectors.service_principals import collect_service_principals
+    from portal.directory_client import MockDirectoryClient
+    from portal.service_principals import Replayed
+
+    web, collector = PostgresStore(pg_db("portal_web")), PostgresStore(pg_db("portal_collector"))
+    try:
+        settings = dataclasses.replace(make_settings(directory=fake_directory(), graph_scopes=fake_catalog()), servicenow=True,
+                                       servicenow_api=mock_servicenow())
+        clock = Clock(T0)
+        app = create_app(settings=settings, store=web, http=httpx.Client(transport=transport(FakeGitHub())), clock=clock)
+
+        def person(name, groups):
+            p, token, csrf = web.sign_in(issuer=ISSUER, subject=name, display_name=name.title(), email=f"{name}@example.test",
+                                         groups=groups, roles=roles_for(groups, settings.role_groups), now=clock(),
+                                         max_age=settings.session_max)
+            http = TestClient(app, base_url=BASE, follow_redirects=False)
+            http.cookies.set(SESSION_COOKIE, token, domain="portal.example.test")
+            return p, http, csrf
+
+        owner, owner_http, owner_csrf = person("owner", [])
+        admin, admin_http, admin_csrf = person("admin", ["golden-road-admins"])
+        web.add_link(person_id=owner.id, github_login="owner-gh", github_user_id=1001, source="admin", actor_id=admin.id,
+                     reason="seeded for the flow test", now=clock())
+        collector.replace_repo_admins([RepoAdmin("acme/notes", "owner-gh", 1001, T0)], observed_at=T0)
+        servicenow = Replayed(settings.servicenow_api, collector, settings.base_url, settings.graph_scopes)
+
+        def collector_pass():
+            return collect_service_principals(collector, servicenow, MockDirectoryClient(), base_url=settings.base_url, now=clock(),
+                                              catalog=settings.graph_scopes)
+
+        assert 'href="/apps/acme/notes/service-principals/new">Create a service principal</a>' in owner_http.get("/apps/acme/notes").text
+        asked = owner_http.post("/apps/acme/notes/service-principals/new", data={
+            "csrf_token": owner_csrf, "name": "sp-notes-rooms", "scope": ["Calendars.Read", "Calendars.ReadWrite"],
+            "justification": "Books meeting rooms for the team."})
+        assert asked.status_code == 303
+        rid = asked.headers["location"].rsplit("/", 1)[1]
+        assert web.service_principal_request(rid).state == "pending"
+        assert collector_pass()["opened"] == 1
+        card = owner_http.get("/apps/acme/notes").text
+        assert f'<a href="/requests/{rid}">sp-notes-rooms</a>' in card and "Waiting for approval in SCTASK0010007" in card
+        assert "Waiting for approval in SCTASK0010007" in owner_http.get(f"/requests/{rid}").text
+
+        task_page = admin_http.get("/mock/servicenow/tasks/SCTASK0010007").text
+        assert '<span class="badge">Open</span>' in task_page and "Mock: acting as the ServiceNow approver" in task_page
+        approved = admin_http.post("/mock/servicenow/tasks/SCTASK0010007/approve", data={"csrf_token": admin_csrf, "close_notes": ""})
+        assert approved.status_code == 303
+        assert '<span class="badge">Closed Complete</span>' in admin_http.get("/mock/servicenow/tasks/SCTASK0010007").text
+        counts = collector_pass()
+        assert (counts["approved"], counts["created"], counts["noted"], counts["failed"]) == (1, 1, 1, 0)
+        [made] = web.service_principals("acme/notes")
+        app_page = owner_http.get("/apps/acme/notes").text
+        assert f'value="{made.id}"' in app_page and "Created in the portal" in app_page and made.client_id in app_page
+        task_page = admin_http.get("/mock/servicenow/tasks/SCTASK0010007").text
+        assert f"client ID {made.client_id}" in task_page and "Mock: acting as the ServiceNow approver" not in task_page
+        actions = [e.action for e in reversed(web.audit_entries(1000))]
+        assert "request.created" in actions and "mock_task.decided" in actions and "service_principal.created" in actions
+    finally:
+        for s in (web, collector):
+            s.close()

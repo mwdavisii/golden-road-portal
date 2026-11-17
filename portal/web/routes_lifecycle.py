@@ -16,12 +16,14 @@ from fastapi import APIRouter, Form, Request
 from .. import lifecycle
 from ..outbox import note_text
 from ..ids import new_id
+from ..service_principals import replay_into
 from ..servicenow_mock import MockServiceNow
 from ..store.base import LIFECYCLE_ACTIONS, OPEN_STATES, TASK_NUMBER, Conflict
 from ..timeline import STEP_LABELS, lifecycle_timeline
 from .access import ADMIN, APP_ADMIN
 from .flash import redirect
 from .render import page
+from .routes_service_principals import task_decision
 
 router = APIRouter()
 NOTHING_TO_RETRY = "Nothing to retry: no step of this request has failed."
@@ -50,6 +52,15 @@ def closing(store, task_sys_id) -> bool:
     """Whether a request's completed note is stored for this task, sent or not: the portal closes (or has closed) the task, though
     ServiceNow may show it open until the collector's next pass."""
     return any(e.step == "completed" and e.task_sys_id == task_sys_id for e in store.lifecycle_events())
+
+
+def service_principal_task(store, number, sys_id) -> bool:
+    """Whether a service principal request has this task (its number or its sys_id): a lifecycle request's completion closes its task
+    Closed Complete, which would approve that request's scopes (Round 3 review I1; 0013 holds the same)."""
+    return any(r.task_number == number or r.task_sys_id == sys_id for r in store.service_principal_requests())
+
+
+TASK_STATES = {"1": "Open", "2": "Open", "3": "Closed Complete", "4": "Closed Incomplete", "7": "Closed Skipped"}  # the badge's words: sc_task's choice list
 
 
 def task_servicenow(settings, store):
@@ -154,6 +165,8 @@ def ask(request: Request, owner: str, repo: str, action: str, task: str = Form("
         return lifecycle_form(request, action, 503 if str(exc) == lifecycle.SERVICENOW_DOWN else 400, [str(exc)], form)
     if closing(state.store, task_sys_id):  # rule 2: the portal closes it once the collector sends the note, so it is closed already
         return lifecycle_form(request, action, 400, [lifecycle.TASK_CLOSED.format(task=task)], form)
+    if service_principal_task(state.store, task, task_sys_id):  # its completion would close the task, approving that request
+        return lifecycle_form(request, action, 400, [lifecycle.TASK_SERVICE_PRINCIPAL.format(task=task)], form)
     final = {"action": action, "task": task, "task_sys_id": task_sys_id, "reason": reason}
     note = lifecycle.request_note(action, principal.person.display_name, reason)
     try:
@@ -164,6 +177,8 @@ def ask(request: Request, owner: str, repo: str, action: str, task: str = Form("
             return lifecycle_form(request, action, 409, [lifecycle.ONE_OPEN.format(repo=repo)], form)
         if exc.code == "decommissioned":
             return lifecycle_form(request, action, 409, [lifecycle.decommissioned_words(state.store.lifecycle_state(repo))], form)
+        if exc.code == "task_taken":
+            return lifecycle_form(request, action, 400, [lifecycle.TASK_SERVICE_PRINCIPAL.format(task=task)], form)
         raise
     return redirect(f"/requests/{req.id}", "lifecycle")
 
@@ -266,7 +281,12 @@ def mock_task(request: Request, number: str, principal=ADMIN):
     if not isinstance(settings.servicenow_api, MockServiceNow) or not TASK_NUMBER.fullmatch(number):
         return page(request, "error.html", 404, message="Not found.")
     mock = task_servicenow(settings, store)
+    # the tasks the portal opened for service principal requests, the mock decisions and the creation notes (spec 2026-11-16): on this
+    # page only; the lifecycle form's task check asks the fixture's tasks, as a real instance holds them (Round 5, decided while building)
+    replay_into(mock, store, settings.base_url, settings.graph_scopes)
     task = mock.task_fields(number)
     if task is None:
         return page(request, "error.html", 404, message="Not found.")
-    return page(request, "mock_servicenow_task.html", task=task, history=mock.task_history(number))
+    return page(request, "mock_servicenow_task.html", task=task, history=mock.task_history(number),
+                state_label=TASK_STATES.get(task["state"], task["state"]), description=mock.task_description(number),
+                decide=task_decision(store, number, principal))

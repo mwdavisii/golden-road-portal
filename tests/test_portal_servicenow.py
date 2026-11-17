@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from portal.servicenow import CLASS, DATA_SOURCE, GOLDEN_ROAD_STATES, LIFECYCLE_FIELDS, MAX_ANSWER, UNEXPECTED, Client, ServiceNowError, Task
+from portal.servicenow import CLASS, DATA_SOURCE, GOLDEN_ROAD_STATES, LIFECYCLE_FIELDS, MAX_ANSWER, UNEXPECTED, Client, ServiceNowError, Task, TaskRef
 from portal.store.base import LIFECYCLE_STATES
 
 BASE = "https://instance.service-now.example"
@@ -185,7 +185,8 @@ def test_a_task_is_read_by_number_with_its_ci():
     seen = []
     c = client({("GET", "/api/now/table/sc_task"): (200, {"result": [TASK_ROW]})}, seen)
     assert c.task("SCTASK0010001") == Task("5ca1ab1e000040008000000000010001", "SCTASK0010001", "1", "c" * 32)
-    assert seen[0][2] == {"sysparm_query": "number=SCTASK0010001", "sysparm_fields": "sys_id,number,state,cmdb_ci", "sysparm_limit": "1"}
+    assert seen[0][2] == {"sysparm_query": "number=SCTASK0010001", "sysparm_fields": "sys_id,number,state,cmdb_ci,close_notes,closed_by",
+                          "sysparm_limit": "1"}
     assert c.task("SCTASK0010001").open
 
 
@@ -344,3 +345,154 @@ def test_an_answer_slower_than_the_deadline_is_refused(monkeypatch):
     with pytest.raises(ServiceNowError, match="took longer than"):
         raw(lambda r: httpx.Response(200, content=trickle())).user_sys_id("x@example.test")
     assert len(sent) <= sn.ANSWER_DEADLINE // 20 + 2
+
+
+REQUEST_ID = "r_" + "a" * 32
+CREATED = {"sys_id": "b" * 32, "number": "SCTASK0010007", "correlation_id": REQUEST_ID, "correlation_display": "golden-road-portal",
+           "sys_created_by": "golden-road-cmdb"}  # only the fields asked for
+REF_FIELDS = "sys_id,number,correlation_id,correlation_display,sys_created_by"
+
+
+def test_a_task_is_created_with_its_correlation_id_and_read_from_a_201():
+    seen = []
+    c = client({("POST", "/api/now/table/sc_task"): (201, {"result": CREATED})}, seen)
+    ref = c.create_task(short_description="Service principal for acme/notes: sp-notes-rooms", description="Scopes:\n- Calendars.ReadWrite",
+                        correlation_id=REQUEST_ID, ci="c" * 32)
+    assert ref == TaskRef("b" * 32, "SCTASK0010007")
+    method, path, params, body, _ = seen[0]
+    assert (method, path, params) == ("POST", "/api/now/table/sc_task", {"sysparm_fields": REF_FIELDS})
+    assert json.loads(body) == {"short_description": "Service principal for acme/notes: sp-notes-rooms",
+                                "description": "Scopes:\n- Calendars.ReadWrite", "correlation_id": REQUEST_ID,
+                                "correlation_display": "golden-road-portal", "cmdb_ci": "c" * 32}
+
+
+def test_a_task_with_no_ci_sends_none():
+    seen = []
+    client({("POST", "/api/now/table/sc_task"): (201, {"result": CREATED})}, seen).create_task(
+        short_description="x", description="y", correlation_id=REQUEST_ID, ci=None)
+    assert "cmdb_ci" not in json.loads(seen[0][3])
+
+
+@pytest.mark.parametrize("status", [200, 400, 403, 500])
+def test_a_create_answered_with_anything_but_201_is_an_error(status):
+    with pytest.raises(ServiceNowError, match=f"ServiceNow answered {status} for the new task"):
+        client({("POST", "/api/now/table/sc_task"): (status, {"result": CREATED})}, []).create_task(
+            short_description="x", description="y", correlation_id=REQUEST_ID)
+
+
+@pytest.mark.parametrize("result", [{**CREATED, "correlation_id": "r_" + "f" * 32}, {**CREATED, "number": "SCTASK7"},
+                                    {**CREATED, "sys_id": "x"}, [CREATED], None])
+def test_a_create_answer_that_isn_t_the_new_task_is_an_error(result):
+    with pytest.raises(ServiceNowError):
+        client({("POST", "/api/now/table/sc_task"): (201, {"result": result})}, []).create_task(
+            short_description="x", description="y", correlation_id=REQUEST_ID)
+
+
+@pytest.mark.parametrize("kwargs", [{"correlation_id": "r_1^ORnumber=SCTASK0010001"}, {"correlation_id": ""},
+                                    {"correlation_id": "javascript:x"}, {"correlation_id": "javascript:gs.getUserID()"},
+                                    {"correlation_id": "R_" + "a" * 32}, {"correlation_id": "r_" + "a" * 31},
+                                    {"short_description": "two\nlines"}, {"short_description": "x" * 161}, {"short_description": ""},
+                                    {"description": "x" * 4001}, {"ci": "C" * 32}])
+def test_a_bad_task_is_never_sent(kwargs):
+    seen = []
+    with pytest.raises(ServiceNowError):
+        client({}, seen).create_task(**{"short_description": "x", "description": "y", "correlation_id": REQUEST_ID, **kwargs})
+    assert seen == []
+
+
+def test_a_task_is_found_by_its_correlation_id():
+    seen = []
+    c = client({("GET", "/api/now/table/sc_task"): (200, {"result": [CREATED]})}, seen)
+    assert c.find_task(REQUEST_ID) == TaskRef("b" * 32, "SCTASK0010007")
+    assert seen[0][2] == {"sysparm_query": f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by=golden-road-cmdb",
+                          "sysparm_fields": REF_FIELDS, "sysparm_limit": "2"}
+    assert client({("GET", "/api/now/table/sc_task"): (200, {"result": []})}, []).find_task(REQUEST_ID) is None
+
+
+def test_two_tasks_for_one_correlation_id_is_an_error():
+    with pytest.raises(ServiceNowError, match="more than one task"):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [CREATED, {**CREATED, "number": "SCTASK0010008"}]})}, []).find_task(
+            REQUEST_ID)
+
+
+def test_a_closed_task_s_close_notes_are_read():
+    row = {**TASK_ROW, "state": "4", "close_notes": "Use Calendars.Read."}
+    task = client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).task("SCTASK0010001")
+    assert (task.state, task.close_notes, task.open) == ("4", "Use Calendars.Read.", False)
+    with pytest.raises(ServiceNowError):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [{**row, "close_notes": 4}]})}, []).task("SCTASK0010001")
+
+
+@pytest.mark.parametrize("correlation_id", ["javascript:x", "r_1^ORnumber=SCTASK0010001", "", None, "r_" + "A" * 32, "r_" + "a" * 33])
+def test_a_find_by_anything_but_a_request_id_is_never_sent(correlation_id):
+    seen = []
+    with pytest.raises(ServiceNowError):
+        client({}, seen).find_task(correlation_id)
+    assert seen == []
+
+
+def test_a_task_s_correlation_id_is_the_request_id_s_exact_shape():
+    from portal.servicenow import CORRELATION_ID
+    from portal.store.base import REQUEST_ID as STORE_REQUEST_ID
+    assert CORRELATION_ID.pattern == STORE_REQUEST_ID.pattern
+
+
+def test_a_found_task_whose_correlation_id_differs_in_case_is_an_error_not_a_match():
+    row = {**CREATED, "correlation_id": REQUEST_ID.upper()}  # a real instance's "=" ignores case
+    with pytest.raises(ServiceNowError, match="this correlation id"):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).find_task(REQUEST_ID)
+
+
+@pytest.mark.parametrize("row", [{**CREATED, "sys_created_by": "someone"}, {**CREATED, "sys_created_by": "golden-road-cmdb2"},
+                                 {k: v for k, v in CREATED.items() if k != "sys_created_by"},
+                                 {**CREATED, "correlation_display": "someone-else"},
+                                 {k: v for k, v in CREATED.items() if k != "correlation_display"}])
+def test_a_task_someone_else_opened_with_the_request_s_correlation_id_is_never_adopted(row):
+    """Round 3 review I2: anyone who can open a task could open (and close) one with the request id (it is on the request page); only
+    a task the integration user opened, as the portal (correlation_display), is the request's."""
+    with pytest.raises(ServiceNowError, match="the portal didn't open"):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).find_task(REQUEST_ID)
+    with pytest.raises(ServiceNowError, match="the portal didn't open"):
+        client({("POST", "/api/now/table/sc_task"): (201, {"result": row})}, []).create_task(
+            short_description="x", description="y", correlation_id=REQUEST_ID)
+
+
+@pytest.mark.parametrize("typed, canonical", [("golden-road-cmdb", "Golden-Road-CMDB"), ("SVC_Golden_Road", "svc_golden_road")])
+def test_the_creator_is_compared_in_any_case_as_servicenow_logins_are(typed, canonical):
+    """sys_created_by is the user's canonical user_name; the credential may be typed in another case (a login ignores case)."""
+    def handle(request):
+        return httpx.Response(200, json={"result": [{**CREATED, "sys_created_by": canonical}]})
+    c = Client(BASE, http=httpx.Client(transport=httpx.MockTransport(handle)), auth=(typed, SECRET))
+    assert c.find_task(REQUEST_ID) == TaskRef("b" * 32, "SCTASK0010007")
+
+
+# ---- final review I2: who closed the task ----
+
+@pytest.mark.parametrize("closed_by, expected", [({"link": f"{BASE}/api/now/table/sys_user/{'d' * 32}", "value": "d" * 32}, "d" * 32),
+                                                 ("d" * 32, "d" * 32), ("", None), (None, None), ("absent", None)])
+def test_a_task_s_closer_is_read_as_a_reference(closed_by, expected):
+    row = {**TASK_ROW, "state": "3"} if closed_by == "absent" else {**TASK_ROW, "state": "3", "closed_by": closed_by}
+    task = client({("GET", "/api/now/table/sc_task"): (200, {"result": [row]})}, []).task("SCTASK0010001")
+    assert task.closed_by == expected
+
+
+@pytest.mark.parametrize("closed_by", [{"value": "D" * 32}, "x", 7, {"value": 7}])
+def test_a_closer_that_isn_t_a_sys_id_is_an_error(closed_by):
+    with pytest.raises(ServiceNowError):
+        client({("GET", "/api/now/table/sc_task"): (200, {"result": [{**TASK_ROW, "closed_by": closed_by}]})}, []).task("SCTASK0010001")
+
+
+@pytest.mark.parametrize("user", ["a^b", "a=b", "a,b", "a\tb", "javascript;x", "a/b"])
+def test_a_find_by_a_user_name_an_encoded_query_could_read_is_never_sent(user):
+    """Final review M1: the integration user's name enters find_task's query (sys_created_by=<user>): nothing an encoded query reads
+    as an operator, a separator or a script rides along."""
+    seen = []
+    c = Client(BASE, http=httpx.Client(transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={"result": []}))),
+               auth=(user, SECRET)) if "\t" not in user else None
+    if c is None:   # a tab is refused as a credential already
+        with pytest.raises(ServiceNowError):
+            Client(BASE, http=httpx.Client(), auth=(user, SECRET))
+        return
+    with pytest.raises(ServiceNowError, match="integration user's name"):
+        c.find_task(REQUEST_ID)
+    assert seen == []

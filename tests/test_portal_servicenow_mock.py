@@ -8,7 +8,7 @@ import re
 import httpx
 import pytest
 
-from portal.servicenow import CLASS, ServiceNowError
+from portal.servicenow import CLASS, Client, ServiceNowError, TaskRef
 from portal.servicenow_mock import MOCK, PASSWORD, MockServiceNowError, ci_sys_id, load_mock, parse, values_hash
 
 NOTES = {"name": "acme/notes", "short_description": "Stores team notes.", "u_tier": "low", "u_data_classification": "public",
@@ -189,7 +189,7 @@ def test_a_bad_fixture_is_refused(d):
 
 def test_the_fixture_is_valid_and_names_no_real_instance():
     mock = parse(doc())
-    assert mock.instance.endswith(".example") and len(mock.users) == 2
+    assert mock.instance.endswith(".example") and len(mock.users) == 3   # final review I2 added the mock approver
 
 
 # ---- The lifecycle (spec 2026-11-02): sc_task, the PATCH calls, the CI's lifecycle fields, the replay ----
@@ -321,3 +321,220 @@ def test_the_task_routes_are_401_without_the_integration_user(method, path, kw, 
     r = httpx.Client(transport=mock.transport()).request(method, f"{mock.instance}{path}", auth=auth, **kw)
     assert r.status_code == 401
     assert mock.task_history("SCTASK0010001") == [] and mock.task_fields("SCTASK0010001")["state"] == "1"
+
+
+REQUEST_ID = "r_" + "a" * 32
+
+
+def create(c, correlation_id=REQUEST_ID, ci=None):
+    return c.create_task(short_description="Service principal for acme/notes: sp-notes-rooms",
+                         description="Scopes:\n- Calendars.ReadWrite (needs approval)", correlation_id=correlation_id, ci=ci)
+
+
+def test_a_created_task_is_numbered_after_the_fixture_s_and_found_by_its_correlation_id():
+    mock = mock_for()
+    with mock.client() as c:
+        first, second = create(c), create(c, "r_" + "b" * 32, ci=ci_sys_id("acme/notes"))
+        assert (first.number, second.number) == ("SCTASK0010007", "SCTASK0010008")
+        assert c.find_task(REQUEST_ID) == first and c.find_task("r_" + "c" * 32) is None
+        task = c.task("SCTASK0010008")
+        assert (task.sys_id, task.state, task.ci, task.open, task.close_notes) == (second.sys_id, "1", ci_sys_id("acme/notes"), True, "")
+    assert mock.task_fields("SCTASK0010007")["short_description"] == "Service principal for acme/notes: sp-notes-rooms"
+    assert mock.task_description("SCTASK0010007") == "Scopes:\n- Calendars.ReadWrite (needs approval)"
+    assert mock.task_description("SCTASK0010001") == ""
+
+
+def test_the_create_answers_201_with_only_the_fields_asked_for():
+    mock = mock_for()
+    raw = httpx.Client(transport=mock.transport())
+    answer = raw.post(f"{mock.instance}/api/now/table/sc_task", params={"sysparm_fields": "sys_id,number"},
+                      json={"short_description": "x", "correlation_id": REQUEST_ID, "correlation_display": "golden-road-portal"},
+                      auth=(mock.integration_user, PASSWORD))
+    assert answer.status_code == 201 and set(answer.json()["result"]) == {"sys_id", "number"}
+    whole = raw.get(f"{mock.instance}/api/now/table/sc_task", params={"sysparm_query": f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by={mock.integration_user}"},
+                    auth=(mock.integration_user, PASSWORD)).json()["result"][0]
+    assert {"sys_id", "number", "state", "cmdb_ci", "close_notes", "correlation_id", "correlation_display", "sys_created_by"} <= set(whole)
+    assert whole["sys_created_by"] == mock.integration_user
+
+
+def test_a_task_says_who_opened_it_and_as_what_as_the_table_api_does():
+    """Round 3 review I2: sys_created_by is the user who opened it (the authenticated one), correlation_display what it was sent; a
+    replayed task is the integration user's unless said otherwise (a test's stand-in for a task someone else opened)."""
+    mock = mock_for()
+    with mock.client() as c:
+        ref = create(c)
+        assert c.find_task(REQUEST_ID) == ref
+    fresh = mock.fresh()
+    fresh.add_task(number="SCTASK0010009", sys_id="9" * 32, correlation_id=REQUEST_ID, short_description="x", description="y", ci=None)
+    fresh.add_task(number="SCTASK0010010", sys_id="a" * 32, correlation_id="r_" + "b" * 32, short_description="x", description="y",
+                   ci=None, created_by="someone")
+    with fresh.client() as c:
+        assert c.find_task(REQUEST_ID) == TaskRef("9" * 32, "SCTASK0010009")
+        assert c.find_task("r_" + "b" * 32) is None   # final review M1: the query asks for the portal's own tasks only
+    with pytest.raises(MockServiceNowError):
+        fresh.add_task(number="SCTASK0010011", sys_id="b" * 32, correlation_id=REQUEST_ID, short_description="x", description="y",
+                       ci=None, created_by="no:colon")
+
+
+def test_the_task_query_answers_at_most_sysparm_limit_rows():
+    mock = mock_for()
+    auth = (mock.integration_user, PASSWORD)
+    raw = httpx.Client(transport=mock.transport())
+    for _ in range(3):  # the Table API refuses no second task with one correlation id; the client's find_task refuses two
+        assert raw.post(f"{mock.instance}/api/now/table/sc_task", json={"short_description": "x", "correlation_id": REQUEST_ID,
+                                                                        "correlation_display": "golden-road-portal"},
+                        auth=auth).status_code == 201
+    query = {"sysparm_query": f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by={mock.integration_user}"}
+    assert len(raw.get(f"{mock.instance}/api/now/table/sc_task", params={**query, "sysparm_limit": "2"}, auth=auth).json()["result"]) == 2
+    assert len(raw.get(f"{mock.instance}/api/now/table/sc_task", params=query, auth=auth).json()["result"]) == 3
+    assert raw.get(f"{mock.instance}/api/now/table/sc_task", params={**query, "sysparm_limit": "0"}, auth=auth).status_code == 400
+    with mock.client() as c, pytest.raises(ServiceNowError, match="more than one task"):
+        c.find_task(REQUEST_ID)
+
+
+@pytest.mark.parametrize("body", [{"correlation_id": REQUEST_ID}, {"short_description": "x"}, {"short_description": "x", "correlation_id": REQUEST_ID, "state": "3"},
+                                  {"short_description": "two\nlines", "correlation_id": REQUEST_ID}, {"short_description": "x", "correlation_id": "javascript:x"},
+                                  {"short_description": "x", "correlation_id": REQUEST_ID, "cmdb_ci": "nope"}, ["x"]])
+def test_a_bad_create_is_400(body):
+    mock = mock_for()
+    answer = httpx.Client(transport=mock.transport()).post(f"{mock.instance}/api/now/table/sc_task", json=body,
+                                                           auth=(mock.integration_user, PASSWORD))
+    assert answer.status_code == 400 and mock.task_fields("SCTASK0010007") is None
+
+
+def test_the_create_and_the_lookup_are_401_without_the_integration_user():
+    mock = mock_for()
+    raw = httpx.Client(transport=mock.transport())
+    assert raw.post(f"{mock.instance}/api/now/table/sc_task", json={"short_description": "x", "correlation_id": REQUEST_ID}).status_code == 401
+    assert raw.get(f"{mock.instance}/api/now/table/sc_task", params={"sysparm_query": f"correlation_id={REQUEST_ID}"}).status_code == 401
+    assert mock.task_fields("SCTASK0010007") is None
+
+
+def test_a_decision_closes_the_task_with_its_close_notes():
+    mock = mock_for()
+    with mock.client() as c:
+        ref = create(c)
+        mock.decide_task(ref.number, "4", "Use Calendars.Read.")
+        task = c.task(ref.number)
+    assert (task.state, task.close_notes, task.open) == ("4", "Use Calendars.Read.", False)
+    assert mock.task_history(ref.number) == [("closed", "Use Calendars.Read.")]
+    mock.decide_task("SCTASK0010099", "3", "")   # a task the mock doesn't hold is skipped
+    with pytest.raises(MockServiceNowError):
+        mock.decide_task(ref.number, "5", "")
+
+
+def test_a_fresh_mock_takes_replayed_tasks_and_numbers_after_them():
+    mock = mock_for()
+    fresh = mock.fresh()
+    fresh.add_task(number="SCTASK0010009", sys_id="9" * 32, correlation_id=REQUEST_ID, short_description="Service principal for acme/notes: x",
+                   description="Scopes:\n- Mail.Send (needs approval)", ci=None)
+    with fresh.client() as c:
+        assert c.find_task(REQUEST_ID) == TaskRef("9" * 32, "SCTASK0010009")
+        assert create(c, "r_" + "b" * 32).number == "SCTASK0010010"
+    assert mock.task_fields("SCTASK0010009") is None and mock.fresh().task_fields("SCTASK0010009") is None
+    with pytest.raises(MockServiceNowError):
+        fresh.add_task(number="SCTASK0010009", sys_id="8" * 32, correlation_id="r_" + "c" * 32, short_description="x", description="y", ci=None)
+
+
+@pytest.mark.parametrize("kwargs", [{"ci": 7}, {"ci": "C" * 32}, {"short_description": None}, {"description": 4},
+                                    {"short_description": ""}, {"short_description": "x" * 161}, {"short_description": "two\nlines"},
+                                    {"short_description": "a\rb"}, {"description": "x" * 4001},
+                                    {"correlation_id": "r_1^ORnumber=SCTASK0010001"}, {"number": "SCTASK1"}, {"sys_id": "x"}])
+def test_a_malformed_replayed_task_is_refused(kwargs):
+    fresh = mock_for().fresh()
+    with pytest.raises(MockServiceNowError):
+        fresh.add_task(**{"number": "SCTASK0010009", "sys_id": "9" * 32, "correlation_id": REQUEST_ID, "short_description": "x",
+                          "description": "y", "ci": None, **kwargs})
+    assert fresh.task_fields("SCTASK0010009") is None
+
+
+def test_a_correlation_query_other_than_one_id_is_400():
+    mock = mock_for()
+    joined = f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by={mock.integration_user}"
+    for query in ("correlation_id=r_1^ORnumber=SCTASK0010001", "correlation_id=", "short_description=x", "correlation_id=javascript:x",
+                  f"correlation_id={REQUEST_ID}",   # final review M1: only the joined form
+                  f"correlation_id={REQUEST_ID}^correlation_display=other^sys_created_by={mock.integration_user}",
+                  f"correlation_id={REQUEST_ID}^sys_created_by={mock.integration_user}^correlation_display=golden-road-portal",
+                  joined + "^ORnumber=SCTASK0010001", joined + "^", joined.replace("sys_created_by=golden-road-cmdb", "sys_created_by=a^b"),
+                  f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by="):
+        r = httpx.Client(transport=mock.transport()).get(f"{mock.instance}/api/now/table/sc_task", params={"sysparm_query": query},
+                                                         auth=(mock.integration_user, PASSWORD))
+        assert r.status_code == 400, query
+
+
+def test_a_close_by_patch_or_replay_keeps_its_close_notes_as_the_table_api_does():
+    mock = mock_for()
+    with mock.client() as c:
+        ref = create(c)
+        c.close_task(ref.sys_id, "Applied in git.")
+        assert c.task(ref.number).close_notes == "Applied in git."
+    fresh = mock.fresh()
+    fresh.replay([("5ca1ab1e000040008000000000010001", "completed", "Done.")])
+    with fresh.client() as c:
+        assert (c.task("SCTASK0010001").state, c.task("SCTASK0010001").close_notes) == ("3", "Done.")
+
+
+@pytest.mark.parametrize("number", [None, 7, "SCTASK1", "sctask0010001", "SCTASK0010001^ORnumber=SCTASK0010002"])
+def test_a_decision_or_a_description_for_a_malformed_number_is_refused(number):
+    mock = mock_for()
+    with pytest.raises(MockServiceNowError):
+        mock.decide_task(number, "3", "")
+    with pytest.raises(MockServiceNowError):
+        mock.task_description(number)
+
+
+def test_a_replayed_task_at_the_field_lengths_is_taken():
+    fresh = mock_for().fresh()
+    fresh.add_task(number="SCTASK0010009", sys_id="9" * 32, correlation_id=REQUEST_ID, short_description="x" * 160,
+                   description="y" * 4000, ci=None)
+    assert fresh.task_description("SCTASK0010009") == "y" * 4000
+
+
+@pytest.mark.parametrize("asked, expected", [(" sys_id , number ,", {"sys_id", "number"}), ("number,,state", {"number", "state"}),
+                                             ("", None), (" , ", None)])
+def test_sysparm_fields_are_trimmed_and_an_empty_list_is_every_field(asked, expected):
+    mock = mock_for()
+    answer = httpx.Client(transport=mock.transport()).get(
+        f"{mock.instance}/api/now/table/sc_task", params={"sysparm_query": "number=SCTASK0010001", "sysparm_fields": asked},
+        auth=(mock.integration_user, PASSWORD)).json()["result"][0]
+    assert set(answer) == (expected or {"sys_id", "number", "state", "cmdb_ci", "close_notes", "correlation_id", "correlation_display",
+                                        "sys_created_by", "closed_by"})
+
+
+def test_the_integration_user_signs_in_in_any_case_and_its_tasks_are_still_the_portal_s():
+    """A ServiceNow login ignores case; sys_created_by is the user's own user_name, whatever case the credential was typed in."""
+    mock = mock_for()
+    typed = Client(mock.instance, http=httpx.Client(transport=mock.transport()), auth=(mock.integration_user.upper(), PASSWORD))
+    with typed as c:
+        ref = create(c)
+        assert c.find_task(REQUEST_ID) == ref
+    whole = httpx.Client(transport=mock.transport()).get(f"{mock.instance}/api/now/table/sc_task", params={
+        "sysparm_query": f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by={mock.integration_user}"},
+        auth=(mock.integration_user, PASSWORD)).json()["result"][0]
+    assert whole["sys_created_by"] == mock.integration_user
+
+
+# ---- final review I2: a decision says who closed the task ----
+
+MWDAVISII, APPROVER = "6816f79cc0a8016401c5a33be04be441", "a9b0c1d2e3f40516a7b8c9d0e1f20314"
+
+
+@pytest.mark.parametrize("email, closer", [("MWDavisii@Example.com", MWDAVISII), ("admin@example.test", APPROVER), (None, APPROVER)])
+def test_a_decision_closes_the_task_as_the_decider_s_user_or_the_mock_approver(email, closer):
+    """closed_by is the decider's ServiceNow user when their email is a mock user's, else the mock approver (approver@example.com)."""
+    mock = mock_for()
+    with mock.client() as c:
+        ref = create(c)
+        mock.decide_task(ref.number, "3", "", decided_by_email=email)
+        assert c.task(ref.number).closed_by == closer
+        assert c.user_sys_id("approver@example.com") == APPROVER
+
+
+def test_the_joined_query_finds_the_portal_s_task_in_any_case_of_its_user():
+    mock = mock_for()
+    with mock.client() as c:
+        ref = create(c)
+    answer = httpx.Client(transport=mock.transport()).get(f"{mock.instance}/api/now/table/sc_task", params={
+        "sysparm_query": f"correlation_id={REQUEST_ID}^correlation_display=golden-road-portal^sys_created_by={mock.integration_user.upper()}"},
+        auth=(mock.integration_user, PASSWORD))
+    assert [r["number"] for r in answer.json()["result"]] == [ref.number]

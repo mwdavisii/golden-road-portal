@@ -16,7 +16,7 @@ LINK_SOURCES = ("github-oauth", "admin")
 
 
 class Conflict(Exception):
-    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable, decommissioned, command_open, not_lifecycle."""
+    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable, decommissioned, command_open, not_lifecycle, name_taken, task_taken, principal_exists, decided."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -76,7 +76,8 @@ def check_binding(request_id, person_id, final):
 def open_key(kind, repo, draft):
     """What one open request is unique by, exactly migration 0007's request_one_open: its kind, its repo case-insensitively, and
     for a binding its draft's environment (test for one recorded before bindings were per environment); '' for any other kind,
-    whatever its draft says."""
+    whatever its draft says; a service principal request is never one of these keys' clash (0013 keys it by its own id, and its name
+    has an index of its own)."""
     if kind != "binding":
         return kind, repo.lower(), ""
     env = draft.get("environment") if isinstance(draft, dict) else None
@@ -205,6 +206,10 @@ class AuditEntry:
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SCOPE_ID = re.compile(r"[A-Za-z][A-Za-z]{0,63}(\.[A-Z][A-Za-z]{0,63}){1,3}")  # a Graph application permission's name: Calendars.Read, eDiscovery.Read.All
+SP_NAME = re.compile(r"sp-[a-z0-9-]{1,64}")  # a service principal's display name (S11)
+SP_SCHEMA = "service-principal-request/v1"
+MAX_JUSTIFICATION = MAX_CLOSE_NOTES = 2000
 RECORD_SCHEMAS = ("intake/v1", "intake/v2", "invalid")
 
 
@@ -581,6 +586,112 @@ def moved_step(kept, to_state, now, fields):
     return dc.replace(kept, state=to_state, updated_at=now, **fields)
 
 
+# ---- service principals (spec 2026-11-16, migration 0013) ----
+
+SP_STATES = ("pending", "approved", "created", "rejected")
+
+
+def check_service_principal_request(request_id, person_id, repo, draft, state) -> None:
+    """A service principal request's id has the portal's format, it names a person and a repo, it starts approved or pending, and its
+    draft is exactly a service-principal-request/v1 for that repo: a name (S11), its scopes sorted with no repeat, and a justification
+    exactly when it is pending (0013's insert trigger holds the same). The tier is the web's to decide from the catalog."""
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        raise ValueError("a service principal request's id is not a portal request id")
+    if not isinstance(person_id, str) or not PERSON_ID.fullmatch(person_id) or not isinstance(repo, str) or not REPO_NAME.fullmatch(repo):
+        raise ValueError("a service principal request names its person and its repo")
+    keys = {"schema", "repo", "display_name", "scopes"} | ({"justification"} if state == "pending" else set())
+    scopes = draft.get("scopes") if isinstance(draft, dict) else None
+    why = draft.get("justification") if isinstance(draft, dict) else None
+    if (state not in ("pending", "approved") or not isinstance(draft, dict) or set(draft) != keys or draft["schema"] != SP_SCHEMA
+            or draft["repo"] != repo or not isinstance(draft["display_name"], str) or not SP_NAME.fullmatch(draft["display_name"])
+            or not isinstance(scopes, list) or not scopes or not all(isinstance(s, str) and SCOPE_ID.fullmatch(s) for s in scopes)
+            or scopes != sorted(set(scopes))
+            or (state == "pending" and not (isinstance(why, str) and 1 <= len(why) <= MAX_JUSTIFICATION and why.strip() == why))):
+        raise ValueError("a service principal request starts approved or pending, with a service-principal-request/v1 for its repo: a name, "
+                         "sorted scopes, and a justification exactly when it is pending")
+
+
+PRINCIPAL_ID = re.compile(r"sp-[0-9a-f]{24}")  # a principal the portal created (decided while planning: item 19)
+CLIENT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")  # a random (version 4) GUID
+DECISION_STATES = ("3", "4", "7")  # Closed Complete, Closed Incomplete, Closed Skipped (S5)
+SP_AUDIT = ("service_principal.task_opened", "service_principal.approved", "service_principal.rejected", "service_principal.created")
+
+
+@dc.dataclass(frozen=True)
+class ServicePrincipalRequest:
+    """A service principal request as the collector may read it (0013's service_principal_request view): never another kind's draft."""
+    id: str
+    repo: str
+    state: str  # one of SP_STATES
+    draft: dict  # service-principal-request/v1
+    requested_by: str
+    created_at: dt.datetime
+    updated_at: dt.datetime
+    task_number: str | None = None
+    task_sys_id: str | None = None
+    attempts: int = 0
+    last_error: str | None = None
+    close_notes: str | None = None  # a rejected request's (decided while planning: item 6)
+    note_sent_at: dt.datetime | None = None  # when the creation note reached the task
+
+    @property
+    def display_name(self) -> str:
+        return self.draft["display_name"]
+
+    @property
+    def scopes(self) -> tuple[str, ...]:
+        return tuple(self.draft["scopes"])
+
+    @property
+    def justification(self) -> str | None:
+        return self.draft.get("justification")
+
+
+@dc.dataclass(frozen=True)
+class ServicePrincipal:
+    id: str
+    repo: str
+    display_name: str
+    client_id: str
+    scopes: tuple[str, ...]
+    request_id: str
+    created_at: dt.datetime
+
+
+@dc.dataclass(frozen=True)
+class MockTaskDecision:
+    """What an admin pressed on the mock's task page (S6): the collector's mock replays it."""
+    task_number: str
+    state: str  # one of DECISION_STATES
+    close_notes: str
+    decided_by: str
+    decided_at: dt.datetime
+
+
+def check_task_ref(task_number, task_sys_id) -> None:
+    if not (isinstance(task_number, str) and TASK_NUMBER.fullmatch(task_number) and isinstance(task_sys_id, str) and SYS_ID.fullmatch(task_sys_id)):
+        raise ValueError("a task is SCTASK and 7 digits, with a 32-hex sys_id")
+
+
+def check_principal(principal_id, client_id) -> None:
+    if not (isinstance(principal_id, str) and PRINCIPAL_ID.fullmatch(principal_id) and isinstance(client_id, str) and CLIENT_ID.fullmatch(client_id)):
+        raise ValueError("a created principal's id is sp- and 24 hex digits, and its client ID a lowercase version 4 GUID")
+
+
+def check_decision(task_number, state, close_notes) -> None:
+    if not isinstance(task_number, str) or not TASK_NUMBER.fullmatch(task_number) or state not in DECISION_STATES:
+        raise ValueError("a mock decision names a task and closes it 3, 4 or 7")
+    if not isinstance(close_notes, str) or len(close_notes) > MAX_CLOSE_NOTES or (state != "3" and not close_notes.strip()):
+        raise ValueError(f"a mock decision's close notes are at most {MAX_CLOSE_NOTES} characters, and a rejection has some")
+
+
+def check_close_notes(approved, close_notes) -> None:
+    if approved and close_notes is not None:
+        raise ValueError("an approval keeps no close notes")
+    if not approved and not (isinstance(close_notes, str) and len(close_notes) <= MAX_CLOSE_NOTES):
+        raise ValueError(f"a rejection keeps the task's close notes, at most {MAX_CLOSE_NOTES} characters")
+
+
 class Store(Protocol):
     def sign_in(self, *, issuer, subject, display_name, email, groups, roles, now, max_age) -> tuple[Person, str, str]: ...
     def get_session(self, token, *, now, idle) -> Session | None: ...
@@ -681,3 +792,20 @@ class Store(Protocol):
     # once every step is done, in one transaction: the state its action applies (set_lifecycle_state's, kept if this request set it
     # already), its completed note (closes the task), and writing -> merged with the last merge commit (or None: no step had a PR)
     def apply_lifecycle(self, *, request_id, merge_sha, note, now) -> Request: ...
+
+    # ---- service principals (spec 2026-11-16, migration 0013) ----
+    def create_service_principal_request(self, *, request_id, person_id, repo, draft, state, now) -> Request: ...  # approved or pending
+    def service_principal_requests(self, *, states=None, repo=None) -> list[ServicePrincipalRequest]: ...  # oldest first; repo any case
+    def service_principal_request(self, request_id) -> ServicePrincipalRequest | None: ...  # None for another kind
+    # the collector's: a pending request's task, once (task_taken when another request has the number)
+    def record_service_principal_task(self, *, request_id, task_number, task_sys_id, now) -> None: ...
+    # the collector's: a pending request with a task, decided by its close (approved, or rejected with its close notes)
+    def decide_service_principal_request(self, *, request_id, approved, close_notes, now) -> ServicePrincipalRequest: ...
+    def record_service_principal_failure(self, *, request_id, error, now) -> None: ...  # attempts + 1, the error kept; not final states
+    # the collector's, in one transaction: the principal row and approved -> created
+    def create_service_principal(self, *, request_id, principal_id, client_id, now) -> ServicePrincipal: ...
+    def mark_service_principal_note_sent(self, *, request_id, now) -> None: ...  # once, on a created request with a task
+    def service_principals(self, repo=None) -> list[ServicePrincipal]: ...  # oldest first; one repo's (any case) when given
+    def add_mock_task_decision(self, *, task_number, state, close_notes, actor_id, now) -> MockTaskDecision: ...  # the web's, once per task
+    def mock_task_decisions(self) -> list[MockTaskDecision]: ...  # oldest first
+    def service_principal_lock(self): ...  # a context manager: True while this pass alone runs the collector's step

@@ -215,3 +215,19 @@ def test_back_from_the_field_step_keeps_the_search(secrets):
     text = get(secrets, folder="17", q="notes", secret_id="1042").text
     assert step_of(text) == "3" and 'secrets/new?environment=test&amp;folder=17&amp;q=notes">Back</a>' in text
     assert '<input type="hidden" name="q" value="notes">' in text
+
+
+def test_the_steps_preview_against_the_overlay_as_the_post_does(secrets, monkeypatch):
+    """Round 4 review: the preview's binding carries the directory with the principals the portal created, as _change's does."""
+    from portal_fakes import CREATED_ID, created_principal
+
+    import portal.web.routes_secrets as routes
+    created_principal(secrets.store, secrets.people["owner"].id, secrets.clock())
+    seen, real = [], routes.view
+
+    def spy(*args, binding=None, **kwargs):
+        seen.append(binding)
+        return real(*args, binding=binding, **kwargs)
+    monkeypatch.setattr(routes, "view", spy)
+    assert get(secrets).status_code == 200
+    assert seen and all(b is not None and b["directory"].principal(CREATED_ID) is not None for b in seen)

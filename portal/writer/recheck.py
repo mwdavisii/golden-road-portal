@@ -11,6 +11,7 @@ from ..cloudflare import CloudflareError
 from ..cloudflare_mock import MockCloudflare
 from ..compose import ComposeError, skills_config_map
 from ..contracts import validate
+from ..directory import overlay
 from ..secretserver import SecretServerError
 from ..floor import below_floor
 from ..roles import roles_for
@@ -101,10 +102,11 @@ def _still_admin(request, cfg, store, now) -> bool:
                for r in store.admin_repos_of_person(request.requested_by))
 
 
-def _directory_problems(request, cfg, final) -> list[str]:
+def _directory_problems(request, cfg, final, store) -> list[str]:
     """Every directory entry the binding names is still there, with the values recorded: the principal tagged for this repo, the
-    warehouse granted to that principal."""
-    directory = cfg.directory
+    warehouse granted to that principal. With the store, the principals the portal created count as tagged (S8), as on the app page; recheck()
+    without a store passes None, and the mock JSON alone fails closed."""
+    directory = overlay(cfg.directory, store, cfg.org)
     identity, data = final.get("azure_identity"), final.get("databricks")
     if not identity and not data:
         return []  # nothing the directory holds: secrets (or nothing) only
@@ -255,7 +257,7 @@ def _binding(request, cfg, store, now) -> list[str]:
         return problems + ["schema_invalid"]
     if (final["repo"], final["request"], final["linked_by"]) != (request.repo, request.id, request.requested_by) or final != request.draft:
         problems.append("record_mismatch")
-    problems += _directory_problems(request, cfg, final)
+    problems += _directory_problems(request, cfg, final, store)
     problems += _secret_problems(cfg, final)
     problems += _mcp_problems(cfg, final)
     problems += _skill_problems(cfg, final)

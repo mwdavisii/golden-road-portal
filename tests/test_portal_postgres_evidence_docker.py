@@ -66,9 +66,12 @@ def test_the_collector_inserts_evidence_and_problems_and_nothing_else_new(pg_db)
         conn.execute(EVIDENCE_SQL, evidence_row(ids))
         assert conn.execute("SELECT id, kind, repo, state, submission FROM request").fetchall() == [
             (ids["request"], "registration", "acme/notes", "pending", 1)]
-        for statement in ("SELECT draft FROM request", "SELECT * FROM request", "UPDATE request SET state = 'sent_back'", "SELECT * FROM person"):
+        for statement in ("SELECT draft FROM request", "SELECT * FROM request", "SELECT * FROM person"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
+        # since 0013 it may update some of request's columns, of a service principal request only: a trigger refuses the rest
+        with pytest.raises(errors.RaiseException, match="only service principal requests"):
+            conn.execute("UPDATE request SET state = 'sent_back'")
         with pytest.raises(errors.RaiseException, match="re-review items"):  # since 0010 it may audit re-review items, and only those
             conn.execute("INSERT INTO audit_log (at, actor_kind, action, subject_kind, subject_id, reason) VALUES (now(), 'system', 't', 'person', 'p_x', 'r')")
 

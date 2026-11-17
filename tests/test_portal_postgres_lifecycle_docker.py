@@ -461,7 +461,7 @@ def test_0012_applies_to_a_populated_database_migrated_through_0011(pg_server, m
                                        now=NOW)
             store.replace_intake_observed([IntakeObserved("acme/notes", "c" * 40, "intake/v2", True, owner.id, "low", "public",
                                                           "Stores notes.", dt.date(2027, 10, 1), None, None)], observed_at=NOW)
-            monkeypatch.setattr(migrate, "migrations", lambda: every)
+            monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0012"])  # 0013 has its own test
             assert migrate.apply(dsn()) == ["0012_lifecycle"] and migrate.apply(dsn()) == []
             assert store.get_request(reg.id).state == "pending" and store.get_request(bid).state == "approved"
             assert store.evidence_for(reg.id, 1).commit == "e" * 40 and [r.repo for r in store.intake_observed()] == ["acme/notes"]

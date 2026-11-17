@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}Create a service principal for {{ repo }} - golden road{% endblock %}
+{% block head %}<script src="/static/service_principal.js" defer></script>{% endblock %}
+{% block main %}
+<p><a href="/apps/{{ owner_name }}/{{ repo_name }}">&larr; {{ repo }}</a></p>
+<span class="eyebrow">Azure identity</span>
+<h1>Create a service principal for <span class="mono">{{ repo }}</span></h1>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+<p class="callout info">With only pre-approved scopes, the portal creates the service principal on the collector's next pass. With any scope that needs approval, the portal opens a ServiceNow task instead, and creates the service principal once the task is closed as approved. Either way it then appears in this app's Service principal list, to link to test or prod.</p>
+<section class="card">
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/service-principals/new" data-service-principal>
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="field"><label for="name">Name</label>
+<input id="name" class="mono" name="name" value="{{ form.name }}" maxlength="67" required autocomplete="off">
+<span class="hint">{{ prefix }} and then lowercase letters, digits and -, at most 64 characters after sp-.</span></p>
+<fieldset class="field choices"><legend>Pre-approved scopes</legend>
+{% for s in approved %}<label class="choice"><input type="checkbox" name="scope" value="{{ s.id }}" data-tier="approved"{% if s.id in form.scopes %} checked{% endif %}><span class="choice-title mono">{{ s.id }}</span><span class="choice-line">{{ s.label }}: {{ s.description }}</span></label>
+{% endfor %}</fieldset>
+<fieldset class="field choices"><legend>Scopes that need approval</legend>
+{% if not servicenow %}<p class="hint">ServiceNow isn't set up here, so these can't be requested.</p>{% endif %}
+{% for s in requestable %}<label class="choice"><input type="checkbox" name="scope" value="{{ s.id }}" data-tier="requestable"{% if s.id in form.scopes %} checked{% endif %}><span class="choice-title mono">{{ s.id }}</span><span class="choice-line">{{ s.label }}: {{ s.description }}</span><span class="choice-line">Risk: {{ s.risk }}</span></label>
+{% endfor %}</fieldset>
+<p class="field" data-sp-justification><label for="justification">Justification</label>
+<textarea id="justification" name="justification" rows="4" maxlength="{{ max_justification }}" data-counter="justification-count">{{ form.justification }}</textarea>
+<span class="counter" id="justification-count"></span>
+<span class="hint">Needed only when a scope that needs approval is ticked: say why this app needs it. It goes into the ServiceNow task.</span></p>
+<p class="actions"><button class="gold" type="submit" data-sp-submit>Create or request</button></p>
+</form>
+</section>
+{% endblock %}

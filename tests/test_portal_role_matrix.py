@@ -65,6 +65,9 @@ ROUTES = {
     ("POST", "/apps/{owner}/{repo}/skills"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/skills/update"): {A: 401, O: 400, X: 404, P: 404, D: 403},
     ("POST", "/apps/{owner}/{repo}/skills/remove"): {A: 401, O: 400, X: 404, P: 404, D: 403},
+    # create a service principal (spec 2026-11-16 S2): the app's admin, or a portal admin; an empty form is a 400 (no name, no scope)
+    ("GET", "/apps/{owner}/{repo}/service-principals/new"): {A: 303, O: 200, X: 404, P: 404, D: 200},
+    ("POST", "/apps/{owner}/{repo}/service-principals/new"): {A: 401, O: 400, X: 404, P: 404, D: 400},
     # lifecycle (spec 2026-11-02 rule 1): a portal admin only; the app's own admin passes APP_ADMIN and is refused (403). acme/notes has no
     # intake record observed here, so the admin's form is refused as not registered (409), before any task is checked
     ("GET", "/apps/{owner}/{repo}/lifecycle/{action}"): {A: 303, O: 403, X: 404, P: 404, D: 409},
@@ -73,6 +76,8 @@ ROUTES = {
     ("POST", "/requests/{request_id}/abandon"): admin_only(404, anonymous=401),
     ("POST", "/requests/{request_id}/stop"): admin_only(404, anonymous=401),
     ("GET", "/mock/servicenow/tasks/{number}"): admin_only(404),   # 404 for the admin too: the mock ServiceNow is not set up here
+    ("POST", "/mock/servicenow/tasks/{number}/approve"): admin_only(404, anonymous=401),   # 404 for the admin too: no mock ServiceNow here
+    ("POST", "/mock/servicenow/tasks/{number}/reject"): admin_only(404, anonymous=401),
 }
 
 
@@ -113,8 +118,9 @@ def test_a_forged_roles_header_changes_nothing(portal, route, who):
 
 # the app page's environment selector: ?environment=prod (GET) or environment=prod (POST) gets what the plain route gets, and a
 # bad environment is a 400 for whoever passes the route's Access requirement (that requirement is checked first). The lifecycle routes
-# take no environment: an action is for every environment of the app
-APP_ROUTES = sorted(r for r in ROUTES if r[1].startswith("/apps/") and "/lifecycle/" not in r[1])
+# take no environment: an action is for every environment of the app; nor do the service principal routes: a principal is the app's,
+# linked per environment afterwards
+APP_ROUTES = sorted(r for r in ROUTES if r[1].startswith("/apps/") and "/lifecycle/" not in r[1] and "/service-principals/" not in r[1])
 
 
 @pytest.mark.parametrize("who", PRINCIPALS)

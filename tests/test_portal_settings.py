@@ -334,3 +334,17 @@ def test_the_mock_servicenow_for_the_web_s_task_check_knows_the_org():
     assert problems == {} and s.servicenow is True and s.servicenow_api.org == "acme"
     s, problems = Settings.check(ENV)
     assert problems == {} and s.servicenow is False and s.servicenow_api is None
+
+
+def test_the_scope_catalog_comes_with_the_mock_directory():
+    s, problems = Settings.check({**ENV, "PORTAL_DIRECTORY": "mock"})
+    assert problems == {} and s.graph_scopes is not None and s.graph_scopes.scope("Calendars.Read").tier == "approved"
+    assert Settings.from_env(ENV).graph_scopes is None
+
+
+def test_a_bad_scope_catalog_stops_startup(tmp_path, monkeypatch):
+    import portal.graph_scopes
+    (tmp_path / "scopes.json").write_text('{"schema": "mock-graph-scopes/v1", "scopes": []}')
+    monkeypatch.setattr(portal.graph_scopes, "MOCK", tmp_path / "scopes.json")
+    s, problems = Settings.check({**ENV, "PORTAL_DIRECTORY": "mock"})
+    assert s is None and set(problems) == {"PORTAL_DIRECTORY"} and "scope catalog" in problems["PORTAL_DIRECTORY"]

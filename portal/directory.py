@@ -1,14 +1,17 @@
 """The directory the app page picks from (spec 2026-10-29 app bindings, B2/B3). Only a mock exists: mock_directory.json stands in
 for what security's process (service principals, each tagged for the repo it was made for) and analytics' process (SQL warehouses
 granted to principals) produce. The real directory answers the same two questions, principals_for and warehouses_for, from Azure
-and Databricks. Repos are named without the org: they live under the portal's own org."""
+and Databricks. Repos are named without the org: they live under the portal's own org. The principals the portal created (spec
+2026-11-16 S8) are added by overlay(), for the web and the writer's recheck alike."""
 
 import dataclasses as dc
 import json
+import logging
 import re
 import unicodedata
 from pathlib import Path
 
+log = logging.getLogger(__name__)
 MOCK = Path(__file__).resolve().parent / "mock_directory.json"
 GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ENTRY_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -119,3 +122,23 @@ def load_mock() -> Directory:
         return parse(json.loads(MOCK.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys))
     except (OSError, ValueError) as exc:
         raise DirectoryError(f"the mock directory can't be loaded: {exc}") from None
+
+
+def overlay(directory, store, org):
+    """The directory with the principals the store created (S8): each tagged for its repo when the repo is under the portal's org. A
+    created principal never shadows a listed one (the same id or client ID is skipped) and has no warehouses. A new Directory: the
+    one given is never changed. None stays None; without a store, the directory as it is."""
+    if directory is None or store is None:
+        return directory
+    taken = {p.id for p in directory.principals} | {p.client_id for p in directory.principals}
+    added = []
+    for made in store.service_principals():
+        owner, _, name = made.repo.partition("/")
+        if owner.lower() != org.lower():
+            continue
+        if made.id in taken or made.client_id in taken:
+            log.warning("directory: created principal %s skipped: its id or client ID is listed already", made.id)
+            continue
+        added.append(Principal(made.id, made.display_name, made.client_id, name))
+        taken |= {made.id, made.client_id}
+    return dc.replace(directory, principals=directory.principals + tuple(added))

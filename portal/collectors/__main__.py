@@ -5,8 +5,11 @@ factory's intake records and opens or closes the review-date items (PORTAL_REVIE
 events from run artifacts onto the re-review list (PORTAL_REREVIEW_SIGNALS). Without actions: read, the events part is skipped and the
 Re-review page says so. With PORTAL_SERVICENOW=mock, a fifth part after intake syncs each new or changed intake record to ServiceNow CMDB as
 a business application (the mock's CI table is seeded from the records the portal kept), then sends the lifecycle notes (the
-outbox) to their ServiceNow tasks, in order, each linking its request on PORTAL_BASE_URL (spec 2026-11-02 L11); unset, neither runs. It
-never prints a credential."""
+outbox) to their ServiceNow tasks, in order, each linking its request on PORTAL_BASE_URL (spec 2026-11-02 L11); unset, neither runs.
+Every pass ends with the service principal part (spec 2026-11-16): it opens and reads the ServiceNow tasks of the requests that need
+approval (with PORTAL_SERVICENOW=mock: a fresh mock per pass, with the store's tasks and the web's mock decisions replayed), and creates
+each approved principal through the mock directory client; without ServiceNow only pre-approved requests move. It never prints a
+credential."""
 
 import datetime as dt
 import logging
@@ -17,15 +20,20 @@ from pathlib import Path
 
 import httpx
 
+from ..directory import DirectoryError, load_mock as load_directory
+from ..directory_client import MockDirectoryClient, reserved_from
 from ..github.appauth import InstallationToken
 from ..github.client import GitHub, GitHubError
+from ..graph_scopes import CatalogError, load_mock as load_scopes
 from ..rereview import BadSetting, parse_days, parse_signals
+from ..service_principals import Replayed
 from ..settings import HOST, ORG, SettingsError, https_url, github_bases, no_servicenow_url, servicenow_from
 from .cmdb import collect_cmdb, seed_mock
 from .events import ARTIFACT_HOSTS, collect_events
 from .evidence import collect_evidence
 from .intake import collect_intake
 from .repo_admins import collect
+from .service_principals import collect_service_principals
 from .writeback import collect_writeback
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs each request's URL at INFO, and a storage URL carries a signature
@@ -72,12 +80,22 @@ def main(argv=None, env=os.environ) -> int:
         if servicenow is not None:  # the web's own rule for its base URL
             base_url = https_url("PORTAL_BASE_URL", env.get("PORTAL_BASE_URL") or _missing(
                 "PORTAL_BASE_URL", "the ServiceNow notes link the portal's request"), root_only=True)
+        # the mock directory's ids are reserved, and the catalog marks the scopes that need approval (decided while planning: item 14);
+        # either one invalid skips only the service principal part (Round 3 review M7)
+        directory_client = catalog = sp_unusable = None
+        try:
+            directory_client, catalog = MockDirectoryClient(reserved_from(load_directory())), load_scopes()
+        except (DirectoryError, CatalogError) as exc:
+            sp_unusable = exc
         try:
             key = Path(key_file).read_bytes()
         except OSError:
             raise SettingsError("PORTAL_READ_APP_KEY_FILE can't be read") from None
     except (SettingsError, BadSetting) as exc:
         return _fail(str(exc))
+    if sp_unusable is not None:
+        print("collectors: service principals: the mock directory or the scope catalog (portal/mock_graph_scopes.json) is not valid: the "
+              "part is skipped", file=sys.stderr)
     from ..store.postgres import PostgresStore
 
     api = github_bases(host)[1]
@@ -100,6 +118,10 @@ def main(argv=None, env=os.environ) -> int:
             # the write-back is the ServiceNow part's second step: its status line is cmdb's (a write-back that raises is cmdb failed)
             writeback = (("lifecycle write-back", "cmdb", lambda: _writeback_note(collect_writeback(
                 store, servicenow, base_url=base_url, now=dt.datetime.now(dt.UTC)))),) if servicenow is not None else ()
+            sp_servicenow = Replayed(servicenow, store, base_url, catalog) if servicenow is not None else None
+            service_principals = (("service principals", None, lambda: _sp_note(collect_service_principals(
+                store, sp_servicenow, directory_client, base_url=base_url, now=dt.datetime.now(dt.UTC), catalog=catalog))
+                if sp_unusable is None else _raise(sp_unusable)),)  # skipped: the part is failed each pass, by the error's type
             for name, part, run in (
                     ("repo_admins", "repo_admins", lambda: f"{collect(gh, store, now=dt.datetime.now(dt.UTC))} rows"),
                     ("evidence", "evidence", lambda: _evidence_note(collect_evidence(gh, store, org=org, gateway_hosts=gateway_hosts,
@@ -109,7 +131,8 @@ def main(argv=None, env=os.environ) -> int:
                     *cmdb,
                     *writeback,
                     ("re-review events", "events", lambda: _events_note(collect_events(gh, store, org=org, signals=signals, now=dt.datetime.now(dt.UTC),
-                                                                             actions_readable=actions_readable(token), artifact_hosts=hosts)))):
+                                                                             actions_readable=actions_readable(token), artifact_hosts=hosts))),
+                    *service_principals):
                 ok = _part(name, run)
                 _status(store, part, ok, interval)
                 failed = not ok or failed
@@ -137,6 +160,8 @@ def _status(store, part, ok, interval) -> None:
     """The part's line on the Re-review page: the parts with no status of their own (repo admins, evidence) record that
     they ran and the collector's interval, so the page can tell a stopped collector; a part that raised is "failed". Best effort: the
     store may be what failed."""
+    if part is None:  # a part with no Re-review status source of its own
+        return
     try:
         if not ok:
             store.set_rereview_status(source=part, problem="failed", counts={}, now=dt.datetime.now(dt.UTC))
@@ -204,6 +229,24 @@ def _writeback_note(result) -> str:
     if result.get("failed"):
         note += f" ({result['failed']} failed: will retry; {result['waiting']} waiting behind them)"
     return note
+
+
+def _sp_note(result) -> str:
+    if result.get("busy"):
+        return "skipped: another collector is creating them"
+    note = (f"{result['created']} created, {result['opened']} tasks opened, {result['approved']} approved, {result['rejected']} rejected, "
+            f"{result['waiting']} waiting")
+    if result.get("noted"):
+        note += f", {result['noted']} noted"
+    if result.get("failed"):
+        note += f" ({result['failed']} failed: will retry)"
+    if result.get("servicenow"):
+        note += f" (ServiceNow not reachable this pass: {result['servicenow']}; tasks and notes wait)"
+    return note
+
+
+def _raise(exc):
+    raise exc
 
 
 def _events_note(result) -> str:

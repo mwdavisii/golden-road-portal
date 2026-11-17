@@ -1532,3 +1532,200 @@ def test_a_rebuild_is_a_note_of_its_own(store):
     moved, event = store.move_lifecycle_step_with_event(request_id=req.id, step="deploy", to_state="planned", now=T0, event="rebuilt",
                                                         note="Pull request #7 closed: main moved, so the writer rebuilds it.")
     assert (moved.state, moved.attempt, event.step) == ("planned", 2, "rebuilt")
+
+
+# ---- service principals (spec 2026-11-16, migration 0013) ----
+
+from portal_fakes import SP_APPROVED, SP_PENDING, sp_request  # noqa: E402
+
+TASK, TASK_SYS_ID = "SCTASK0010007", "7" * 32
+SP_ID, CLIENT_ID = "sp-" + "a" * 24, "0e2f6c1d-3b4a-4c5d-8e6f-7a8b9c0d1e2f"
+
+
+def test_a_service_principal_request_starts_approved_or_pending_and_is_audited(store):
+    owner, _, _ = sign_in(store)
+    done, waiting = sp_request(store, owner.id, T0), sp_request(store, owner.id, T0 + dt.timedelta(minutes=1), SP_PENDING)  # oldest first
+    assert (done.kind, done.state, done.draft, done.final) == ("service_principal", "approved", SP_APPROVED, None)
+    assert waiting.state == "pending"
+    view = store.service_principal_request(waiting.id)
+    assert (view.display_name, view.scopes, view.justification, view.task_number, view.attempts) == (
+        "sp-notes-rooms", ("Calendars.Read", "Calendars.ReadWrite"), SP_PENDING["justification"], None, 0)
+    assert [r.id for r in store.service_principal_requests()] == [done.id, waiting.id]
+    assert [r.id for r in store.service_principal_requests(states=("pending",), repo="ACME/notes")] == [waiting.id]
+    assert store.audit_for("request", done.id)[0].action == "request.created"
+    assert store.service_principal_request(seed_registration(store, owner).id) is None
+
+
+def seed_registration(store, owner):
+    return store.create_registration(person_id=owner.id, now=T0, draft={"schema": "registration-draft/v1", "repo": "acme/tools",
+                                                                       "purpose": "Builds internal tools for the team.", "data_classification": "public"})
+
+
+def test_several_open_requests_per_app_but_never_one_name_twice(store):
+    owner, _, _ = sign_in(store)
+    sp_request(store, owner.id, T0)
+    sp_request(store, owner.id, T0, SP_PENDING)
+    with pytest.raises(Conflict) as err:
+        sp_request(store, owner.id, T0)   # SP_APPROVED's name again, while the first is open
+    assert err.value.code == "name_taken"
+
+
+def test_the_writer_never_claims_a_service_principal_request(store):
+    owner, _, _ = sign_in(store)
+    sp_request(store, owner.id, T0)
+    assert store.claim_approved(now=T0) is None
+
+
+def test_the_collector_opens_reads_and_rejects_a_pending_request(store):
+    owner, _, _ = sign_in(store)
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    with pytest.raises(Conflict) as err:
+        store.decide_service_principal_request(request_id=req.id, approved=True, close_notes=None, now=T0)
+    assert err.value.code == "wrong_state"   # decided only by its task
+    store.record_service_principal_task(request_id=req.id, task_number=TASK, task_sys_id=TASK_SYS_ID, now=T0)
+    with pytest.raises(Conflict):
+        store.record_service_principal_task(request_id=req.id, task_number="SCTASK0010008", task_sys_id="8" * 32, now=T0)
+    store.record_service_principal_failure(request_id=req.id, error="ServiceNow answered 503 for the task", now=T0)
+    rejected = store.decide_service_principal_request(request_id=req.id, approved=False, close_notes="Use Calendars.Read.", now=T0)
+    assert (rejected.state, rejected.close_notes, rejected.task_number, rejected.attempts, rejected.last_error) == (
+        "rejected", "Use Calendars.Read.", TASK, 1, "ServiceNow answered 503 for the task")
+    assert [e.action for e in store.audit_for("request", req.id)] == ["request.created", "service_principal.task_opened",
+                                                                      "service_principal.rejected"]
+    with pytest.raises(Conflict):
+        store.record_service_principal_failure(request_id=req.id, error="late", now=T0)   # rejected is final
+
+
+def test_a_task_number_belongs_to_one_request(store):
+    owner, _, _ = sign_in(store)
+    first, second = sp_request(store, owner.id, T0, SP_PENDING), sp_request(store, owner.id, T0, {**SP_PENDING, "display_name": "sp-notes-x"})
+    store.record_service_principal_task(request_id=first.id, task_number=TASK, task_sys_id=TASK_SYS_ID, now=T0)
+    with pytest.raises(Conflict) as err:
+        store.record_service_principal_task(request_id=second.id, task_number=TASK, task_sys_id="8" * 32, now=T0)
+    assert err.value.code == "task_taken"
+
+
+def test_an_approved_request_is_created_with_its_principal_in_one_step_and_noted_once(store):
+    owner, _, _ = sign_in(store)
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    store.record_service_principal_task(request_id=req.id, task_number=TASK, task_sys_id=TASK_SYS_ID, now=T0)
+    store.decide_service_principal_request(request_id=req.id, approved=True, close_notes=None, now=T0)
+    made = store.create_service_principal(request_id=req.id, principal_id=SP_ID, client_id=CLIENT_ID, now=T0)
+    assert (made.id, made.repo, made.display_name, made.client_id, made.scopes, made.request_id) == (
+        SP_ID, "acme/notes", "sp-notes-rooms", CLIENT_ID, ("Calendars.Read", "Calendars.ReadWrite"), req.id)
+    assert store.service_principal_request(req.id).state == "created"
+    assert store.service_principals() == [made] and store.service_principals("ACME/Notes") == [made] and store.service_principals("acme/x") == []
+    with pytest.raises(Conflict):
+        store.create_service_principal(request_id=req.id, principal_id="sp-" + "b" * 24, client_id=CLIENT_ID.replace("0e", "1e"), now=T0)
+    store.mark_service_principal_note_sent(request_id=req.id, now=T0)
+    assert store.service_principal_request(req.id).note_sent_at == T0
+    with pytest.raises(Conflict):
+        store.mark_service_principal_note_sent(request_id=req.id, now=T0)
+
+
+def test_a_name_used_by_a_created_principal_is_taken_for_good(store):
+    owner, _, _ = sign_in(store)
+    req = sp_request(store, owner.id, T0)
+    store.create_service_principal(request_id=req.id, principal_id=SP_ID, client_id=CLIENT_ID, now=T0)
+    with pytest.raises(Conflict) as err:
+        sp_request(store, owner.id, T0)
+    assert err.value.code == "name_taken"
+
+
+def test_a_note_is_only_for_a_created_request_with_a_task(store):
+    owner, _, _ = sign_in(store)
+    req = sp_request(store, owner.id, T0)
+    store.create_service_principal(request_id=req.id, principal_id=SP_ID, client_id=CLIENT_ID, now=T0)
+    with pytest.raises(Conflict):
+        store.mark_service_principal_note_sent(request_id=req.id, now=T0)
+
+
+@pytest.mark.parametrize("principal_id, client_id", [("sp-notes", CLIENT_ID), (SP_ID, "not-a-guid"), (SP_ID, CLIENT_ID.upper())])
+def test_a_principal_s_id_and_client_id_are_shaped(store, principal_id, client_id):
+    owner, _, _ = sign_in(store)
+    req = sp_request(store, owner.id, T0)
+    with pytest.raises(ValueError):
+        store.create_service_principal(request_id=req.id, principal_id=principal_id, client_id=client_id, now=T0)
+
+
+def test_the_mock_approver_decides_once_and_never_their_own_task(store):
+    owner, _, _ = sign_in(store)
+    admin, _, _ = sign_in(store, subject="sub-admin", roles=["admin"], groups=["golden-road-admins"], name="Ada")
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    with pytest.raises(Conflict) as err:
+        store.add_mock_task_decision(task_number=TASK, state="3", close_notes="", actor_id=admin.id, now=T0)
+    assert err.value.code == "not_found"   # no request has the task yet
+    store.record_service_principal_task(request_id=req.id, task_number=TASK, task_sys_id=TASK_SYS_ID, now=T0)
+    with pytest.raises(Conflict) as err:
+        store.add_mock_task_decision(task_number=TASK, state="3", close_notes="", actor_id=owner.id, now=T0)
+    assert err.value.code == "self_decision"
+    with pytest.raises(ValueError):
+        store.add_mock_task_decision(task_number=TASK, state="4", close_notes="", actor_id=admin.id, now=T0)   # a reject needs notes
+    decision = store.add_mock_task_decision(task_number=TASK, state="4", close_notes="Use the read scope.", actor_id=admin.id, now=T0)
+    assert store.mock_task_decisions() == [decision] and (decision.state, decision.decided_by) == ("4", admin.id)
+    with pytest.raises(Conflict) as err:
+        store.add_mock_task_decision(task_number=TASK, state="3", close_notes="", actor_id=admin.id, now=T0)
+    assert err.value.code == "decided"
+    assert store.audit_for("mock_task", TASK)[0].action == "mock_task.decided"
+
+
+def test_the_service_principal_lock_is_held_by_one_pass(store):
+    with store.service_principal_lock() as held:
+        assert held is True
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_an_approver_s_decision_is_for_a_registration_only(store, approve):
+    owner, _, _ = sign_in(store)
+    admin, _, _ = sign_in(store, subject="sub-admin", roles=["admin"], groups=["golden-road-admins"], name="Ada")
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    with pytest.raises(Conflict) as err:
+        store.decide(request_id=req.id, actor_id=admin.id, actor_groups=["golden-road-admins"], approve=approve, note="Looks fine.",
+                     final={"schema": "intake/v2"} if approve else None, now=T0)
+    assert err.value.code == "wrong_role"
+    assert store.service_principal_request(req.id).state == "pending"
+
+
+# ---- Round 3 review I1: a ServiceNow task is one request's, a lifecycle's or a service principal's, never both ----
+
+@pytest.mark.parametrize("same", ["number", "sys_id"])
+def test_a_lifecycle_request_can_t_cite_a_service_principal_request_s_task(store, same):
+    """A lifecycle request's completion closes its task (Closed Complete): citing an SP request's task would approve it."""
+    owner, admin = people(store)
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    store.record_service_principal_task(request_id=req.id, task_number=TASK, task_sys_id=TASK_SYS_ID, now=T0)
+    final = {**LIFE, "task": TASK} if same == "number" else {**LIFE, "task_sys_id": TASK_SYS_ID}
+    with pytest.raises(Conflict) as err:
+        store.create_lifecycle(request_id=new_rid(), person_id=admin.id, repo="acme/notes", final=final, note=NOTE, now=T0)
+    assert err.value.code == "task_taken"
+    assert store.lifecycle_events() == []
+
+
+@pytest.mark.parametrize("same", ["number", "sys_id"])
+def test_a_service_principal_request_can_t_take_a_lifecycle_request_s_task(store, same):
+    owner, admin = people(store)
+    lifecycle_request(store, admin)
+    req = sp_request(store, owner.id, T0, SP_PENDING)
+    number, sys_id = (LIFE["task"], "8" * 32) if same == "number" else ("SCTASK0010008", LIFE["task_sys_id"])
+    with pytest.raises(Conflict) as err:
+        store.record_service_principal_task(request_id=req.id, task_number=number, task_sys_id=sys_id, now=T0)
+    assert err.value.code == "task_taken"
+    assert store.service_principal_request(req.id).task_number is None
+
+
+def new_rid():
+    from portal.ids import new_id
+    return new_id("r")
+
+
+# ---- final review I1: no principal for an app decommissioned after its request ----
+
+def test_no_principal_is_created_for_an_app_decommissioned_after_its_request(store):
+    owner, admin = people(store)
+    req = sp_request(store, owner.id, T0)
+    life, _ = writing_lifecycle(store, admin, action="decommission")
+    store.move_lifecycle_step(request_id=life.id, step="deploy", to_state="done", now=T0, merge_sha="3" * 40)
+    store.set_lifecycle_state(request_id=life.id, state="decommissioned", now=T0)
+    with pytest.raises(Conflict) as err:
+        store.create_service_principal(request_id=req.id, principal_id=SP_ID, client_id=CLIENT_ID, now=T0)
+    assert err.value.code == "decommissioned"
+    assert store.service_principals() == [] and store.service_principal_request(req.id).state == "approved"

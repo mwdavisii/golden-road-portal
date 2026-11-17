@@ -47,7 +47,7 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_OIDC_SCOPES`, `PORTAL_OIDC_GROUPS_CLAIM`, `PORTAL_OIDC_ALGORITHMS` | Optional; default `openid profile email`, `groups`, `RS256` |
 | `PORTAL_REVIEW_MONTHS` | Optional; months until a registration's review date (1 to 36, default 12) |
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; seconds after which the collector's observation of a person's admin repos is too old to register or approve on (60 to 604800, default 600: two collector intervals) |
-| `PORTAL_DIRECTORY` | Optional; `mock` turns on each app's connections (an Azure identity and a Databricks connection, picked from `portal/mock_directory.json`); unset, the app page shows none. The writer must get the same value |
+| `PORTAL_DIRECTORY` | Optional; `mock` turns on each app's connections (an Azure identity and a Databricks connection, picked from `portal/mock_directory.json`), and creating a service principal from the scope catalog (`portal/mock_graph_scopes.json`); unset, the app page shows none. The writer must get the same value |
 | `PORTAL_IDENTITY_PROCESS_URL`, `PORTAL_DATA_PROCESS_URL` | Optional; `https://` pages that say how to ask for a service principal and for a warehouse grant (linked on the app page) |
 | `PORTAL_SECRET_SERVER` | Optional; `mock` turns on each app's secrets from Delinea Secret Server (`portal/mock_secret_server.json`, served through `portal/secretserver.py`'s client, which never reads a value); unset, the app page shows none. The writer must get the same value |
 | `PORTAL_SECRET_PROCESS_URL` | Optional; an `https://` page that says how to ask security to share a secret with the platform account `golden-road-eso` (linked on the app page) |
@@ -57,7 +57,7 @@ The portal signs people in with OIDC and enforces its own roles (contributor, op
 | `PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD` | Optional; each environment's gateway host, the same as `platform.json`'s `mcp_gateways` (`configure.py --mcp-gateway-test`, `--mcp-gateway-prod`). Empty is the placeholder, `mcp-test.example.com` or `mcp.example.com`; the two must differ. The writer must get the same values |
 | `PORTAL_MCP_PROCESS_URL` | Optional; an `https://` page that says how to ask for a server to be added to a gateway (linked on the app page) |
 | `PORTAL_SKILLS_CATALOG` | Optional; `mock` turns on each app's skills from the platform's catalog (`portal/mock_skills_catalog.json`); unset, the app page shows none. The writer must get the same value |
-| `PORTAL_SERVICENOW` | Optional; `mock` shows the collector's CMDB records (the app page's card, the request's Registered in ServiceNow step) and turns on the lifecycle actions (the web checks each task against it). The collector reads it too |
+| `PORTAL_SERVICENOW` | Optional; `mock` shows the collector's CMDB records (the app page's card, the request's Registered in ServiceNow step) and turns on the lifecycle actions (the web checks each task against it) and service principal requests for scopes that need approval. The collector reads it too |
 | `PORTAL_ORG_NAME` | Optional; the organization's name in the ownership notice (one line, 1 to 100 characters; empty is "the organization") |
 | `PORTAL_LIFECYCLE_GRACE_DAYS` | Optional; the days the ownership notice gives (0 to 36500, default 30; `0` leaves the day count out, it never means "no time") |
 | `PORTAL_CLOUDFLARE_ACCOUNT_ID`, `PORTAL_SERVICENOW_URL` | Must stay unset: they are for a real Cloudflare account and a real ServiceNow instance, which there are none of yet. Set, each process that reads them stops (the web both, the writer the account id, the collector the URL) |
@@ -338,6 +338,63 @@ mode the web checks tasks against its own mock; against a real instance it would
 **The demo page.** `/mock/servicenow/tasks/<number>` (admins, mock only) shows a fixture task (`SCTASK0010001` to `SCTASK0010006`) with
 the notes the collector sent replayed in order, and Closed Complete once the close was sent. The request page links it, and shows
 the timeline, the pull requests, Retry or abandon, and "What ServiceNow was told".
+
+## Service principals (0.7.2, mock directory and ServiceNow)
+
+Mock only: nothing calls a real Microsoft Graph or a real ServiceNow. A created service principal is a row in the portal's store,
+listed beside the mock directory's (`portal/mock_directory.json`).
+
+**The catalog.** `portal/mock_graph_scopes.json` (`mock-graph-scopes/v1`) lists each Graph application permission an app may ask
+for: its `id` (`Calendars.Read`), `label`, `description` and `tier`, `approved` or `requestable`; a requestable one also has its
+`risk`. The platform owns the file: a change is a reviewed PR. The web loads it with `PORTAL_DIRECTORY=mock`; the collector always.
+
+**The form.** `/apps/<owner>/<repo>/service-principals/new` (the repo's admin, or a portal admin; others get 404) takes a name
+(`sp-<repo>-<suffix>`, lowercase letters, digits and `-`, at most 64 characters after `sp-`, used nowhere yet), the ticked scopes and,
+when one needs approval, a justification of up to 2000 characters (no control or invisible formatting characters: a 400). The
+server decides from the catalog: only pre-approved scopes is a
+request `approved`; any requestable scope makes it `pending`, which needs ServiceNow ("Requests for higher-risk scopes need ServiceNow,
+which isn't set up here."). The draft is a `service-principal-request/v1`. `service_principal.js` only changes the button's label.
+The request page (`/requests/<id>`) shows the scopes, the state and the task's number (linked to the mock task page for admins).
+
+**The collector** runs the step on every pass, last, under its own advisory lock: for each `pending` request with no task it looks for
+the portal's own task with the request's id (`GET /api/now/table/sc_task?sysparm_query=correlation_id=<id>^correlation_display=golden-road-portal^sys_created_by=<user>`:
+a task someone else opened with that `correlation_id` is never asked for, so it can't stall the request) and else opens one
+(`POST /api/now/table/sc_task`, which answers 201 with `{"result": ...}`), then records its number and `sys_id`. A found task is
+taken only if the integration user opened it (`sys_created_by`, compared in any case) as the portal (`correlation_display`
+`golden-road-portal`); anything else is an error, retried. It reads each pending request's task: Closed Complete (3) makes it
+`approved` when the task's `closed_by` names someone other than the requester's own ServiceNow user (found by their email); a task
+that names no one who closed it, or names the requester, is a failure, retried, never approved. ServiceNow's ACLs, or an approval
+record (`sysapproval_approver`), must still keep anyone else who mustn't approve from closing it. Closed Incomplete (4) or Closed Skipped (7) `rejected` with the task's `close_notes` (neutralised, cut to 2000
+characters); an open task waits. For each `approved` request it checks the scopes against the catalog again (the database doesn't
+know the tiers): an unknown scope, a requestable scope on a request with no task, or an app decommissioned after its request is
+never created (0013's guard refuses the last too). Otherwise the mock directory
+client makes the principal, recorded with the request `created` in one transaction; then one work note gives the task the new client
+ID, sent at least once (a note that failed is sent again on the next pass). A failure keeps the request as it is with one more
+attempt and the client's error, and the next pass tries again, with no attempt cap. Its log line is `collectors: service principals:
+N created, N tasks opened, N approved, N rejected, N waiting` (then `N noted` and `N failed: will retry` when there are any). Without
+`PORTAL_SERVICENOW`, only pre-approved requests move. A task is a lifecycle request's or a service principal request's, never both:
+the lifecycle form refuses a task recorded on a service principal request, and the store answers `task_taken` either way.
+
+**The mock approver.** `/mock/servicenow/tasks/<number>` shows a portal-opened task with Approve
+(`/mock/servicenow/tasks/<number>/approve`) and Reject (`.../reject`, close notes required), under "Mock: acting as the ServiceNow
+approver", for an admin who isn't the requester (the requester gets 403); close notes with control or invisible formatting characters
+are a 400. The decision is a `mock_task_decision` row, and the replay closes the task as the decider's mock ServiceNow user (by email),
+else the mock approver (`approver@example.com`). The
+collector's mock is built fresh each pass with the store's tasks, decisions and creation notes replayed into it; the web replays
+them only on the mock task page (the lifecycle form's task check asks the fixture's tasks alone). The replay skips (and logs) a
+request whose task number or `sys_id` the fresh mock already holds (a fixture task's).
+
+**Linking.** A created principal is in the Azure identity card's Service principal list and links per environment like a tagged one;
+the writer's recheck accepts it (the directory overlay reads the store's `service_principal` rows, built per call, never cached). A
+created principal whose id or client ID the mock directory already lists is left out of the overlay and logged; the card's "Created
+in the portal" list still shows it. `/admin/directory` shows the mock JSON only.
+
+**Data (`0013`, forward-only).** Request kind `service_principal`, states `approved`, `pending`, `created` and `rejected`, and the
+columns `task_number`, `task_sys_id`, `attempts`, `last_error`, `close_notes` and `note_sent_at` that only `portal_collector` sets;
+`service_principal` (read by `portal_web` and `portal_writer`, inserted by `portal_collector`); `mock_task_decision` (inserted once
+per task by `portal_web`, read by the web and the collector); the view `service_principal_request`, which is all the collector reads
+of the kind (it still never reads a registration's draft). The kind has its own insert and update triggers, names are unique in any
+case, and a task belongs to one request of either kind. The Approvals page lists registrations only.
 
 ## Development
 

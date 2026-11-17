@@ -87,6 +87,8 @@ def approvals_page(request, principal, status=200, errors=()):
     store, settings, today = request.app.state.store, request.app.state.settings, request.app.state.clock().date()
     items = []
     for r in store.requests_in(("pending",)):
+        if r.kind != "registration":
+            continue  # a service principal request is decided in ServiceNow (decided while planning: item 22)
         fresh, stale = fresh_admin_repos(store, r.requested_by, request.app.state.clock(), settings.repo_admins_stale_after)
         context = evidence_context(store, r)
         items.append({"request": r, "requester": store.get_person(r.requested_by), "links": store.links_for(r.requested_by),
@@ -105,7 +107,7 @@ def approvals(request: Request, principal=ADMIN):
 
 def _pending(request, principal, request_id):
     found = request.app.state.store.get_request(request_id)
-    if found is None:
+    if found is None or found.kind != "registration":  # only a registration is decided here (review I2)
         return None, approvals_page(request, principal, 404, ["No such request."])
     if found.requested_by == principal.person.id:
         return None, approvals_page(request, principal, 403, ["You requested this, so another admin must decide it."])

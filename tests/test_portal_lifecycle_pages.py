@@ -363,6 +363,32 @@ def test_the_store_s_refusal_answers_the_same_words(lp, monkeypatch):
     assert binding.status_code == 409 and DECOMMISSIONED in binding.text
 
 
+# ---- Round 3 review I1: a service principal request's task is never a lifecycle request's ----
+
+@pytest.mark.parametrize("same", ["number", "sys_id"])
+def test_a_service_principal_request_s_task_is_refused(lp, same):
+    """Its completion would close the task Closed Complete, and the collector would then create scopes nobody approved. On a real
+    instance the task is found, open and naming the app's CI; here it is a fixture task recorded on a service principal request."""
+    from portal_fakes import SP_PENDING, sp_request
+    req = sp_request(lp.store, lp.people["owner"].id, T0, SP_PENDING)
+    number, sys_id = ("SCTASK0010001", "8" * 32) if same == "number" else ("SCTASK0010008", TASK1_SYS_ID)
+    lp.store.record_service_principal_task(request_id=req.id, task_number=number, task_sys_id=sys_id, now=T0)
+    refused = ask(lp)
+    assert refused.status_code == 400 and lifecycle.TASK_SERVICE_PRINCIPAL.format(task="SCTASK0010001").replace("'", "&#39;") in refused.text
+    assert lifecycles(lp) == []
+
+
+def test_the_store_s_task_taken_answers_the_same_words(lp, monkeypatch):
+    """Recorded on a service principal request between the page's check and the insert: the store's Conflict("task_taken")."""
+    from portal.store.base import Conflict
+
+    def taken(**kwargs):
+        raise Conflict("task_taken")
+    monkeypatch.setattr(lp.store, "create_lifecycle", taken)
+    refused = ask(lp)
+    assert refused.status_code == 400 and lifecycle.TASK_SERVICE_PRINCIPAL.format(task="SCTASK0010001").replace("'", "&#39;") in refused.text
+
+
 # ---- Retry and Abandon ----
 
 def failed(portal, action="suspend"):

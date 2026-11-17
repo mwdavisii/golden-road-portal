@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% set active = "requests" %}
+{% block title %}Service principal {{ req.display_name }} - golden road{% endblock %}
+{% block main %}
+<p><a href="/requests">&larr; My requests</a></p>
+<span class="eyebrow">Service principal request</span>
+<div class="card-head"><h1 class="mono">{{ req.display_name }}</h1><span class="badge state-{{ req.state }}">{{ STATE_LABELS.get(req.state, req.state) }}</span></div>
+<p class="callout {% if req.state == 'rejected' %}warn{% else %}info{% endif %}" role="status">{{ words }}</p>
+<dl class="facts summary">
+<div><dt>App</dt><dd class="mono"><a href="/apps/{{ req.repo }}">{{ req.repo }}</a></dd></div>
+<div><dt>ServiceNow task</dt><dd class="mono">{% if req.task_number %}{% if mock_task %}<a href="/mock/servicenow/tasks/{{ req.task_number }}">{{ req.task_number }}</a>{% else %}{{ req.task_number }}{% endif %}{% elif req.justification is not none %}Not opened yet{% else %}None: every scope is pre-approved{% endif %}</dd></div>
+{% if made %}<div><dt>Client ID</dt><dd class="mono">{{ made.client_id }}</dd></div>{% endif %}
+</dl>
+<section>
+<h2>Scopes</h2>
+<ul>{% for s in scopes %}<li><span class="mono">{{ s.id }}</span> ({{ s.label }}){% if s.needs_approval %} <span class="tag">needs approval</span>{% endif %}</li>{% endfor %}</ul>
+{% if req.justification is not none %}<h2>Justification</h2>
+<pre class="prose">{{ req.justification }}</pre>{% endif %}
+{% if retrying %}<p class="hint">The collector tried {{ req.attempts }} time{% if req.attempts != 1 %}s{% endif %} and will try again: {{ req.last_error }}</p>{% endif %}
+</section>
+{% endblock %}

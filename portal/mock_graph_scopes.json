@@ -1,0 +1,14 @@
+{
+  "schema": "mock-graph-scopes/v1",
+  "scopes": [
+    {"id": "Calendars.Read", "label": "Read calendars", "description": "Read events in every calendar in the tenant.", "tier": "approved"},
+    {"id": "Contacts.Read", "label": "Read contacts", "description": "Read every user's contacts.", "tier": "approved"},
+    {"id": "Presence.Read.All", "label": "Read presence", "description": "Read every user's presence: available, busy or away.", "tier": "approved"},
+    {"id": "Calendars.ReadWrite", "label": "Read and write calendars", "description": "Create, change and delete events in every calendar in the tenant.",
+     "tier": "requestable", "risk": "The app can change or delete anyone's meetings, not only read them."},
+    {"id": "Mail.Send", "label": "Send mail as any user", "description": "Send mail as any user in the tenant.",
+     "tier": "requestable", "risk": "The app can send mail that looks as if anyone in the organization wrote it."},
+    {"id": "Files.Read.All", "label": "Read all files", "description": "Read every file in OneDrive and SharePoint.",
+     "tier": "requestable", "risk": "The app can read every document in the tenant, sensitive ones included."}
+  ]
+}

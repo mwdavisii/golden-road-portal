@@ -1,7 +1,8 @@
 """A ServiceNow CMDB client for the collector's CMDB part (spec 2026-10-31 Part 3), written against ServiceNow's REST API: the Table API
 (GET /api/now/table/sys_user, GET /api/now/table/cmdb_ci_business_app/{sys_id}) and the Identification and Reconciliation API
 (POST /api/now/identifyreconcile) and, for the lifecycle (spec 2026-11-02), the Table API's sc_task (GET by number; PATCH for a work
-note and for the close) and the CI's lifecycle fields. It authenticates with basic auth as the platform's integration user (its
+note and for the close) and the CI's lifecycle fields. For a service principal request (spec 2026-11-16) it opens an sc_task (POST,
+which answers 201 Created) whose correlation_id is the portal's request id, and finds one by that id. It authenticates with basic auth as the platform's integration user (its
 password is in Secret Server; the mock's is a constant). In the mock its transport is portal.servicenow_mock. Against a real instance,
 confirm the marked details against the instance's REST API Explorer, the class's identification rule on correlation_id, and a
 reconciliation rule for the golden_road data source. No error message carries the credentials or the instance's own text."""
@@ -32,6 +33,16 @@ TASK_NUMBER = re.compile(r"SCTASK[0-9]{7}")
 OPEN_TASK_STATES = ("1", "2")  # sc_task's Open and Work in Progress; 3 is Closed Complete (confirm the choice list on the instance)
 CLOSED_COMPLETE = "3"
 CHOICE = re.compile(r"-?[0-9]{1,4}")  # a choice field's value, as the Table API answers it (a string)
+# What the portal puts on a task it opens: a request id, exactly store.base.REQUEST_ID's shape (no query operator, no "javascript:")
+CORRELATION_ID = re.compile(r"r_[0-9a-f]{32}")
+CORRELATION_DISPLAY = "golden-road-portal"
+# The integration user's name as find_task's query takes it (sys_created_by=<user>): no ^ (joins), = or , (operators' parts), : (a
+# script's prefix), whitespace or anything else an encoded query reads (final review M1)
+QUERY_USER = re.compile(r"[A-Za-z0-9._@-]{1,100}")
+MAX_SHORT_DESCRIPTION, MAX_DESCRIPTION = 160, 4000  # sc_task's field lengths (confirm on the instance's dictionary)
+# what a TaskRef reads (a task's state comes from task(number)): who opened the task and as what, so a task someone else opened with
+# the request's id (it is on the request page) is never taken for the portal's (Round 3 review I2)
+TASK_REF_FIELDS = "sys_id,number,correlation_id,correlation_display,sys_created_by"
 # The CI's lifecycle fields (spec 2026-11-02 "ServiceNow write-back"): the platform's own u_ fields to confirm with the ServiceNow admins
 LIFECYCLE_FIELDS = ("operational_status", "install_status", "u_golden_road_state", "u_golden_road_task")
 GOLDEN_ROAD_STATES = ("active", "suspended", "decommissioned")  # u_golden_road_state's values: the store's LIFECYCLE_STATES
@@ -41,7 +52,7 @@ ANSWER_DEADLINE = 30.0  # seconds for the whole answer (TIMEOUT bounds each read
 
 
 class ServiceNowError(Exception):
-    """status: the HTTP status ServiceNow answered with (not 200), or None when it didn't answer, its answer wasn't one the client reads,
+    """status: the HTTP status ServiceNow answered with (not the one expected), or None when it didn't answer, its answer wasn't one the client reads,
     or the request was refused before it was sent."""
 
     def __init__(self, message: str, *, status: int | None = None):
@@ -87,10 +98,19 @@ class Task:
     number: str
     state: str  # the choice value, a string ("1")
     ci: str | None  # cmdb_ci's sys_id; None when the task names no CI
+    close_notes: str = ""  # a closed task's close notes; "" when it has none
+    closed_by: str | None = None  # who closed it: a sys_user's sys_id; None when the task says no one (final review I2)
 
     @property
     def open(self) -> bool:
         return self.state in OPEN_TASK_STATES
+
+
+@dc.dataclass(frozen=True)
+class TaskRef:
+    """A task the portal opened, or found by its correlation id."""
+    sys_id: str
+    number: str
 
 
 def email_ok(email) -> bool:
@@ -120,8 +140,8 @@ class Client:
         if callable(close):
             close()
 
-    def _send(self, method, path, what, *, params, json=None):
-        """The answer's JSON body for a 200, else ServiceNowError naming the status and what was asked: never the instance's text,
+    def _send(self, method, path, what, *, params, json=None, expect=200):
+        """The answer's JSON body for the status expected (200; a create's 201), else ServiceNowError naming the status and what was asked: never the instance's text,
         never the request (it carries the credentials). Never redirected. The body is streamed and refused past MAX_ANSWER bytes (a
         declared Content-Length over it is refused unread) or still arriving after ANSWER_DEADLINE, so a huge or slow answer can't hold
         the worker."""
@@ -130,7 +150,7 @@ class Client:
             with self.http.stream(method, f"{self.base}{path}", params=params, json=json, auth=self._auth,
                                   headers={"Accept": "application/json"}, timeout=TIMEOUT, follow_redirects=False) as r:
                 status = r.status_code
-                if status == 200:
+                if status == expect:
                     body = _read_capped(r)
         except (httpx.HTTPError, httpx.InvalidURL, UnicodeError) as exc:  # never the exception's text, nor the exception itself
             failure = f"ServiceNow could not be reached for {what}: {type(exc).__name__}"
@@ -140,7 +160,7 @@ class Client:
             failure = f"ServiceNow's answer for {what} took longer than {ANSWER_DEADLINE:g} seconds"
         if failure is not None:  # raised outside the except block, so the httpx exception is not its __context__
             raise ServiceNowError(failure)
-        if status != 200:
+        if status != expect:
             raise ServiceNowError(f"ServiceNow answered {status} for {what}", status=status)
         try:
             return _json.loads(body)
@@ -214,7 +234,8 @@ class Client:
             raise ServiceNowError("a task number is SCTASK followed by 7 digits")
         what = "the task"
         doc = self._send("GET", f"/api/now/table/{TASK_TABLE}", what, params={
-            "sysparm_query": f"number={number}", "sysparm_fields": "sys_id,number,state,cmdb_ci", "sysparm_limit": "1"})
+            "sysparm_query": f"number={number}", "sysparm_fields": "sys_id,number,state,cmdb_ci,close_notes,closed_by",
+            "sysparm_limit": "1"})
         result = doc.get("result") if isinstance(doc, dict) else None
         if not isinstance(result, list) or len(result) > 1 or not all(isinstance(r, dict) for r in result):
             raise ServiceNowError(f"ServiceNow's answer for {what} is not a list of at most one task")
@@ -223,11 +244,15 @@ class Client:
         row = result[0]
         ci = row.get("cmdb_ci")
         value = ci.get("value") if isinstance(ci, dict) else ci
+        notes = row.get("close_notes", "")
+        closer = row.get("closed_by")  # a sys_user reference, as cmdb_ci: {"link", "value"}, a bare sys_id, or "" when empty
+        closer = closer.get("value") if isinstance(closer, dict) else closer
         if (row.get("number") != number or not isinstance(row.get("sys_id"), str) or not SYS_ID.fullmatch(row["sys_id"])
                 or not isinstance(row.get("state"), str) or not CHOICE.fullmatch(row["state"])
-                or not (value in ("", None) or (isinstance(value, str) and SYS_ID.fullmatch(value)))):
-            raise ServiceNowError(f"ServiceNow's answer for {what} is not a task with a sys_id, a state and a CI or none")
-        return Task(row["sys_id"], number, row["state"], value or None)
+                or not (value in ("", None) or (isinstance(value, str) and SYS_ID.fullmatch(value))) or not isinstance(notes, str)
+                or not (closer in ("", None) or (isinstance(closer, str) and SYS_ID.fullmatch(closer)))):
+            raise ServiceNowError(f"ServiceNow's answer for {what} is not a task with a sys_id, a state, a CI or none and a closer or none")
+        return Task(row["sys_id"], number, row["state"], value or None, notes, closer or None)
 
     def _patch_task(self, sys_id, body, what) -> None:
         if not isinstance(sys_id, str) or not SYS_ID.fullmatch(sys_id):
@@ -244,6 +269,52 @@ class Client:
     def close_task(self, sys_id: str, summary: str) -> None:
         """Close the task as Closed Complete with the summary as its close notes."""
         self._patch_task(sys_id, {"state": CLOSED_COMPLETE, "close_notes": summary}, "the task's close")
+
+    def create_task(self, *, short_description, description, correlation_id, ci=None) -> TaskRef:
+        """Open an sc_task: POST /api/now/table/sc_task answers 201 Created with {"result": the new record}. Its correlation_id is the
+        portal's request id, so find_task tells a pass that stopped after this call that the task is open already. ci: the app's CI's
+        sys_id, or None. Confirm on a real instance whether tasks must hang under a catalog request item, and the fields' lengths."""
+        if not isinstance(correlation_id, str) or not CORRELATION_ID.fullmatch(correlation_id):
+            raise ServiceNowError("a task's correlation id is a request id: r_ and 32 lowercase hex characters")
+        if ci is not None and (not isinstance(ci, str) or not SYS_ID.fullmatch(ci)):
+            raise ServiceNowError("a CI's sys_id is 32 lowercase hex characters")
+        if (not isinstance(short_description, str) or not 1 <= len(short_description) <= MAX_SHORT_DESCRIPTION
+                or any(c in short_description for c in "\r\n")):
+            raise ServiceNowError(f"a task's short description is one line of 1 to {MAX_SHORT_DESCRIPTION} characters")
+        if not isinstance(description, str) or not 1 <= len(description) <= MAX_DESCRIPTION:
+            raise ServiceNowError(f"a task's description is 1 to {MAX_DESCRIPTION} characters")
+        body = {"short_description": short_description, "description": description, "correlation_id": correlation_id,
+                "correlation_display": CORRELATION_DISPLAY}
+        if ci is not None:
+            body["cmdb_ci"] = ci
+        what = "the new task"
+        doc = self._send("POST", f"/api/now/table/{TASK_TABLE}", what, params={"sysparm_fields": TASK_REF_FIELDS}, json=body, expect=201)
+        return _task_ref(doc.get("result") if isinstance(doc, dict) else None, correlation_id, self._auth[0], what)
+
+    def find_task(self, correlation_id) -> TaskRef | None:
+        """The one sc_task the portal opened whose correlation_id is this one, or None; two are an error (the portal opens one per
+        request). The query names the portal's correlation_display and the integration user as its creator. A real
+        instance matches "=" on a string case-insensitively; _task_ref's exact check turns a row whose correlation_id differs into an
+        error, never a wrong match. A task someone else opened (sys_created_by not the integration user, or correlation_display not the
+        portal's) is an error too, never adopted: the request id is on the request page, and whoever can open a task could open and
+        close one with it. It says nothing about the task's state: read that with task(number)."""
+        if not isinstance(correlation_id, str) or not CORRELATION_ID.fullmatch(correlation_id):
+            raise ServiceNowError("a task's correlation id is a request id: r_ and 32 lowercase hex characters")
+        user = self._auth[0]
+        if not QUERY_USER.fullmatch(user):
+            raise ServiceNowError("the integration user's name can't go in a query: letters, digits, '.', '_', '@' and '-' only")
+        what = "the request's task"
+        # only the portal's own (final review M1): a task someone else opened with the request's id is not asked for, so it can't
+        # stall the request; _task_ref still checks each field the answer carries
+        query = f"correlation_id={correlation_id}^correlation_display={CORRELATION_DISPLAY}^sys_created_by={user}"
+        doc = self._send("GET", f"/api/now/table/{TASK_TABLE}", what, params={
+            "sysparm_query": query, "sysparm_fields": TASK_REF_FIELDS, "sysparm_limit": "2"})
+        result = doc.get("result") if isinstance(doc, dict) else None
+        if not isinstance(result, list):
+            raise ServiceNowError(f"ServiceNow's answer for {what} is not a list of tasks")
+        if len(result) > 1:
+            raise ServiceNowError(f"ServiceNow has more than one task for {what}")
+        return _task_ref(result[0], correlation_id, self._auth[0], what) if result else None
 
     def ci_lifecycle(self, sys_id: str) -> dict:
         """The CI's lifecycle fields it reports, {field: value} (a field it leaves out is not in the dict): rule 9 compares them with the
@@ -268,3 +339,16 @@ def _lifecycle_value_ok(field, value) -> bool:
     if field == "u_golden_road_state":
         return value in GOLDEN_ROAD_STATES
     return value == "" or TASK_NUMBER.fullmatch(value) is not None
+
+
+def _task_ref(row, correlation_id, created_by, what) -> TaskRef:
+    """The row's sys_id and number. Its correlation_id must be exactly the one sent (the instance's "=" ignores case), and the task the
+    portal's: opened by the integration user (created_by, in any case: a login ignores case, and sys_created_by holds the user's own
+    user_name; with basic auth, as here: confirm on the instance) as CORRELATION_DISPLAY. Else an error."""
+    if (not isinstance(row, dict) or not isinstance(row.get("number"), str) or not TASK_NUMBER.fullmatch(row["number"])
+            or not isinstance(row.get("sys_id"), str) or not SYS_ID.fullmatch(row["sys_id"]) or row.get("correlation_id") != correlation_id):
+        raise ServiceNowError(f"ServiceNow's answer for {what} is not a task with a number, a sys_id and this correlation id")
+    creator = row.get("sys_created_by")
+    if not isinstance(creator, str) or creator.casefold() != created_by.casefold() or row.get("correlation_display") != CORRELATION_DISPLAY:
+        raise ServiceNowError(f"ServiceNow's answer for {what} is a task the portal didn't open (another creator, or not as the portal)")
+    return TaskRef(row["sys_id"], row["number"])
