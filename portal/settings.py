@@ -132,6 +132,18 @@ def servicenow_on(value: str) -> bool:
     return value == "mock"
 
 
+def graph_scopes_from(value: str):
+    """The scope catalog (spec 2026-11-16 S1), loaded with the directory: PORTAL_DIRECTORY=mock loads portal/mock_graph_scopes.json too;
+    unset (or any other value, which the directory's own check refuses) is None."""
+    if value != "mock":
+        return None
+    from .graph_scopes import CatalogError, load_mock
+    try:
+        return load_mock()
+    except CatalogError:
+        raise SettingsError("PORTAL_DIRECTORY is mock, but the mock scope catalog (portal/mock_graph_scopes.json) is not valid") from None
+
+
 DEFAULT_ORG_NAME = "the organization"
 ORG_NAME_MAX = 100
 
@@ -206,6 +218,7 @@ class Settings:
     review_months: int = 12
     repo_admins_stale_after: dt.timedelta = dt.timedelta(minutes=10)  # two collector intervals of 5 minutes
     directory: object = None  # portal.directory.Directory when PORTAL_DIRECTORY is set; None hides the app's connections
+    graph_scopes: object = None  # portal.graph_scopes.Catalog with PORTAL_DIRECTORY=mock; None hides creating a service principal
     identity_process_url: str = ""  # where security's process for service principals is described (link text on the app page)
     data_process_url: str = ""  # where analytics' process for warehouse grants is described
     secret_server: object = None  # portal.secretserver_mock.MockSecretServer when PORTAL_SECRET_SERVER=mock; None hides app secrets
@@ -361,6 +374,7 @@ class Settings:
             secret_process_url=get("PORTAL_SECRET_PROCESS_URL", link_ok("PORTAL_SECRET_PROCESS_URL"), ""),
             classification_policy_url=get("PORTAL_CLASSIFICATION_POLICY_URL", policy_ok, ""),
             rereview_stale_days=get("PORTAL_REREVIEW_STALE_DAYS", days_ok("PORTAL_REREVIEW_STALE_DAYS"), ""))
+        values.update(graph_scopes=get("PORTAL_DIRECTORY", graph_scopes_from, ""))
         get("PORTAL_SECRET_SERVER_URL", no_secret_server_url, "")
         gateways = {e: get(name, lambda v, name=name, e=e: mcp_gateway(name, v, DEFAULT_GATEWAYS[e]), "")
                     for e, name in GATEWAY_SETTINGS.items()}

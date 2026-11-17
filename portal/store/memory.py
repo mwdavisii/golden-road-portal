@@ -13,7 +13,9 @@ from .base import (ACTION_STEPS, COMMANDS, DATE_REASONS, LIFECYCLE_STATES, MAX_S
                    Evidence, ItemEvent, FailedRun, Link, Person, RepoAdmin, Request, RereviewItem, RereviewStatus, Session, check_approval,
                    check_binding, check_cmdb_error, check_cmdb_sync, check_failed_run, check_item,
                    check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row, item_event, open_key,
-                   token_hash, PendingEvent, Watermark)
+                   token_hash, PendingEvent, Watermark, MockTaskDecision, ServicePrincipal,
+                   ServicePrincipalRequest, check_close_notes, check_decision, check_principal, check_service_principal_request,
+                   check_task_ref)
 
 
 REGISTERED = ("approved", "writing", "pr_open", "merged")  # a registration an admin approved
@@ -42,6 +44,9 @@ class MemoryStore:
         self._steps = {}  # (request_id, step) -> LifecycleStep
         self._commands = []  # LifecycleCommand, by id
         self._lifecycle_events = []  # LifecycleEvent, by id
+        self._sp = {}  # request_id -> {task_number, task_sys_id, attempts, last_error, close_notes, note_sent_at}
+        self._principals = {}  # id -> ServicePrincipal
+        self._decisions = {}  # task_number -> MockTaskDecision
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -262,6 +267,8 @@ class MemoryStore:
             req = self._need(request_id)
             if req.state != "pending":
                 raise Conflict("wrong_state")
+            if req.kind != "registration":  # an approver decides registrations only (a service principal's is its ServiceNow task)
+                raise Conflict("wrong_role")
             if req.requested_by == actor_id:
                 raise Conflict("self_decision")
             if approve and final is None:
@@ -324,7 +331,8 @@ class MemoryStore:
 
     def claim_approved(self, *, now):
         with self._lock:
-            ready = sorted((r for r in self._requests.values() if r.state == "approved"), key=lambda r: (r.decided_at or r.created_at, r.id))  # a binding has no decision
+            ready = sorted((r for r in self._requests.values() if r.state == "approved" and r.kind != "service_principal"),
+                           key=lambda r: (r.decided_at or r.created_at, r.id))  # a binding has no decision; a service principal is the collector's
             if not ready:
                 return None
             return self._move(ready[0].id, ("approved",), "writing", now, "the writer picked up the approved request")
@@ -596,6 +604,8 @@ class MemoryStore:
             key = open_key("lifecycle", repo, final)
             if any(open_key(r.kind, r.repo, r.draft) == key and r.state in OPEN_STATES for r in self._requests.values()):
                 raise Conflict("open_request_exists")
+            if any(f["task_number"] == final["task"] or f["task_sys_id"] == final["task_sys_id"] for f in self._sp.values()):
+                raise Conflict("task_taken")  # a service principal request's task: closing it would approve that request (0013)
             req = Request(request_id, "lifecycle", repo, "approved", dict(final), person_id, now, now, final=dict(final))
             self._requests[req.id] = req
             self._log(now, "person", person_id, "request.created", "request", req.id, None,
@@ -822,3 +832,152 @@ class MemoryStore:
             self._set_state(req, STATE_AFTER[req.final["action"]], now)
             self._event(req, "completed", note, now)
             return self._move(request_id, ("writing",), "merged", now, "the lifecycle action is applied in git", merge_sha=merge_sha)
+
+    # ---- service principals (spec 2026-11-16, migration 0013) ----
+
+    def _sp_view(self, req):
+        return ServicePrincipalRequest(req.id, req.repo, req.state, dict(req.draft), req.requested_by, req.created_at, req.updated_at,
+                                       **self._sp[req.id])
+
+    def _sp_need(self, request_id):
+        req = self._requests.get(request_id)
+        if req is None or req.kind != "service_principal":
+            raise Conflict("not_found")
+        return req
+
+    def _name_used(self, name):
+        name = name.lower()
+        return any(p.display_name.lower() == name for p in self._principals.values()) or any(
+            r.kind == "service_principal" and r.state in OPEN_STATES and r.draft["display_name"].lower() == name
+            for r in self._requests.values())
+
+    def _sp_move(self, req, now, state=None, **fields):
+        new = dc.replace(req, state=state or req.state, updated_at=now)
+        self._requests[req.id] = new
+        self._sp[req.id].update(fields)
+        return new
+
+    def create_service_principal_request(self, *, request_id, person_id, repo, draft, state, now):
+        check_service_principal_request(request_id, person_id, repo, draft, state)
+        with self._lock:
+            self._not_decommissioned(repo)
+            if person_id not in self._people:
+                raise Conflict("unknown_person")
+            if request_id in self._requests:
+                raise Conflict("request_exists")
+            if self._name_used(draft["display_name"]):
+                raise Conflict("name_taken")
+            req = Request(request_id, "service_principal", repo, state, dict(draft), person_id, now, now)
+            self._requests[req.id] = req
+            self._sp[req.id] = {"task_number": None, "task_sys_id": None, "attempts": 0, "last_error": None, "close_notes": None,
+                                "note_sent_at": None}
+            self._log(now, "person", person_id, "request.created", "request", req.id, None,
+                      {"state": state, "repo": repo, "draft": dict(draft)}, "service principal requested in the portal")
+            return req
+
+    def service_principal_requests(self, *, states=None, repo=None):
+        with self._lock:
+            found = [self._sp_view(r) for r in self._requests.values() if r.kind == "service_principal"
+                     and (states is None or r.state in states) and (repo is None or r.repo.lower() == str(repo).lower())]
+            return sorted(found, key=lambda r: (r.created_at, r.id))
+
+    def service_principal_request(self, request_id):
+        with self._lock:
+            req = self._requests.get(request_id)
+            return self._sp_view(req) if req is not None and req.kind == "service_principal" else None
+
+    def record_service_principal_task(self, *, request_id, task_number, task_sys_id, now):
+        check_task_ref(task_number, task_sys_id)
+        with self._lock:
+            req = self._sp_need(request_id)
+            if req.state != "pending" or self._sp[req.id]["task_number"] is not None:
+                raise Conflict("wrong_state")
+            if any(f["task_number"] == task_number for f in self._sp.values()) or any(
+                    r.kind == "lifecycle" and (r.final["task"] == task_number or r.final["task_sys_id"] == task_sys_id)
+                    for r in self._requests.values()):
+                raise Conflict("task_taken")  # another request's task (a lifecycle request's: its completion would close it, 0013)
+            self._sp_move(req, now, task_number=task_number, task_sys_id=task_sys_id)
+            self._log(now, "system", None, "service_principal.task_opened", "request", req.id, None, {"task": task_number},
+                      f"the collector opened ServiceNow task {task_number}")
+
+    def decide_service_principal_request(self, *, request_id, approved, close_notes, now):
+        check_close_notes(approved, close_notes)
+        with self._lock:
+            req = self._sp_need(request_id)
+            task = self._sp[req.id]["task_number"]
+            if req.state != "pending" or task is None:
+                raise Conflict("wrong_state")
+            state = "approved" if approved else "rejected"
+            new = self._sp_move(req, now, state, close_notes=close_notes)
+            self._log(now, "system", None, f"service_principal.{state}", "request", req.id, {"state": "pending"}, {"state": state, "task": task},
+                      f"ServiceNow task {task} was closed {'complete' if approved else 'incomplete or skipped'}")
+            return self._sp_view(new)
+
+    def record_service_principal_failure(self, *, request_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("a failure's error is 1 to 300 characters")
+        with self._lock:
+            req = self._sp_need(request_id)
+            fields = self._sp[req.id]
+            if req.state not in ("pending", "approved", "created") or (req.state == "created" and fields["note_sent_at"] is not None):
+                raise Conflict("wrong_state")
+            self._sp_move(req, now, attempts=fields["attempts"] + 1, last_error=error)
+
+    def create_service_principal(self, *, request_id, principal_id, client_id, now):
+        check_principal(principal_id, client_id)
+        with self._lock:
+            req = self._sp_need(request_id)
+            if req.state != "approved":
+                raise Conflict("wrong_state")
+            self._not_decommissioned(req.repo)  # decommissioned after its request (0013's service_principal_guard holds the same)
+            name = req.draft["display_name"]
+            if any(p.display_name.lower() == name.lower() for p in self._principals.values()):
+                raise Conflict("name_taken")
+            if principal_id in self._principals or any(p.client_id == client_id for p in self._principals.values()):
+                raise Conflict("principal_exists")
+            made = ServicePrincipal(principal_id, req.repo, name, client_id, tuple(req.draft["scopes"]), req.id, now)
+            self._principals[made.id] = made
+            self._sp_move(req, now, "created")
+            self._log(now, "system", None, "service_principal.created", "request", req.id, {"state": "approved"},
+                      {"state": "created", "principal": principal_id, "client_id": client_id}, f"the collector created {name}")
+            return made
+
+    def mark_service_principal_note_sent(self, *, request_id, now):
+        with self._lock:
+            req = self._sp_need(request_id)
+            fields = self._sp[req.id]
+            if req.state != "created" or fields["task_number"] is None or fields["note_sent_at"] is not None:
+                raise Conflict("wrong_state")
+            self._sp_move(req, now, note_sent_at=now)
+
+    def service_principals(self, repo=None):
+        with self._lock:
+            return sorted((p for p in self._principals.values() if repo is None or p.repo.lower() == str(repo).lower()),
+                          key=lambda p: (p.created_at, p.id))
+
+    def add_mock_task_decision(self, *, task_number, state, close_notes, actor_id, now):
+        check_decision(task_number, state, close_notes)
+        with self._lock:
+            req = next((r for r in self._requests.values() if r.kind == "service_principal" and self._sp[r.id]["task_number"] == task_number), None)
+            if req is None:
+                raise Conflict("not_found")
+            if task_number in self._decisions:
+                raise Conflict("decided")
+            if req.state != "pending":
+                raise Conflict("wrong_state")
+            if req.requested_by == actor_id:
+                raise Conflict("self_decision")
+            decision = MockTaskDecision(task_number, state, close_notes, actor_id, now)
+            self._decisions[task_number] = decision
+            self._log(now, "person", actor_id, "mock_task.decided", "mock_task", task_number, None, {"state": state},
+                      close_notes or "approved in the mock")
+            return decision
+
+    def mock_task_decisions(self):
+        with self._lock:
+            return sorted(self._decisions.values(), key=lambda d: (d.decided_at, d.task_number))
+
+    @contextlib.contextmanager
+    def service_principal_lock(self):
+        """One process holds a MemoryStore: the lock is always free."""
+        yield True

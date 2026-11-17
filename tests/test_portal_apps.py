@@ -245,7 +245,8 @@ def test_admin_actions_on_a_binding_request_are_refused(portal, monkeypatch):
                    justification="Purpose and classification checked.", submission="1")
     send_back = post(portal, "admin", f"/admin/requests/{req.id}/send-back", justification="Please change the thing.")
     resubmit = post(portal, "owner", f"/requests/{req.id}", purpose="x" * 30, data_classification="public")
-    assert (approve.status_code, send_back.status_code, resubmit.status_code) == (409, 409, 409)
+    # send-back: only a registration is decided on the Approvals page, any other kind is 404 (routes_admin._pending, review I2)
+    assert (approve.status_code, send_back.status_code, resubmit.status_code) == (409, 404, 409)
     assert "Only a registration is approved here" in approve.text
     assert portal.store.get_request(req.id).state == "approved" and portal.store.get_request(req.id).decided_by is None
 
@@ -778,3 +779,25 @@ def test_the_card_ignores_an_intake_record_the_collector_can_t_use(portal, probl
     assert "is registered in ServiceNow" in shown and NUMBER in shown
     assert "The registration record can't be read right now." in shown
     assert "You are its owner" not in shown and "Its owner is" not in shown and "No owner of record" not in shown and "next by" not in shown
+
+
+def test_a_principal_the_portal_created_is_in_the_link_list_and_links_like_a_tagged_one(portal):
+    from portal_fakes import CREATED_CLIENT_ID, CREATED_ID, created_principal
+    created_principal(portal.store, portal.people["owner"].id, portal.clock())
+    page = portal.client("owner").get("/apps/acme/notes")
+    assert f'value="{CREATED_ID}"' in page.text and ">sp-notes-calendar</option>" in page.text
+    response = portal.client("owner").post("/apps/acme/notes/azure-identity", data={"csrf_token": portal.csrfs["owner"],
+                                                                                    "principal_id": CREATED_ID, "environment": "test"})
+    assert response.status_code == 303
+    [req] = [r for r in portal.store.requests_for_repo("acme/notes") if r.kind == "binding"]
+    assert req.final["azure_identity"] == {"directory_id": CREATED_ID, "tenant_id": portal.settings.directory.tenant_id,
+                                           "client_id": CREATED_CLIENT_ID, "verified_by": "mock-directory"}
+
+
+def test_another_repo_s_created_principal_is_refused(portal):
+    from portal_fakes import CREATED_ID, created_principal
+    created_principal(portal.store, portal.people["owner"].id, portal.clock(), repo="acme/tools", name="sp-tools-x")
+    assert CREATED_ID not in portal.client("owner").get("/apps/acme/notes").text
+    response = portal.client("owner").post("/apps/acme/notes/azure-identity", data={"csrf_token": portal.csrfs["owner"],
+                                                                                    "principal_id": CREATED_ID, "environment": "test"})
+    assert response.status_code == 400 and not [r for r in portal.store.requests_for_repo("acme/notes") if r.kind == "binding"]

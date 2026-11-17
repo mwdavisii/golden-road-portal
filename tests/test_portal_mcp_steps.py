@@ -311,3 +311,19 @@ def test_after_a_gateway_move_one_confirmed_remove_clears_the_environment(portal
     response = post(portal, "owner", "/apps/acme/notes/mcp/remove", server_id="notes", confirmed="yes")
     assert response.status_code == 303
     assert bindings(portal)[0].final["mcp"] == {"gateway": "mcp-new.example.com", "servers": []}
+
+
+def test_the_steps_preview_against_the_overlay_as_the_post_does(mcp, monkeypatch):
+    """Round 4 review: the preview's binding carries the directory with the principals the portal created, as _change's does."""
+    from portal_fakes import CREATED_ID, created_principal
+
+    import portal.web.routes_mcp as routes
+    created_principal(mcp.store, mcp.people["owner"].id, mcp.clock())
+    seen, real = [], routes.view
+
+    def spy(*args, binding=None, **kwargs):
+        seen.append(binding)
+        return real(*args, binding=binding, **kwargs)
+    monkeypatch.setattr(routes, "view", spy)
+    assert get(mcp, environment="test").status_code == 200
+    assert seen and all(b is not None and b["directory"].principal(CREATED_ID) is not None for b in seen)

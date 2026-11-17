@@ -14,9 +14,10 @@ ZERO_WIDTH_SPACE = "\u200b"
 
 
 def neutral(text: str) -> str:
-    """The text with no control or format character but the newline (bidi overrides and isolates, zero-width characters and the like:
-    a note can't be made to read other than it is), and no [code] or [/code] tag ServiceNow would render (any case, spaces inside)."""
-    kept = "".join(c for c in text if c == "\n" or unicodedata.category(c) not in ("Cc", "Cf"))
+    """The text with no control, format or surrogate character but the newline (bidi overrides and isolates, zero-width characters and
+    the like: a note can't be made to read other than it is; a NUL or a lone surrogate can't be stored or sent as UTF-8), and no [code]
+    or [/code] tag ServiceNow would render (any case, spaces inside)."""
+    kept = "".join(c for c in text if c == "\n" or unicodedata.category(c) not in ("Cc", "Cf", "Cs"))
     return CODE_TAG.sub(lambda m: f"[{ZERO_WIDTH_SPACE}{m.group(1)}]", kept)
 
 

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from ..binding_record import (ENVIRONMENTS, BindingRefused, CloudflareUnavailable, SecretServerUnavailable, environment_state, next_binding,
                               secret_tokens)
 from ..bindings import effects
+from ..directory import overlay
 from ..ids import new_id
 from ..lifecycle import decommissioned_words
 from ..secretserver import SecretServerError
@@ -25,6 +26,7 @@ from .access import ADMIN, APP_ADMIN
 from .flash import redirect
 from .render import page
 from .routes_lifecycle import banner, panel
+from .routes_service_principals import card as service_principal_card
 from .secret_steps import DIGITS, SECRET_SERVER_DOWN
 
 router = APIRouter()
@@ -127,7 +129,8 @@ def cmdb_card(store, settings, repo, record, viewer_id) -> dict | None:
 
 def app_page(request, environment, status=200, errors=(), confirm=None):
     state, repo = request.app.state, request.state.app_repo
-    directory, org = state.settings.directory, state.settings.org
+    org = state.settings.org
+    directory = overlay(state.settings.directory, state.store, org)  # the principals the portal created too (S8)
     current, open_one, failed, registration = binding_state(state.store, repo, environment)
     identity = (current or {}).get("azure_identity")
     owner_name, repo_name = repo.split("/")
@@ -140,6 +143,7 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
                 record=record, reviews=reviews, cmdb=cmdb_card(state.store, state.settings, repo, record, request.state.principal.person.id),
                 environment=environment, environments=ENVIRONMENTS, current=current, open_request=open_one, failed=failed,
                 can_change=request.state.app_repo_admin,
+                sp_card=service_principal_card(state, repo, request.state.principal, request.state.app_repo_admin),
                 principals=directory.principals_for(org, repo) if directory else [],
                 warehouses=directory.warehouses_for(identity["directory_id"]) if directory and identity else [],
                 gateway=state.settings.mcp_gateways[environment],
@@ -216,7 +220,8 @@ def _change(request, principal, environment, flash_key, confirmed=None, folder=N
     if confirmed is not None and confirmed != "yes":  # a removal needs its confirming POST (spec 2026-10-30 R6)
         return app_page(request, environment, 400, [CONFIRM_FIRST])
     try:
-        final = next_binding(current=current, repo=repo, org=state.settings.org, directory=state.settings.directory,
+        final = next_binding(current=current, repo=repo, org=state.settings.org,
+                             directory=overlay(state.settings.directory, state.store, state.settings.org),
                              person_id=principal.person.id, request_id=request_id, now=now, environment=environment, **choice)
     except (SecretServerUnavailable, CloudflareUnavailable) as exc:
         return app_page(request, environment, 503, [str(exc)])

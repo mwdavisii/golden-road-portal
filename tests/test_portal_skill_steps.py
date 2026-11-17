@@ -275,3 +275,19 @@ def test_a_skill_that_left_the_catalog_says_so_and_offers_no_update(skills, tmp_
     page = skills.client("owner").get("/apps/acme/notes").text
     assert "<td>no longer in the catalog</td>" in page and "/skills/update" not in page and "newer:" not in page
     assert "confirm_skill=incident-triage" in page   # it can still be removed
+
+
+def test_the_steps_preview_against_the_overlay_as_the_post_does(skills, monkeypatch):
+    """Round 4 review: the preview's binding carries the directory with the principals the portal created, as _change's does."""
+    from portal_fakes import CREATED_ID, created_principal
+
+    import portal.web.routes_skills as routes
+    created_principal(skills.store, skills.people["owner"].id, skills.clock())
+    seen, real = [], routes.view
+
+    def spy(*args, binding=None, **kwargs):
+        seen.append(binding)
+        return real(*args, binding=binding, **kwargs)
+    monkeypatch.setattr(routes, "view", spy)
+    assert get(skills, environment="test").status_code == 200
+    assert seen and all(b is not None and b["directory"].principal(CREATED_ID) is not None for b in seen)

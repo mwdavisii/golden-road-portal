@@ -5,6 +5,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Query, Request
 
 from ..binding_record import ENVIRONMENTS
+from ..directory import overlay
 from ..ids import new_id
 from .access import APP_ADMIN
 from .render import page
@@ -40,7 +41,8 @@ def new_secret(request: Request, owner: str, repo: str, environment: str = Query
     user = secret_user(request)
     if user is None:
         return steps_page(request, environment, NOTHING, Choices(), typed, note=NO_LINK)
-    binding = {"current": current, "repo": request.state.app_repo, "org": state.settings.org, "directory": state.settings.directory,
+    directory = overlay(state.settings.directory, state.store, state.settings.org)  # created principals too (S8), as _change
+    binding = {"current": current, "repo": request.state.app_repo, "org": state.settings.org, "directory": directory,
                "person_id": principal.person.id, "request_id": new_id("r"), "now": state.clock(), "environment": environment,
                "mcp_gateway": state.settings.mcp_gateways[environment]}
     errors, status = [], 200

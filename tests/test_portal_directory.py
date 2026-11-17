@@ -83,3 +83,58 @@ def test_a_mock_with_a_duplicate_key_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(portal.directory, "MOCK", tmp_path / "dup.json")
     with pytest.raises(DirectoryError, match="twice"):
         load_mock()
+
+
+def test_the_overlay_adds_the_store_s_principals_of_the_org_s_repos():
+    import datetime as dt
+    from portal.directory import overlay
+    from portal.store.memory import MemoryStore
+    from portal_fakes import CREATED_CLIENT_ID, CREATED_ID, T0, created_principal
+    store = MemoryStore()
+    owner = store.sign_in(issuer="i", subject="o", display_name="O", email=None, groups=[], roles=[], now=T0, max_age=dt.timedelta(hours=8))[0]
+    created_principal(store, owner.id, T0)
+    base = load_mock()
+    before = (base.principals, base.warehouses)
+    seen = overlay(base, store, "acme")
+    [made] = [p for p in seen.principals_for("acme", "acme/notes") if p.id == CREATED_ID]
+    assert (made.display_name, made.client_id, made.tagged_repo_name) == ("sp-notes-calendar", CREATED_CLIENT_ID, "notes")
+    assert seen.principal(CREATED_ID) == made and seen.tenant_id == base.tenant_id and seen.name == base.name
+    assert seen.warehouses == base.warehouses and seen.warehouses_for(CREATED_ID) == []   # a created principal has no warehouses
+    assert all(made not in seen.principals_for("acme", f"acme/{p.tagged_repo_name}") for p in base.principals if p.tagged_repo_name != "notes")
+    assert (base.principals, base.warehouses) == before and base.principal(CREATED_ID) is None   # the static directory is never changed
+    assert overlay(base, store, "other-org").principals == base.principals   # another org's repo is never tagged here
+    assert overlay(None, store, "acme") is None and overlay(base, None, "acme") is base
+
+
+def test_the_overlay_never_lets_a_created_principal_shadow_a_listed_one():
+    import dataclasses as dc
+    from portal.directory import overlay
+    from portal.store.base import ServicePrincipal
+    from portal_fakes import T0
+    base = load_mock()
+    listed = base.principals[0]
+
+    class Store:
+        def service_principals(self, repo=None):
+            return [ServicePrincipal(listed.id, "acme/notes", "sp-notes-x", "0e2f6c1d-3b4a-4c5d-8e6f-7a8b9c0d1e2f", ("Calendars.Read",), "r_" + "a" * 32, T0),
+                    ServicePrincipal("sp-" + "d" * 24, "acme/notes", "sp-notes-y", listed.client_id, ("Calendars.Read",), "r_" + "b" * 32, T0)]
+    assert overlay(base, Store(), "acme").principals == base.principals
+    assert dc.is_dataclass(overlay(base, Store(), "acme"))
+
+
+def test_the_overlay_logs_each_created_principal_it_skips_by_its_id_only(caplog):
+    from portal.directory import overlay
+    from portal.store.base import ServicePrincipal
+    from portal_fakes import T0
+    base = load_mock()
+    listed = base.principals[0]
+    clash = ServicePrincipal("sp-" + "d" * 24, "acme/notes", "sp-notes-y", listed.client_id, ("Calendars.Read",), "r_" + "b" * 32, T0)
+
+    class Store:
+        def service_principals(self, repo=None):
+            return [clash]
+    with caplog.at_level("WARNING", logger="portal.directory"):
+        overlay(base, Store(), "acme")
+    [record] = [r for r in caplog.records if r.name == "portal.directory"]
+    assert record.levelname == "WARNING" and clash.id in record.getMessage()
+    assert listed.client_id not in record.getMessage() and "sp-notes-y" not in record.getMessage()   # the skipped id only

@@ -168,8 +168,8 @@ section, .card, .form-card { background: var(--surface); border: 1px solid var(-
 .badge.role { background: var(--ok-wash); color: var(--ok); border-color: transparent; }
 .state-pending, .state-approved, .state-writing, .state-pr_open { background: var(--info-wash); color: var(--info); border-color: transparent; }
 .state-sent_back { background: var(--warn-wash); color: var(--warn); border-color: transparent; }
-.state-merged { background: var(--ok-wash); color: var(--ok); border-color: transparent; }
-.state-failed { background: var(--danger-wash); color: var(--danger); border-color: transparent; }
+.state-merged, .state-created { background: var(--ok-wash); color: var(--ok); border-color: transparent; }
+.state-failed, .state-rejected { background: var(--danger-wash); color: var(--danger); border-color: transparent; }
 .tag { font: 600 11.5px/1 var(--sans); background: var(--surface); color: var(--warn); border: 1px solid rgb(138 83 0 / 30%); border-radius: 99px; padding: 3px 7px; margin-left: 6px; }
 
 /* ---------- buttons ---------- */

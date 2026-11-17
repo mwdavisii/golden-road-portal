@@ -320,6 +320,33 @@ def fake_directory():
     return parse(FAKE_DIRECTORY)
 
 
+def fake_catalog():
+    from portal.graph_scopes import load_mock
+    return load_mock()
+
+
+SP_APPROVED = {"schema": "service-principal-request/v1", "repo": "acme/notes", "display_name": "sp-notes-calendar", "scopes": ["Calendars.Read"]}
+SP_PENDING = {"schema": "service-principal-request/v1", "repo": "acme/notes", "display_name": "sp-notes-rooms",
+              "scopes": ["Calendars.Read", "Calendars.ReadWrite"], "justification": "Books meeting rooms for the team."}
+
+
+def sp_request(store, person_id, now, draft=None, request_id=None):
+    """A service principal request by person_id: approved for SP_APPROVED (the default), pending for a draft with a justification."""
+    from portal.ids import new_id
+    draft = dict(SP_APPROVED if draft is None else draft)
+    return store.create_service_principal_request(request_id=request_id or new_id("r"), person_id=person_id, repo=draft["repo"],
+                                                  draft=draft, state="pending" if "justification" in draft else "approved", now=now)
+
+
+CREATED_ID, CREATED_CLIENT_ID = "sp-" + "c" * 24, "0e2f6c1d-3b4a-4c5d-8e6f-7a8b9c0d1e2f"
+
+
+def created_principal(store, person_id, now, repo="acme/notes", name="sp-notes-calendar"):
+    """A principal the collector created for repo (an approved request, then the store's create)."""
+    req = sp_request(store, person_id, now, {**SP_APPROVED, "repo": repo, "display_name": name})
+    return store.create_service_principal(request_id=req.id, principal_id=CREATED_ID, client_id=CREATED_CLIENT_ID, now=now)
+
+
 def seed(store, people, now):
     """What every portal test starts from: owner linked to GitHub login owner-gh (id 1001), an admin of acme/notes, and a
     pending registration of acme/notes by owner."""

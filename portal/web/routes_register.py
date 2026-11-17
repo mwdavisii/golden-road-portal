@@ -13,6 +13,7 @@ from .ownership import admin_repos_of, fresh_admin_repos, stale_message  # noqa:
 from .flash import redirect
 from .render import page
 from .routes_lifecycle import request_page as lifecycle_request_page
+from .routes_service_principals import request_page as service_principal_request_page
 
 router = APIRouter()
 EMPTY = {"repo": "", "purpose": "", "data_classification": ""}
@@ -191,6 +192,8 @@ def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
         return RedirectResponse(f"/apps/{found.repo}?environment={environment_of(found) or 'test'}", status_code=303)
     if found.kind == "lifecycle":
         return lifecycle_request_page(request, found, principal)
+    if found.kind == "service_principal":
+        return service_principal_request_page(request, found, principal)
     store = request.app.state.store
     context = evidence_context(store, found)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],

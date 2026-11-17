@@ -12,7 +12,14 @@ table (portal.servicenow), in ServiceNow's REST API response shapes, over the du
   reconcile gives it), or empty without an org. PATCH stores a work note or the close (state 3 and close notes), in order, so the demo
   can show a task's history (task_history); replay() rebuilds it in another process from the notes the collector sent. With
   refuse_notes_on_closed (off by default, so the demos keep working), a work note or a close on a closed task answers 403, as an
-  instance whose business rule protects a closed task would.
+  instance whose business rule protects a closed task would. A POST opens a task (state 1) numbered after the highest SCTASK number
+  the mock holds, fixture or replayed (decided while planning: item 8), and answers 201, keeping who sent it (sys_created_by) and its
+  correlation_display (a fixture task's creator is FIXTURE_CREATOR, a person); a GET finds one by number or by
+  correlation_id (only the portal's own: correlation_id=<id>^correlation_display=golden-road-portal^sys_created_by=<user>, the
+  one form find_task sends), at most sysparm_limit of them. Every task route answers only the sysparm_fields asked for (all of the row without
+  them), as the Table API does. add_task and decide_task replay into a fresh mock the tasks the portal opened and the decisions the web
+  stored (spec 2026-11-16 S6); a decision's task is closed_by the decider's mock user (by email), else the mock approver (final
+  review I2).
 - The CI keeps the values it was last sent, so its lifecycle fields are readable; edit_ci() changes them as a person in ServiceNow would.
 - Anything outside the table answers 404: another method, path, table or host, and a CI or task the table doesn't hold."""
 
@@ -26,7 +33,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .servicenow import CLASS, DATA_SOURCE, EMAIL, SYS_ID, Client, email_ok
+from .servicenow import (CLASS, CORRELATION_DISPLAY, CORRELATION_ID, DATA_SOURCE, EMAIL, MAX_SHORT_DESCRIPTION, QUERY_USER, SYS_ID, Client,
+                         email_ok)
+from .servicenow import MAX_DESCRIPTION as MAX_TASK_DESCRIPTION  # this module's MAX_DESCRIPTION is a fixture task's one line
 
 MOCK = Path(__file__).resolve().parent / "mock_servicenow.json"
 PASSWORD = "mock-servicenow-password"  # the mock's integration user's; the real one is in Secret Server
@@ -47,6 +56,12 @@ ORG = re.compile(r"[A-Za-z0-9](-?[A-Za-z0-9]){0,38}")
 MAX_DESCRIPTION = 160
 OPEN_STATES = ("1", "2")
 TABLE = "/api/now/table"
+CREATE_KEYS = {"short_description", "description", "correlation_id", "correlation_display", "cmdb_ci"}
+DECISION_STATES = ("3", "4", "7")  # Closed Complete, Closed Incomplete, Closed Skipped
+PORTAL_TASK_QUERY = re.compile(rf"correlation_id=(?P<id>r_[0-9a-f]{{32}})\^correlation_display={re.escape(CORRELATION_DISPLAY)}"
+                               r"\^sys_created_by=(?P<user>[^\^]+)")
+APPROVER_EMAIL = "approver@example.com"  # the mock user who closes a decided task when the decider isn't a mock user (final review I2)
+FIXTURE_CREATOR = "admin"  # who opened a fixture task: a person in ServiceNow, never the integration user
 
 
 class MockServiceNowError(ValueError):
@@ -126,9 +141,22 @@ def load_mock(org=None) -> "MockServiceNow":
         raise MockServiceNowError(f"the mock ServiceNow can't be loaded: {type(exc).__name__}") from None
 
 
+def _task_text_ok(short_description, description) -> bool:
+    """A task's text as the mock takes it, opened by a POST or replayed: one line of 1 to MAX_SHORT_DESCRIPTION characters, and a
+    description of at most MAX_TASK_DESCRIPTION."""
+    return (isinstance(short_description, str) and 1 <= len(short_description) <= MAX_SHORT_DESCRIPTION
+            and not any(c in short_description for c in "\r\n")
+            and isinstance(description, str) and len(description) <= MAX_TASK_DESCRIPTION)
+
+
 def _error(status, message, detail=""):
     """ServiceNow's REST error shape."""
     return httpx.Response(status, json={"error": {"message": message, "detail": detail}, "status": "failure"})
+
+
+def _need_task_number(number):
+    if not (isinstance(number, str) and TASK_NUMBER.fullmatch(number)):
+        raise MockServiceNowError("a task number is SCTASK followed by 7 digits")
 
 
 class MockServiceNow:
@@ -145,6 +173,7 @@ class MockServiceNow:
         self._cis = {}
         self._fixture_tasks = tuple(dict(t) for t in tasks)  # as loaded, for fresh()
         self._tasks = {t["number"]: {**t, "history": []} for t in tasks}  # number -> the task and its [(kind, text)] in order
+        self._next_task = max((int(n[6:]) for n in self._tasks), default=0) + 1  # a new task's number: after the highest held
         self._next = first_number
 
     def client(self) -> Client:
@@ -183,7 +212,8 @@ class MockServiceNow:
             given = base64.b64decode(header[6:], validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError):
             return False
-        return given == f"{self.integration_user}:{PASSWORD}"
+        user, _, password = given.partition(":")
+        return user.casefold() == self.integration_user.casefold() and password == PASSWORD  # a login ignores case, a password doesn't
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         path, method = request.url.path, request.method
@@ -197,6 +227,8 @@ class MockServiceNow:
             route = self._ci
         elif method == "GET" and path == f"{TABLE}/sc_task":
             route = self._task_query
+        elif method == "POST" and path == f"{TABLE}/sc_task":
+            route = self._task_create
         elif method == "PATCH" and path.startswith(f"{TABLE}/sc_task/") and SYS_ID.fullmatch(path[len(f"{TABLE}/sc_task/"):]):
             route = self._task_patch
         else:
@@ -266,18 +298,68 @@ class MockServiceNow:
             return httpx.Response(200, json={"result": {**fields, "number": ci["number"], "sys_id": ci["sys_id"]}})
 
     def _task_row(self, t):
-        ci = ci_sys_id(f"{self.org}/{t['ci']}") if self.org else ""
+        if "cmdb_ci" in t:  # a task the portal opened: its CI is the sys_id it was sent (or none)
+            ci = t["cmdb_ci"]
+        else:
+            ci = ci_sys_id(f"{self.org}/{t['ci']}") if self.org else ""
         return {"sys_id": t["sys_id"], "number": t["number"], "state": t["state"],
-                "cmdb_ci": {"link": f"{self.instance}{TABLE}/cmdb_ci/{ci}", "value": ci} if ci else ""}
+                "cmdb_ci": {"link": f"{self.instance}{TABLE}/cmdb_ci/{ci}", "value": ci} if ci else "",
+                "close_notes": t.get("close_notes", ""), "correlation_id": t.get("correlation_id", ""),
+                "correlation_display": t.get("correlation_display", ""), "sys_created_by": t.get("sys_created_by", FIXTURE_CREATOR),
+                "closed_by": ({"link": f"{self.instance}{TABLE}/sys_user/{t['closed_by']}", "value": t["closed_by"]}
+                              if t.get("closed_by") else "")}
+
+    @staticmethod
+    def _fields(row, request):
+        """Only the fields asked for (sysparm_fields, each trimmed, empty entries ignored), as the Table API answers; the whole row
+        without it or when it names none."""
+        asked = [k.strip() for k in request.url.params.get("sysparm_fields", "").split(",") if k.strip()]
+        return {k: row[k] for k in asked if k in row} if asked else row
+
+    def _new_task(self, number, sys_id, body, created_by):
+        self._tasks[number] = {"number": number, "sys_id": sys_id, "state": "1", "ci": "", "cmdb_ci": body.get("cmdb_ci", ""),
+                               "short_description": body["short_description"], "description": body.get("description", ""),
+                               "correlation_id": body["correlation_id"], "correlation_display": body.get("correlation_display", ""),
+                               "sys_created_by": created_by, "close_notes": "", "history": []}
+        self._next_task = max(self._next_task, int(number[6:]) + 1)
+        return self._tasks[number]
+
+    def _task_create(self, request):
+        try:
+            body = json.loads(request.content)
+        except ValueError:
+            return _error(400, "the body is not JSON")
+        if (not isinstance(body, dict) or set(body) - CREATE_KEYS or not {"short_description", "correlation_id"} <= set(body)
+                or not all(isinstance(v, str) for v in body.values())
+                or not _task_text_ok(body["short_description"], body.get("description", ""))
+                or not CORRELATION_ID.fullmatch(body["correlation_id"])
+                or not (body.get("cmdb_ci", "") == "" or SYS_ID.fullmatch(body["cmdb_ci"]))):
+            return _error(400, "the mock opens a task with a short description, a correlation id, and a description and a CI or none")
+        with self._lock:
+            if self._next_task > MAX_NUMBER:
+                return _error(400, "the mock has no task numbers left")
+            number = f"SCTASK{self._next_task:07d}"
+            # sys_created_by: the user who sent it, as its user_name (_handle let only the integration user through, in any case)
+            task = self._new_task(number, hashlib.sha256(f"sc_task:{number}".encode()).hexdigest()[:32], body, self.integration_user)
+            return httpx.Response(201, json={"result": self._fields(self._task_row(task), request)})
 
     def _task_query(self, request):
         query = request.url.params.get("sysparm_query", "")
-        number = query[len("number="):] if query.startswith("number=") else None
-        if number is None or not TASK_NUMBER.fullmatch(number):
-            return _error(400, "the mock answers one query: number=<SCTASK and 7 digits>")
+        limit = request.url.params.get("sysparm_limit", "10000")
+        if not (limit.isascii() and limit.isdigit() and int(limit) >= 1):
+            return _error(400, "sysparm_limit must be a whole number from 1")
         with self._lock:
-            found = self._tasks.get(number)
-            return httpx.Response(200, json={"result": [self._task_row(found)] if found else []})
+            if query.startswith("number=") and TASK_NUMBER.fullmatch(query[len("number="):]):
+                found = [self._tasks[query[len("number="):]]] if query[len("number="):] in self._tasks else []
+            elif (joined := PORTAL_TASK_QUERY.fullmatch(query)) and QUERY_USER.fullmatch(joined["user"]):
+                # the portal's own task (final review M1): its correlation id, as the portal, by this user (any case, as "=" is)
+                found = [t for t in self._tasks.values() if t.get("correlation_id") == joined["id"]
+                         and t.get("correlation_display") == CORRELATION_DISPLAY
+                         and t.get("sys_created_by", FIXTURE_CREATOR).casefold() == joined["user"].casefold()]
+            else:
+                return _error(400, "the mock answers one query: number=<SCTASK and 7 digits>, or correlation_id=<one id>^correlation_display="
+                                   f"{CORRELATION_DISPLAY}^sys_created_by=<user>")
+            return httpx.Response(200, json={"result": [self._fields(self._task_row(t), request) for t in found[:int(limit)]]})
 
     def _task_patch(self, request):
         sys_id = request.url.path.rsplit("/", 1)[1]
@@ -295,11 +377,11 @@ class MockServiceNow:
                 found["history"].append(("work_notes", body["work_notes"]))
             elif (isinstance(body, dict) and set(body) == {"state", "close_notes"} and body["state"] == "3"
                     and isinstance(body["close_notes"], str)):
-                found["state"] = "3"
+                found["state"], found["close_notes"] = "3", body["close_notes"]
                 found["history"].append(("closed", body["close_notes"]))
             else:
                 return _error(400, "the mock takes a work note, or state 3 with close notes")
-            return httpx.Response(200, json={"result": self._task_row(found)})
+            return httpx.Response(200, json={"result": self._fields(self._task_row(found), request)})
 
     # ---- for the demo and the tests ----
 
@@ -308,6 +390,54 @@ class MockServiceNow:
         The web replays the collector's sent notes into a fresh one per use (the task check, the task page), never into its own."""
         return MockServiceNow(self.instance, self.integration_user, self.number_prefix, self.first_number, self.users,
                               tasks=self._fixture_tasks, org=self.org, refuse_notes_on_closed=self.refuse_notes_on_closed)
+
+    def add_task(self, *, number, sys_id, correlation_id, short_description, description, ci, created_by=None) -> None:
+        """A task the portal opened (its number and sys_id from the store, its text rebuilt), replayed into a fresh mock: open, as created,
+        by the integration user as the portal. created_by: for the tests, a task someone else opened with this correlation id."""
+        if not (isinstance(number, str) and TASK_NUMBER.fullmatch(number) and isinstance(sys_id, str) and SYS_ID.fullmatch(sys_id)
+                and isinstance(correlation_id, str) and CORRELATION_ID.fullmatch(correlation_id)
+                and _task_text_ok(short_description, description)
+                and (ci is None or (isinstance(ci, str) and SYS_ID.fullmatch(ci)))
+                and (created_by is None or (isinstance(created_by, str) and USER.fullmatch(created_by)))):
+            raise MockServiceNowError("a replayed task names its number, its sys_id, its correlation id, its text and its CI or none")
+        with self._lock:
+            if number in self._tasks or any(t["sys_id"] == sys_id for t in self._tasks.values()):
+                raise MockServiceNowError("a replayed task is named twice")
+            self._new_task(number, sys_id, {"short_description": short_description, "description": description,
+                                            "correlation_id": correlation_id, "correlation_display": CORRELATION_DISPLAY, "cmdb_ci": ci or ""},
+                           created_by or self.integration_user)
+
+    def holds_task(self, number, sys_id) -> bool:
+        """Whether a task with this number or this sys_id is here already (a replay skips one: add_task would refuse it)."""
+        with self._lock:
+            return number in self._tasks or any(t["sys_id"] == sys_id for t in self._tasks.values())
+
+    def decide_task(self, number, state, close_notes, decided_by_email=None) -> None:
+        """The mock approver's decision (S6): the task closes with this state (3, 4 or 7) and its close notes, closed_by the decider's
+        mock user (their email, any case), else the mock approver (APPROVER_EMAIL's user). A task the mock doesn't hold is skipped."""
+        if state not in DECISION_STATES or not isinstance(close_notes, str):
+            raise MockServiceNowError("a decision closes a task 3, 4 or 7, with its close notes")
+        _need_task_number(number)
+        with self._lock:
+            found = self._tasks.get(number)
+            if found is None:
+                return
+            found["state"], found["close_notes"] = state, close_notes
+            found["closed_by"] = self._closer(decided_by_email)
+            found["history"].append(("closed", close_notes))
+
+    def _closer(self, email) -> str:
+        for wanted in (email, APPROVER_EMAIL):
+            user = next((u for u in self.users if isinstance(wanted, str) and u["email"].lower() == wanted.lower()), None)
+            if user is not None:
+                return user["sys_id"]
+        return ""
+
+    def task_description(self, number) -> str:
+        """A task's description: the portal's for a task it opened, "" for a fixture task or one the mock doesn't hold."""
+        _need_task_number(number)
+        with self._lock:
+            return self._tasks[number].get("description", "") if number in self._tasks else ""
 
     def task_history(self, number) -> list:
         """The task's work notes and close, [("work_notes" or "closed", text)] in order; [] for a task the mock doesn't hold."""
@@ -331,7 +461,7 @@ class MockServiceNow:
                 if found is None:
                     continue
                 if step == "completed":
-                    found["state"] = "3"
+                    found["state"], found["close_notes"] = "3", text
                     found["history"].append(("closed", text))
                 else:
                     found["history"].append(("work_notes", text))

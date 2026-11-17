@@ -157,6 +157,8 @@ def test_the_actions_check_reads_the_token_s_permissions(tmp_path, monkeypatch):
     monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
     monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
     monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: seen.append(k["actions_readable"]) or {"stored": 0, "skipped": 0})
+    monkeypatch.setattr(entry, "collect_service_principals", lambda *a, **k: {"created": 0, "opened": 0, "approved": 0, "rejected": 0,
+                                                                            "waiting": 0, "noted": 0, "failed": 0})
     code, _ = run_main(["--once"], {**env_with(tmp_path), "PORTAL_REREVIEW_SIGNALS": "T-17"})
     assert code == 0 and seen == [True]
 
@@ -348,3 +350,87 @@ def test_a_write_back_that_raises_is_the_cmdb_part_failed_and_the_pass_goes_on(t
     code, err, store = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
     assert code == 1 and "collectors: lifecycle write-back failed: RuntimeError" in err and "own words" not in err
     assert store.rereview_status()["cmdb"].problem == "failed" and "collectors: re-review events:" in err
+
+
+# ---- 0.7.2: the service principal part (every pass, after the others) ----
+
+def test_the_service_principal_part_runs_last_and_opens_tasks_with_the_mock_service_now(tmp_path, monkeypatch):
+    import datetime as dt
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+    from portal.store.memory import MemoryStore
+    from portal_fakes import SP_PENDING, sp_request
+    store = MemoryStore()
+    store.close = lambda: None
+    owner, _, _ = store.sign_in(issuer="https://idp.example.test", subject="o", display_name="O", email="o@example.test", groups=[], roles=[],
+                                now=T0, max_age=dt.timedelta(hours=8))
+    sp_request(store, owner.id, T0, SP_PENDING)
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: store)
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, **k: 0)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    env = {**env_with(tmp_path), "PORTAL_SERVICENOW": "mock", "PORTAL_BASE_URL": "https://portal.example.test"}
+    code, err = run_main(["--once"], env)
+    assert code == 0 and "collectors: service principals: 0 created, 1 tasks opened, 0 approved, 0 rejected, 1 waiting" in err
+    assert err.index("collectors: re-review events:") < err.index("collectors: service principals:")
+    assert "service_principals" not in store.rereview_status()
+    [req] = store.service_principal_requests()
+    assert req.task_number == "SCTASK0010007"
+
+
+def test_without_service_now_pre_approved_principals_are_still_created(tmp_path, monkeypatch):
+    import datetime as dt
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+    from portal.store.memory import MemoryStore
+    from portal_fakes import sp_request
+    store = MemoryStore()
+    store.close = lambda: None
+    owner, _, _ = store.sign_in(issuer="https://idp.example.test", subject="o", display_name="O", email="o@example.test", groups=[], roles=[],
+                                now=T0, max_age=dt.timedelta(hours=8))
+    sp_request(store, owner.id, T0)
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: store)
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, **k: 0)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    code, err = run_main(["--once"], env_with(tmp_path))
+    assert code == 0 and "collectors: service principals: 1 created, 0 tasks opened, 0 approved, 0 rejected, 0 waiting" in err
+    assert [p.display_name for p in store.service_principals()] == ["sp-notes-calendar"]
+
+
+def test_an_invalid_catalog_or_directory_skips_only_the_service_principal_part(tmp_path, monkeypatch):
+    """Round 3 review M7: the other parts still run; the part fails each pass (so --once exits 1) and says why once at start."""
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+    from portal.graph_scopes import CatalogError
+    from portal.store.memory import MemoryStore
+    store = MemoryStore()
+    store.close = lambda: None
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: store)
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, **k: 0)
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+
+    def bad():
+        raise CatalogError("the catalog's own words")
+    monkeypatch.setattr(entry, "load_scopes", bad)
+    code, err = run_main(["--once"], env_with(tmp_path))
+    assert code == 1 and "collectors: re-review events: 0 stored, 0 skipped" in err
+    assert ("collectors: service principals: the mock directory or the scope catalog (portal/mock_graph_scopes.json) is not valid: "
+            "the part is skipped") in err
+    assert "collectors: service principals failed: CatalogError" in err and "own words" not in err
+
+
+def test_the_service_principal_line_says_when_service_now_couldn_t_be_built(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    monkeypatch.setattr(entry, "collect_service_principals", lambda *a, **k: {
+        "created": 1, "opened": 0, "approved": 0, "rejected": 0, "waiting": 2, "noted": 0, "failed": 0, "servicenow": "MockServiceNowError"})
+    code, err, _ = _cmdb_run(tmp_path, monkeypatch, {"PORTAL_SERVICENOW": "mock"})
+    assert code == 0 and ("collectors: service principals: 1 created, 0 tasks opened, 0 approved, 0 rejected, 2 waiting "
+                          "(ServiceNow not reachable this pass: MockServiceNowError; tasks and notes wait)") in err

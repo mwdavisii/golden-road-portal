@@ -17,10 +17,13 @@ from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES
                    Link, LoginState, Person, RepoAdmin, Request, RereviewEvent, RereviewItem, RereviewStatus, Session, check_approval,
                    check_binding, check_failed_run, check_item, check_matched, check_note, check_observed, check_record, check_status, check_watermark, event_row,
                    item_event, token_hash, PendingEvent, Watermark)
+from .base import (MockTaskDecision, ServicePrincipal, ServicePrincipalRequest, check_close_notes, check_decision, check_principal,
+                   check_service_principal_request, check_task_ref)
 
 # pg_try_advisory_lock's key for the collector's write-back pass: one pass sends the outbox at a time (two collectors, or a --once beside
 # the pod, would send a note twice). Any bigint no other part of the portal uses; "grwb" in ASCII.
 WRITEBACK_LOCK = 0x67727762
+SP_LOCK = 0x67727370  # the collector's service principal step: one pass at a time; "grsp" in ASCII
 AUDIT = ("INSERT INTO audit_log (at, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason) "
          "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
@@ -80,6 +83,19 @@ def _lifecycle_event(r):
                           r["last_error"])
 
 
+def _sp_request(r):
+    return ServicePrincipalRequest(r["id"], r["repo"], r["state"], r["draft"], r["requested_by"], r["created_at"], r["updated_at"],
+                                   r["task_number"], r["task_sys_id"], r["attempts"], r["last_error"], r["close_notes"], r["note_sent_at"])
+
+
+def _principal(r):
+    return ServicePrincipal(r["id"], r["repo"], r["display_name"], r["client_id"], tuple(r["scopes"]), r["request_id"], r["created_at"])
+
+
+def _decision(r):
+    return MockTaskDecision(r["task_number"], r["state"], r["close_notes"], r["decided_by"], r["decided_at"])
+
+
 def _item(r, events=()):
     return RereviewItem(r["id"], r["repo"], r["reason"], r["key"], r["opened_at"], r["closed_at"], r["close_kind"], r["closed_by"],
                         r["close_note"], tuple(events))
@@ -97,7 +113,14 @@ TRIGGER_CONFLICTS = (("owns the app", "own_app"), ("can't be read", "record_unre
                      ("names no such request", "not_found"), ("isn't this role's", "wrong_role"), ("after every earlier one", "wrong_state"),
                      ("the one its request applies", "wrong_state"), ("while its request is being written", "wrong_state"),
                      ("after every earlier step is done", "wrong_state"), ("recorded when it opens", "wrong_state"),
-                     ("every one of its steps is done", "wrong_state"))
+                     ("every one of its steps is done", "wrong_state"),
+                     # 0013's service principal triggers
+                     ("is already used", "name_taken"), ("illegal service principal request transition", "wrong_state"),
+                     ("task is recorded once", "wrong_state"), ("decided by its task", "wrong_state"),
+                     ("created only with its service principal", "wrong_state"), ("marked sent once", "wrong_state"),
+                     ("only the collector moves", "wrong_role"), ("only an open service principal task", "wrong_state"),
+                     ("can't decide their own task", "self_decision"), ("created only for an approved request", "wrong_state"),
+                     ("is another request's task", "task_taken"))
 ITEM_INDEXES = {"rereview_item_once": "item_exists", "rereview_item_one_open": "item_open"}
 
 
@@ -372,6 +395,8 @@ class PostgresStore:
             row = self._locked(conn, request_id)
             if row["state"] != "pending":
                 raise Conflict("wrong_state")
+            if row["kind"] != "registration":  # an approver decides registrations only (a service principal's is its ServiceNow task)
+                raise Conflict("wrong_role")
             if row["requested_by"] == actor_id:
                 raise Conflict("self_decision")
             if approve:
@@ -446,6 +471,7 @@ class PostgresStore:
     def claim_approved(self, *, now):
         with self.pool.connection() as conn:
             row = conn.execute("UPDATE request SET state = 'writing', updated_at = %s WHERE id = (SELECT id FROM request WHERE state = 'approved' "
+                               "AND kind <> 'service_principal' "  # the collector's, never the writer's (0013)
                                "ORDER BY coalesce(decided_at, created_at), id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *", (now,)).fetchone()
             if row is None:
                 return None
@@ -1063,3 +1089,167 @@ class PostgresStore:
             self._log(conn, now, "writer", None, "request.merged", "request", request_id, {"state": "writing"},
                       {"state": "merged", "merge_sha": merge_sha}, "the lifecycle action is applied in git")
             return _request(row)
+
+    # ---- service principals (spec 2026-11-16, migration 0013). The collector reads the kind through the service_principal_request view
+    # and updates only its columns; it never reads request.draft. ----
+
+    def create_service_principal_request(self, *, request_id, person_id, repo, draft, state, now):
+        check_service_principal_request(request_id, person_id, repo, draft, state)
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, requested_by, created_at, updated_at) "
+                                       "VALUES (%s, 'service_principal', %s, %s, %s, %s, %s, %s) RETURNING *",
+                                       (request_id, repo, state, Jsonb(dict(draft)), person_id, now, now)).fetchone()
+            except errors.UniqueViolation as exc:
+                raise Conflict("request_exists" if exc.diag.constraint_name == "request_pkey" else "name_taken") from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("unknown_person") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "person", person_id, "request.created", "request", request_id, None,
+                      {"state": state, "repo": repo, "draft": dict(draft)}, "service principal requested in the portal")
+            return _request(row)
+
+    def service_principal_requests(self, *, states=None, repo=None):
+        states = None if states is None else list(states)
+        repo = None if repo is None else str(repo)
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM service_principal_request WHERE (%s::text[] IS NULL OR state = ANY(%s)) "
+                                "AND (%s::text IS NULL OR lower(repo) = lower(%s)) ORDER BY created_at, id",
+                                (states, states, repo, repo)).fetchall()
+        return [_sp_request(r) for r in rows]
+
+    def service_principal_request(self, request_id):
+        with self.pool.connection() as conn:
+            row = conn.execute("SELECT * FROM service_principal_request WHERE id = %s", (str(request_id),)).fetchone()
+        return _sp_request(row) if row else None
+
+    @staticmethod
+    def _locked_sp(conn, request_id):
+        """The request, locked, as the view has it (the collector may lock a request it may update, by its id)."""
+        if conn.execute("SELECT id FROM request WHERE id = %s AND kind = 'service_principal' FOR UPDATE", (str(request_id),)).fetchone() is None:
+            raise Conflict("not_found")
+        return conn.execute("SELECT * FROM service_principal_request WHERE id = %s", (str(request_id),)).fetchone()
+
+    def record_service_principal_task(self, *, request_id, task_number, task_sys_id, now):
+        check_task_ref(task_number, task_sys_id)
+        with self.pool.connection() as conn:
+            row = self._locked_sp(conn, request_id)
+            if row["state"] != "pending" or row["task_number"] is not None:
+                raise Conflict("wrong_state")
+            try:
+                with conn.transaction():
+                    conn.execute("UPDATE request SET task_number = %s, task_sys_id = %s, updated_at = %s WHERE id = %s",
+                                 (task_number, task_sys_id, now, request_id))
+            except errors.UniqueViolation:
+                raise Conflict("task_taken") from None
+            except errors.RaiseException as exc:  # 0013 7c: a lifecycle request's task
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "system", None, "service_principal.task_opened", "request", request_id, None, {"task": task_number},
+                      f"the collector opened ServiceNow task {task_number}")
+
+    def decide_service_principal_request(self, *, request_id, approved, close_notes, now):
+        check_close_notes(approved, close_notes)
+        with self.pool.connection() as conn:
+            row = self._locked_sp(conn, request_id)
+            if row["state"] != "pending" or row["task_number"] is None:
+                raise Conflict("wrong_state")
+            state = "approved" if approved else "rejected"
+            conn.execute("UPDATE request SET state = %s, close_notes = %s, updated_at = %s WHERE id = %s", (state, close_notes, now, request_id))
+            self._log(conn, now, "system", None, f"service_principal.{state}", "request", request_id, {"state": "pending"},
+                      {"state": state, "task": row["task_number"]},
+                      f"ServiceNow task {row['task_number']} was closed {'complete' if approved else 'incomplete or skipped'}")
+            return _sp_request(conn.execute("SELECT * FROM service_principal_request WHERE id = %s", (request_id,)).fetchone())
+
+    def record_service_principal_failure(self, *, request_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("a failure's error is 1 to 300 characters")
+        with self.pool.connection() as conn:
+            row = self._locked_sp(conn, request_id)
+            if row["state"] not in ("pending", "approved", "created") or (row["state"] == "created" and row["note_sent_at"] is not None):
+                raise Conflict("wrong_state")
+            # the value, not attempts + 1: the collector may read attempts only through the view
+            conn.execute("UPDATE request SET attempts = %s, last_error = %s, updated_at = %s WHERE id = %s",
+                         (row["attempts"] + 1, error, now, request_id))
+
+    def create_service_principal(self, *, request_id, principal_id, client_id, now):
+        check_principal(principal_id, client_id)
+        with self.pool.connection() as conn:
+            row = self._locked_sp(conn, request_id)
+            if row["state"] != "approved":
+                raise Conflict("wrong_state")
+            draft = row["draft"]
+            try:
+                with conn.transaction():
+                    made = conn.execute("INSERT INTO service_principal (id, repo, display_name, client_id, scopes, request_id, created_at) "
+                                        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                                        (principal_id, row["repo"], draft["display_name"], client_id, list(draft["scopes"]), request_id,
+                                         now)).fetchone()
+                    conn.execute("UPDATE request SET state = 'created', updated_at = %s WHERE id = %s", (now, request_id))
+            except errors.UniqueViolation as exc:
+                raise Conflict("name_taken" if exc.diag.constraint_name == "service_principal_name" else "principal_exists") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "system", None, "service_principal.created", "request", request_id, {"state": "approved"},
+                      {"state": "created", "principal": principal_id, "client_id": client_id}, f"the collector created {draft['display_name']}")
+            return _principal(made)
+
+    def mark_service_principal_note_sent(self, *, request_id, now):
+        with self.pool.connection() as conn:
+            row = self._locked_sp(conn, request_id)
+            if row["state"] != "created" or row["task_number"] is None or row["note_sent_at"] is not None:
+                raise Conflict("wrong_state")
+            conn.execute("UPDATE request SET note_sent_at = %s, updated_at = %s WHERE id = %s", (now, now, request_id))
+
+    def service_principals(self, repo=None):
+        with self.pool.connection() as conn:
+            if repo is None:
+                rows = conn.execute("SELECT * FROM service_principal ORDER BY created_at, id").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM service_principal WHERE lower(repo) = lower(%s) ORDER BY created_at, id",
+                                    (str(repo),)).fetchall()
+        return [_principal(r) for r in rows]
+
+    def add_mock_task_decision(self, *, task_number, state, close_notes, actor_id, now):
+        check_decision(task_number, state, close_notes)
+        with self.pool.connection() as conn:
+            # the web may read request whole, and FOR UPDATE needs only its UPDATE on some of request's columns (0002)
+            req = conn.execute("SELECT id, state, requested_by FROM request WHERE task_number = %s AND kind = 'service_principal' FOR UPDATE",
+                               (task_number,)).fetchone()
+            if req is None:
+                raise Conflict("not_found")
+            if conn.execute("SELECT 1 FROM mock_task_decision WHERE task_number = %s", (task_number,)).fetchone() is not None:
+                raise Conflict("decided")
+            if req["state"] != "pending":
+                raise Conflict("wrong_state")
+            if req["requested_by"] == actor_id:
+                raise Conflict("self_decision")
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO mock_task_decision (task_number, state, close_notes, decided_by, decided_at) "
+                                       "VALUES (%s, %s, %s, %s, %s) RETURNING *", (task_number, state, close_notes, actor_id, now)).fetchone()
+            except errors.UniqueViolation:
+                raise Conflict("decided") from None
+            except errors.RaiseException as exc:
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "person", actor_id, "mock_task.decided", "mock_task", task_number, None, {"state": state},
+                      close_notes or "approved in the mock")
+            return _decision(row)
+
+    def mock_task_decisions(self):
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM mock_task_decision ORDER BY decided_at, task_number").fetchall()
+        return [_decision(r) for r in rows]
+
+    @contextlib.contextmanager
+    def service_principal_lock(self):
+        """As writeback_lock, on SP_LOCK: True while this pass alone runs the collector's service principal step."""
+        with self.pool.connection() as conn:
+            held = conn.execute("SELECT pg_try_advisory_lock(%s) AS held", (SP_LOCK,)).fetchone()["held"]
+            conn.commit()
+            try:
+                yield held
+            finally:
+                if held:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (SP_LOCK,))

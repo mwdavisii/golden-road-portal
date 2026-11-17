@@ -69,6 +69,21 @@
 {# Remove depends only on the link: a principal untagged since stays removable (Round 6 review) #}
 {% if identity %}<p class="actions">{{ remove_button("confirm=azure-identity") }}{% if data %}<span class="hint">Removing it also removes the Databricks connection.</span>{% endif %}</p>{% endif %}
 {% endif %}
+{% if sp_card %}
+{% if sp_card.created %}
+<h4>Created in the portal</h4>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Name</th><th scope="col">Client ID</th><th scope="col">Scopes</th></tr></thead>
+<tbody>{% for p in sp_card.created %}<tr><td class="mono">{{ p.display_name }}</td><td class="mono">{{ p.client_id }}</td><td class="mono">{{ p.scopes|join(", ") }}</td></tr>
+{% endfor %}</tbody></table></div>
+{% endif %}
+{% if sp_card.requests %}
+<h4>Service principal requests</h4>
+<ul>{% for r in sp_card.requests %}<li><span class="mono">{% if r.linked %}<a href="/requests/{{ r.id }}">{{ r.name }}</a>{% else %}{{ r.name }}{% endif %}</span> <span class="badge state-{{ r.state }}">{{ r.words }}</span></li>
+{% endfor %}</ul>
+{% endif %}
+{% if sp_card.can_create and not decommissioned %}<p class="actions"><a class="button secondary" href="/apps/{{ owner_name }}/{{ repo_name }}/service-principals/new">Create a service principal</a></p>{% endif %}
+{% endif %}
 </section>
 <section class="card connection">
 <h3>Enable Databricks Connection</h3>

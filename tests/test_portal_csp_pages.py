@@ -91,6 +91,9 @@ PAGES = [("anonymous", "/"), ("anonymous", "/register"), ("owner", "/"), ("owner
          ("admin", "/apps/acme/notes/lifecycle/suspend"), ("admin", "/apps/acme/notes/lifecycle/decommission"),   # the lifecycle forms
          ("owner", "/apps/acme/notes?lifecycle=suspended"), ("admin", "/apps/acme/notes?lifecycle=suspended"),   # the banner, the panel
          ("admin", "/requests/{lifecycle}"), ("admin", "/mock/servicenow/tasks/SCTASK0010001"),   # the request page, the mock task page
+         ("owner", "/apps/acme/notes/service-principals/new"), ("owner", "/requests/{sp}"),   # the service principal form, its request
+         ("owner", "/apps/acme/notes?sp=1"),   # the card's created principals and requests
+         ("admin", "/mock/servicenow/tasks/SCTASK0010007"),   # the mock approver's Approve and Reject
          ("other", "/requests/{request}")]   # the last is the error page (404, through base.html)
 
 
@@ -124,7 +127,10 @@ RENDERS = {"/apps/acme/notes?confirm=azure-identity": "Remove the Azure identity
            "/apps/acme/notes?cmdb=1": 'is registered in ServiceNow (<span class="mono">APM0001001</span>)',
            "/requests/{merged}": '<span class="step-detail">APM0001001</span>', "/admin/rereview?cmdb=1": "<h2>ServiceNow CMDB</h2>",
            "/apps/acme/notes/lifecycle/suspend": 'name="task"', "/apps/acme/notes?lifecycle=suspended": "Suspended by the platform",
-           "/requests/{lifecycle}": "What ServiceNow was told", "/mock/servicenow/tasks/SCTASK0010001": "<h3>Work note</h3>", "/apps/acme/notes/lifecycle/decommission": 'name="confirm_repo"'}
+           "/requests/{lifecycle}": "What ServiceNow was told", "/mock/servicenow/tasks/SCTASK0010001": "<h3>Work note</h3>", "/apps/acme/notes/lifecycle/decommission": 'name="confirm_repo"',
+           "/apps/acme/notes/service-principals/new": 'data-tier="requestable"', "/requests/{sp}": "Waiting for approval in SCTASK0010007",
+           "/apps/acme/notes?sp=1": "Created in the portal",
+           "/mock/servicenow/tasks/SCTASK0010007": "Mock: acting as the ServiceNow approver"}
 
 
 def prepare(portal, path):
@@ -202,6 +208,17 @@ def prepare(portal, path):
     if "lifecycle=suspended" in path:   # the page ignores the query: it only names this case
         from test_portal_lifecycle_pages import applied
         applied(portal)
+    if path == "/requests/{sp}":   # a pending service principal request with its task
+        from test_portal_service_principal_pages import pending_with_task
+        portal.seeds["sp"] = pending_with_task(portal).id
+    if path == "/apps/acme/notes?sp=1":   # the page ignores the query: a created principal and an open request on the card
+        from portal_fakes import created_principal
+        from test_portal_service_principal_pages import pending_with_task
+        created_principal(portal.store, portal.people["owner"].id, portal.clock())
+        pending_with_task(portal)
+    if path == "/mock/servicenow/tasks/SCTASK0010007":   # a pending service principal request whose task the collector opened
+        from test_portal_service_principal_pages import opened_by_the_collector, with_servicenow
+        opened_by_the_collector(with_servicenow(portal))
     if "confirm=" in path:
         from test_portal_apps import link_identity_and_merge
         link_identity_and_merge(portal)
@@ -215,7 +232,8 @@ def test_every_rendered_page_has_no_inline_style_or_script(portal, who, path):
         from portal.web.flash import FLASH_COOKIE
         client.cookies.set(FLASH_COOKIE, path.split("flash=", 1)[1], domain="portal.example.test")
     response = client.get(path.format(request=portal.seeds["request"], sent_back=portal.seeds["request"], change=portal.seeds.get("change"),
-                                     merged=portal.seeds.get("merged"), lifecycle=portal.seeds.get("lifecycle")))
+                                     merged=portal.seeds.get("merged"), lifecycle=portal.seeds.get("lifecycle"),
+                                     sp=portal.seeds.get("sp")))
     assert RENDERS.get(path, "") in response.text, (path, RENDERS.get(path))
     flash_set = [c for c in response.headers.get_list("set-cookie") if c.startswith("__Host-portal-flash=")]
     assert all("Max-Age=0" in c for c in flash_set), flash_set   # a GET page only ever clears the toast, never sets one

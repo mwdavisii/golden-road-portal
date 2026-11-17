@@ -6,7 +6,8 @@
   "first_number": 1001,
   "users": [
     {"sys_id": "6816f79cc0a8016401c5a33be04be441", "user_name": "mwdavisii", "email": "mwdavisii@example.com"},
-    {"sys_id": "5137153cc611227c000bbd1bd8cd2005", "user_name": "other", "email": "other@example.com"}
+    {"sys_id": "5137153cc611227c000bbd1bd8cd2005", "user_name": "other", "email": "other@example.com"},
+    {"sys_id": "a9b0c1d2e3f40516a7b8c9d0e1f20314", "user_name": "mock-approver", "email": "approver@example.com"}
   ],
   "tasks": [
     {"number": "SCTASK0010001", "sys_id": "5ca1ab1e000040008000000000010001", "state": "1", "ci": "hello-app",

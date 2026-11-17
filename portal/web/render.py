@@ -23,7 +23,8 @@ ENV.globals["REASON_WORDS"] = REASON_WORDS  # a re-review item's reason in words
 ENV.globals["STEP_WORDS"] = STATUS_WORDS  # a timeline step's status in words, beside its color (spec 2026-10-30 R10)
 # A request's state in words, for its badge (the class keeps the state name: state-<state>)
 ENV.globals["STATE_LABELS"] = {"pending": "Pending", "sent_back": "Sent back", "approved": "Approved", "writing": "Recording",
-                               "pr_open": "Pull request open", "merged": "Merged", "failed": "Failed"}
+                               "pr_open": "Pull request open", "merged": "Merged", "failed": "Failed",
+                               "created": "Created", "rejected": "Rejected"}
 
 
 def page(request, name: str, status: int = 200, **context) -> HTMLResponse:

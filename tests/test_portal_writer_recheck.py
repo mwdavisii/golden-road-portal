@@ -689,3 +689,21 @@ def test_a_request_for_a_decommissioned_app_is_refused_before_anything_else(port
 def test_a_registration_rechecked_without_the_store_is_unchanged(portal):
     req = approved_request(portal.store, portal.people, T0)
     assert recheck(req, writer_config(), ev_of(portal, req)) == []
+
+
+def test_a_binding_to_a_principal_the_portal_created_rechecks_clean_against_the_overlay(portal):
+    from portal_fakes import CREATED_ID, created_principal
+    created_principal(portal.store, portal.people["owner"].id, T0)
+    portal.client("owner").post("/apps/acme/notes/azure-identity", data={"csrf_token": portal.csrfs["owner"], "principal_id": CREATED_ID,
+                                                                         "environment": "test"})
+    [req] = [r for r in portal.store.requests_for_repo("acme/notes") if r.kind == "binding"]
+    writing = dc.replace(req, state="writing")
+    assert recheck(writing, bcfg(), None, portal.store, T0) == []
+    assert recheck(writing, bcfg(), None) == ["not_in_directory", "requester_not_admin"]   # no store: the mock JSON alone, fails closed
+
+
+def test_the_directory_check_takes_the_store_always():
+    """Round 4 review: _directory_problems has no store=None default; recheck() without a store is what fails closed."""
+    import inspect
+    from portal.writer.recheck import _directory_problems
+    assert inspect.signature(_directory_problems).parameters["store"].default is inspect.Parameter.empty
