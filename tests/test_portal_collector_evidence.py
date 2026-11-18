@@ -24,9 +24,9 @@ def with_spec(**changes):
     return json.dumps({**SPEC, **changes}).encode()
 
 
-def world(*, rules=RULES_BYTES, spec=None, factory=True):
+def world(*, rules=RULES_BYTES, spec=None, factory=True, files=None):
     gh = FakeGitHub(permissions=READ_PERMISSIONS)
-    repo_at(gh, "acme/notes", {"builder-spec.json": spec or with_spec(), "requirements.txt": b"fastapi==0.1\n"})
+    repo_at(gh, "acme/notes", {"builder-spec.json": spec or with_spec(), "requirements.txt": b"fastapi==0.1\n", **(files or {})})
     if factory:
         repo_at(gh, "acme/scorecard-factory", {} if rules is None else {"config/registration.yaml": rules})
     store = MemoryStore()
@@ -227,3 +227,36 @@ def test_a_record_in_another_case_makes_the_request_wait_with_its_own_reason():
             commit="f" * 40)
     assert run(gh, store) == {"computed": 0, "waiting": 1, "problem": "record_case_mismatch"}
     assert store.evidence_problem_for(req.id, 1) == "record_case_mismatch"
+
+
+# ---- build an agent (spec 2026-11-17; decided while planning: item 30) ----
+
+AGENT_SPEC = {"app_name": "golden-road-agent-template", "app_type": "agent", "entrypoint": "agent.yaml", "port": 8080, "health_path": "/healthz",
+              "data_classification": "public", "egress": [], "env": [], "resources_tier": "default"}
+
+
+@pytest.mark.parametrize("agent_yaml, problem", [(None, "agent_yaml_missing"), (b"schema: agent/v2\n", "agent_yaml_invalid"),
+                                                 (b"schema: agent/v1\ndisplay_name: A\nmodel: other\ninstructions: Help.\n", "agent_yaml_invalid")])
+def test_an_agent_app_s_registration_waits_for_a_valid_agent_yaml(agent_yaml, problem):
+    gh, store, req, *_ = world(spec=json.dumps(AGENT_SPEC).encode(), files={} if agent_yaml is None else {"agent.yaml": agent_yaml})
+    assert run(gh, store) == {"computed": 0, "waiting": 1, "problem": problem}
+    assert store.evidence_problem_for(req.id, 1) == problem and store.evidence_for(req.id, 1) is None
+
+
+def test_with_a_valid_agent_yaml_the_evidence_is_computed():
+    gh, store, req, *_ = world(spec=json.dumps(AGENT_SPEC).encode(),
+                               files={"agent.yaml": b"schema: agent/v1\ndisplay_name: A\nmodel: chat-default\ninstructions: Help.\n"})
+    assert run(gh, store)["computed"] == 1 and store.evidence_for(req.id, 1).evidence["app_type"] == "agent"
+
+
+def test_an_app_that_isn_t_an_agent_never_reads_agent_yaml():
+    gh, store, req, *_ = world()
+    assert run(gh, store)["computed"] == 1
+    assert not gh.called("GET", "/repos/acme/notes/contents/agent.yaml")
+
+
+def test_a_busy_agent_yaml_read_stores_nothing():
+    gh, store, req, *_ = world(spec=json.dumps(AGENT_SPEC).encode(), files={"agent.yaml": b"schema: agent/v1\n"})
+    gh.routes[("GET", "api.github.com", "/repos/acme/notes/contents/agent.yaml")] = [(502, {"message": "busy"})]
+    assert run(gh, store) == {"computed": 0, "waiting": 1, "transient": True}
+    assert store.evidence_problem_for(req.id, 1) is None and store.evidence_for(req.id, 1) is None

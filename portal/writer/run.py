@@ -15,7 +15,8 @@ passes, and it is left out only when it would not change. A binding with mcp (sp
 cloudflare-access.yaml, compose's cloudflare_access, when it changes; the writer never deletes it (the last server removed keeps the
 key with servers [], so the file stays), and a binding without mcp whose base already has one is refused. A binding's skills are
 read from the skills catalog at their pins, so its ConfigMap is deploy-check's. The merge request names head, so a push after the
-check can't ride along."""
+check can't ride along. An agent definition (spec 2026-11-17) is writer.agent's: the agent App, the app repo's agent.yaml, merged by a
+person."""
 
 import base64
 import datetime as dt
@@ -45,9 +46,10 @@ PR_URL = re.compile(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]{1,300
 
 
 def run_once(store, gh, cfg, now) -> list[str]:
+    from .agent import advance as agent_advance, sweep as agent_sweep, write as agent_write  # here too: writer.agent imports this module
     from .lifecycle import advance as lifecycle_advance  # here, not at the top: writer.lifecycle imports this module
     waiting = store.requests_in(("pr_open",))  # taken first: a request this pass opens waits for its checks until the next pass
-    done = []
+    done = agent_sweep(store, now)  # older approved agent definitions: superseded, never claimed (0014)
 
     def turn(request, step):
         try:
@@ -57,15 +59,27 @@ def run_once(store, gh, cfg, now) -> list[str]:
 
     def write(store_, gh_, cfg_, request, now_):
         """A lifecycle request (spec 2026-11-02) stays writing while its steps run: writer.lifecycle drives it, one pass at a time."""
-        return (lifecycle_advance if request.kind == "lifecycle" else _write)(store_, gh_, cfg_, request, now_)
+        step = {"lifecycle": lifecycle_advance, "agent_definition": agent_write}.get(request.kind, _write)
+        return step(store_, gh_, cfg_, request, now_)
 
     for request in store.requests_in(("writing",)):  # left over from an interrupted run, and every lifecycle request in progress
         turn(request, write)
-    while (claimed := store.claim_approved(now=now)) is not None:
+    while (claimed := _claim(store, now)) is not None:
         turn(claimed, write)
     for request in waiting:
-        turn(request, _advance)
+        turn(request, agent_advance if request.kind == "agent_definition" else _advance)
     return done
+
+
+def _claim(store, now):
+    """The next approved request, or None. A newer agent definition saved during the claim (Conflict newer_definition) ends the claims
+    for this pass: the next pass's sweep supersedes the older one and claims the newer."""
+    try:
+        return store.claim_approved(now=now)
+    except Conflict as exc:
+        if exc.code == "newer_definition":
+            return None
+        raise
 
 
 def _fail(store, req, reason, now) -> str:
@@ -288,7 +302,11 @@ class Refused(Exception):
     (already_suspended), an intake record that isn't intake/v2 (record_not_intake_v2) or already says decommissioned
     (already_decommissioned), no intake record (not_registered), a planned path off the allowlist (path_not_allowlisted), an adapter by
     the app's name that reconciles another path (adapter_not_ours), the app under another spelling in the deploy repo (case_mismatch),
-    or a requester no longer an admin before a merge (not_admin)."""
+    or a requester no longer an admin before a merge (not_admin). An agent definition's (spec 2026-11-17, writer.agent): not an agent
+    repo (not_an_agent_repo), an open PR from portal/agent-definition that isn't the agent App's (pr_not_ours), agent.yaml not a file
+    (not_a_file); and, failed directly, a newer
+    definition (superseded), the file already on main (already_on_main), the PR closed unmerged (pr_closed), merged with other content
+    (merged_file_differs), requester_not_admin, decommissioned, platform_repo and agent_yaml_invalid."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -353,7 +371,8 @@ def compose_bytes(repo, environment, release_raw: bytes, manifests_raw: bytes, b
     portal/compose.py is golden_road/compose.py. release.yaml must be a valid deploy-release/v1 for exactly this repo and
     environment, and the manifests must be its manifests_sha256. The binding's skills are read from skills_catalog at their pins
     (the portal's catalog is the same bytes as the one deploy-verify reads). Raises Refused("compose_refused") on anything
-    golden-road compose would refuse, a skill the catalog doesn't hold, and an owner with no MCP token name."""
+    golden-road compose would refuse, a skill the catalog doesn't hold, and an owner with no MCP token name. An agent app's release
+    composes its gateway key (spec 2026-11-17 A5) from repo and environment, so the lifecycle writer keeps it too."""
     try:
         release = _one_yaml_object(release_raw)
         if len(release_raw) > MAX_FILE_BYTES or validate("deploy-release.v1", release) or release["repo"] != repo \
@@ -366,7 +385,8 @@ def compose_bytes(repo, environment, release_raw: bytes, manifests_raw: bytes, b
             raise ValueError("not this environment's binding")
         lifecycle = None if lifecycle_raw is None else _lifecycle_read_back(lifecycle_raw, repo, environment)
         return compose(manifests_raw.decode("utf-8"), release["image"], binding, namespace=release["namespace"],
-                       skills=_skills_for(binding, skills_catalog) if binding is not None else None, lifecycle=lifecycle).encode("utf-8")
+                       skills=_skills_for(binding, skills_catalog) if binding is not None else None, lifecycle=lifecycle,
+                       repo=repo, environment=environment).encode("utf-8")
     except (ComposeError, ValueError, KeyError, TypeError, yaml.YAMLError, RecursionError):  # UnicodeDecodeError is a ValueError
         raise Refused("compose_refused") from None
 

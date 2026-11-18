@@ -322,3 +322,61 @@ def test_an_installation_that_does_not_name_the_write_app_stops_the_writer(porta
 def test_a_lifecycle_app_that_is_the_write_app_stops_the_writer(portal, tmp_path):
     code, err = run(tmp_path, FakeGitHub(), portal.store, env=lifecycle_env(tmp_path, app_id="424242"))
     assert code == 2 and "PORTAL_LIFECYCLE_APP_ID must be another App than PORTAL_WRITE_APP_ID" in err
+
+
+# ---- the agent App (spec 2026-11-17; decided while planning: item 27): its key in the writer's Secret only, optional ----
+
+def agent_env(tmp_path, key=None, app_id="424244"):
+    path = tmp_path / "agent-app.pem"
+    path.write_bytes(key if key is not None else pem(new_rsa_key()))
+    return {"PORTAL_AGENT_APP_ID": app_id, "PORTAL_AGENT_APP_KEY_FILE": str(path)}
+
+
+def test_the_writer_loads_the_agent_app_when_both_settings_are_set(tmp_path):
+    assert load_with(tmp_path).agent_app is None, "no agent App: an agent definition waits, retried every pass"
+    assert load_with(tmp_path, PORTAL_AGENT_APP_ID="", PORTAL_AGENT_APP_KEY_FILE="").agent_app is None
+    env = agent_env(tmp_path)
+    app = load_with(tmp_path, **env).agent_app
+    assert (app.app_id, app.api) == (424244, "https://api.github.com")
+    assert app.key == (tmp_path / "agent-app.pem").read_bytes() and "BEGIN" not in repr(app)
+    assert load_with(tmp_path, PORTAL_GITHUB_HOST="ghe.example.test", **env).agent_app.api == "https://ghe.example.test/api/v3"
+
+
+def test_the_writer_starts_with_the_agent_app_and_gives_it_its_client(portal, tmp_path, monkeypatch):
+    from portal.writer import __main__ as writer_main
+    seen = []
+    monkeypatch.setattr(writer_main, "run_once", lambda store, gh, cfg, now: seen.append(cfg) or [])
+    code, err = run(tmp_path, good_github(), portal.store, env=agent_env(tmp_path))
+    assert code == 0 and seen[0].agent_app.app_id == 424244 and seen[0].agent_app.http is not None
+    assert "BEGIN" not in err and "PRIVATE KEY" not in err
+
+
+@pytest.mark.parametrize("drop", ["PORTAL_AGENT_APP_ID", "PORTAL_AGENT_APP_KEY_FILE"])
+def test_one_agent_setting_without_the_other_stops_the_writer(portal, tmp_path, drop):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env={**agent_env(tmp_path), drop: ""})
+    assert code == 2 and "PORTAL_AGENT_APP_ID and PORTAL_AGENT_APP_KEY_FILE are set together, or neither" in err
+
+
+def test_a_bad_agent_app_id_stops_the_writer(portal, tmp_path):
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=agent_env(tmp_path, app_id="x"))
+    assert code == 2 and "PORTAL_AGENT_APP_ID" in err
+
+
+@pytest.mark.parametrize("key", [b"not a key", "ec"])
+def test_an_agent_key_that_is_not_an_rsa_key_stops_the_writer_without_the_key(portal, tmp_path, key):
+    raw = ec_key() if key == "ec" else key
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=agent_env(tmp_path, key=raw))
+    assert code == 2 and "PORTAL_AGENT_APP_KEY_FILE" in err and "Traceback" not in err and "not a key" not in err and "BEGIN" not in err
+
+
+def test_an_unreadable_agent_key_file_stops_the_writer(portal, tmp_path):
+    env = {**agent_env(tmp_path), "PORTAL_AGENT_APP_KEY_FILE": str(tmp_path / "missing.pem")}
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
+    assert code == 2 and "PORTAL_AGENT_APP_KEY_FILE can't be read" in err
+
+
+@pytest.mark.parametrize("extra", [{}, "lifecycle"])
+def test_an_agent_app_that_is_the_write_or_the_lifecycle_app_stops_the_writer(portal, tmp_path, extra):
+    env = agent_env(tmp_path, app_id="424242") if extra == {} else {**lifecycle_env(tmp_path), **agent_env(tmp_path, app_id="424243")}
+    code, err = run(tmp_path, FakeGitHub(), portal.store, env=env)
+    assert code == 2 and "PORTAL_AGENT_APP_ID must be another App than PORTAL_WRITE_APP_ID and PORTAL_LIFECYCLE_APP_ID" in err

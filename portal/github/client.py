@@ -2,6 +2,7 @@
 a log line or a request's failure reason. The only headers kept are the two that tell a rate limit from a refusal (GitHub answers
 403 for both): x-ratelimit-remaining and retry-after. `download` follows GitHub's one redirect to its storage without the token."""
 
+import itertools
 import time
 from urllib.parse import urlsplit
 
@@ -94,14 +95,17 @@ class GitHub:
         return b"".join(chunks)
 
     def paginate(self, path, *, key=None, params=None, max_pages=50):
-        url, query = self.api_base + path, {**(params or {}), "per_page": 100}
-        for _ in range(max_pages):
+        """Every item of every page. max_pages=None follows every next link there is (no budgets: spec 2026-11-17's parts). A next link
+        to a page already read (a repeat or a cycle) is an error, never a loop: that is not a cap, the list has no such page."""
+        url, query, visited = self.api_base + path, {**(params or {}), "per_page": 100}, set()
+        for _ in (range(max_pages) if max_pages is not None else itertools.count()):
             try:
                 response = self.http.get(url, params=query, headers=self._headers(), timeout=30)
             except httpx.HTTPError as exc:
                 raise GitHubError(0, "GET", path, "GitHub can't be reached") from exc
             if response.status_code != 200:
                 raise GitHubError(response.status_code, "GET", path, headers=_kept(response))
+            visited.add(str(response.request.url))
             data = response.json()
             yield from (data[key] if key else data)
             following = response.links.get("next", {}).get("url")
@@ -109,5 +113,7 @@ class GitHub:
                 return
             if not following.startswith(self.api_base + "/"):
                 raise GitHubError(200, "GET", path, "a next page leaves the API host")
+            if str(httpx.URL(following)) in visited:
+                raise GitHubError(200, "GET", path, "a next page repeats")
             url, query = following, None
         raise GitHubError(200, "GET", path, "too many pages")

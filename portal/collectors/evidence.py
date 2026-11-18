@@ -11,6 +11,7 @@ from ..floor import compute_floor
 from ..github.client import GitHubError
 from ..store.base import Conflict
 from ..writer.allowlist import factory
+from .agents import agent_yaml_problem
 from .intake import RecordCaseMismatch, RecordUnreadable, current_record
 from .repo_files import UNREADABLE, Transient, head_commit, read_stored, tree_modes
 from .rules import RulesProblem, load_rules
@@ -19,7 +20,7 @@ from .rules import RulesProblem, load_rules
 CAPS = {"builder-spec.json": 65536, ".builder.lock": 65536, "requirements.txt": 262144, "package-lock.json": 10485760}
 MAX_ITEMS = 100
 MAX_NAME = 200  # registration-evidence/v1's bound on a copied name
-LOCKFILES = {"python": ("requirements.txt",), "node": ("package-lock.json",), "static": ()}
+LOCKFILES = {"python": ("requirements.txt",), "node": ("package-lock.json",), "static": (), "agent": ()}
 PINNED = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==\S+")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 SHOWN = 10
@@ -156,7 +157,8 @@ def collect_evidence(gh, store, *, org, gateway_hosts, now) -> dict:
     compute the evidence and the floor, and store both. The store hands out only (request, repo, submission): never the draft.
     For a repo that already has an intake record (a change), the record's blob SHA and view, read at the rules commit, are stored with
     the evidence. A problem the portal can name is stored as a reason the request waits; a transient GitHub error stores nothing (next
-    pass retries)."""
+    pass retries). An agent app's request waits (agent_yaml_missing, agent_yaml_invalid) until its commit holds a valid agent.yaml; the
+    evidence document itself is the same for every app type (the scorecard's parity)."""
     waiting = store.awaiting_evidence()
     if not waiting:
         return {"computed": 0, "waiting": 0}
@@ -180,6 +182,11 @@ def collect_evidence(gh, store, *, org, gateway_hosts, now) -> dict:
         try:
             commit = head_commit(gh, request.repo)
             doc = compute_evidence(gh, request.repo, commit, gateway_hosts=gateway_hosts, many_dependencies_over=rules["many_dependencies_over"])
+            waits = agent_yaml_problem(gh, request.repo, commit) if doc["app_type"] == "agent" else None
+            if waits:  # an agent app registers once its default branch holds a valid agent.yaml (spec 2026-11-17; decided item 30)
+                note(request, waits)
+                problem = waits
+                continue
             record_sha, record = current_record(gh, factory(org), request.repo, rules_commit)  # a change, or (None, None)
         except (RecordUnreadable, RecordCaseMismatch) as exc:
             problem = "record_case_mismatch" if isinstance(exc, RecordCaseMismatch) else "record_unreadable"

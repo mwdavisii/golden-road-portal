@@ -19,6 +19,7 @@ from .base import (DATE_REASONS, LINK_SOURCES, PROBLEMS, REPO_NAME, RUN_OUTCOMES
                    item_event, token_hash, PendingEvent, Watermark)
 from .base import (MockTaskDecision, ServicePrincipal, ServicePrincipalRequest, check_close_notes, check_decision, check_principal,
                    check_service_principal_request, check_task_ref)
+from .base import AGENT_BRANCH, AGENT_KIND, SUPERSEDED, AgentObserved, agent_pr_url_ok, check_agent_definition, check_agent_observed
 
 # pg_try_advisory_lock's key for the collector's write-back pass: one pass sends the outbox at a time (two collectors, or a --once beside
 # the pod, would send a note twice). Any bigint no other part of the portal uses; "grwb" in ASCII.
@@ -42,7 +43,10 @@ def _request(r):
                    decision_groups=tuple(r["decision_groups"] or ()), decision_note=r["decision_note"], final=r["final"],
                    branch=r["branch"], pr_number=r["pr_number"], pr_url=r["pr_url"], merge_sha=r["merge_sha"], failure_reason=r["failure_reason"],
                    head_sha=r["head_sha"], base_sha=r["base_sha"], submission=r["submission"], floor_override=r["floor_override"],
-                   ownership_acknowledged_at=r.get("ownership_acknowledged_at"))  # 0011's column (absent before it is applied)
+                   ownership_acknowledged_at=r.get("ownership_acknowledged_at"),  # 0011's column (absent before it is applied)
+                   # 0013's columns, an agent definition's only here (0014); a service principal request's are on its own view
+                   attempts=(r.get("attempts") or 0) if r["kind"] == AGENT_KIND else 0,
+                   last_error=r.get("last_error") if r["kind"] == AGENT_KIND else None)
 
 
 def _cmdb(r):
@@ -120,7 +124,12 @@ TRIGGER_CONFLICTS = (("owns the app", "own_app"), ("can't be read", "record_unre
                      ("created only with its service principal", "wrong_state"), ("marked sent once", "wrong_state"),
                      ("only the collector moves", "wrong_role"), ("only an open service principal task", "wrong_state"),
                      ("can't decide their own task", "self_decision"), ("created only for an approved request", "wrong_state"),
-                     ("is another request's task", "task_taken"))
+                     ("is another request's task", "task_taken"),
+                     # 0014's agent definition triggers
+                     ("only the writer moves an agent definition", "wrong_role"), ("illegal agent definition transition", "wrong_state"),
+                     ("pull request is on portal/agent-definition", "wrong_state"), ("a newer agent definition", "newer_definition"),
+                     ("superseded only by a newer open one", "wrong_state"), ("fails only as superseded", "wrong_state"),
+                     ("the collector moves only service principal requests", "wrong_role"))
 ITEM_INDEXES = {"rereview_item_once": "item_exists", "rereview_item_one_open": "item_open"}
 
 
@@ -470,9 +479,18 @@ class PostgresStore:
 
     def claim_approved(self, *, now):
         with self.pool.connection() as conn:
-            row = conn.execute("UPDATE request SET state = 'writing', updated_at = %s WHERE id = (SELECT id FROM request WHERE state = 'approved' "
-                               "AND kind <> 'service_principal' "  # the collector's, never the writer's (0013)
-                               "ORDER BY coalesce(decided_at, created_at), id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *", (now,)).fetchone()
+            try:
+                with conn.transaction():
+                    row = conn.execute("UPDATE request SET state = 'writing', updated_at = %s WHERE id = (SELECT r.id FROM request r "
+                                       "WHERE r.state = 'approved' AND r.kind <> 'service_principal' "  # the collector's, never the writer's (0013)
+                                       # an older agent definition while a newer one for its repo is open: superseded, never written (0014)
+                                       "AND NOT (r.kind = 'agent_definition' AND EXISTS (SELECT 1 FROM request n WHERE n.kind = 'agent_definition' "
+                                       "AND lower(n.repo) = lower(r.repo) AND n.id <> r.id AND n.state IN ('approved', 'writing', 'pr_open') "
+                                       "AND (n.created_at, n.id) > (r.created_at, r.id))) "
+                                       "ORDER BY coalesce(r.decided_at, r.created_at), r.id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *",
+                                       (now,)).fetchone()
+            except errors.RaiseException as exc:  # 0014: a newer agent definition went in meanwhile; the next pass claims it
+                raise _trigger_conflict(exc) from None
             if row is None:
                 return None
             self._log(conn, now, "writer", None, "request.writing", "request", row["id"], {"state": "approved"}, {"state": "writing"},
@@ -484,8 +502,15 @@ class PostgresStore:
             locked = self._locked(conn, request_id)
             if locked["state"] != "writing" or locked["kind"] == "lifecycle":  # a lifecycle request's PRs are its steps' (0012)
                 raise Conflict("wrong_state")
-            row = conn.execute("UPDATE request SET state = 'pr_open', updated_at = %s, branch = %s, pr_number = %s, pr_url = %s, head_sha = %s, base_sha = %s "
-                               "WHERE id = %s RETURNING *", (now, branch, pr_number, pr_url, head_sha, base_sha, request_id)).fetchone()
+            if locked["kind"] == AGENT_KIND and (branch != AGENT_BRANCH or not agent_pr_url_ok(locked["repo"], pr_number, pr_url)):
+                raise Conflict("wrong_state")  # an agent definition's one branch, and a pull request of its own repo (0014)
+            try:
+                with conn.transaction():
+                    row = conn.execute("UPDATE request SET state = 'pr_open', updated_at = %s, branch = %s, pr_number = %s, pr_url = %s, "
+                                       "head_sha = %s, base_sha = %s WHERE id = %s RETURNING *",
+                                       (now, branch, pr_number, pr_url, head_sha, base_sha, request_id)).fetchone()
+            except errors.RaiseException as exc:  # 0014: a newer agent definition is open
+                raise _trigger_conflict(exc) from None
             self._log(conn, now, "writer", None, "request.pr_open", "request", request_id, {"state": "writing"},
                       {"state": "pr_open", "branch": branch, "pr_number": pr_number, "pr_url": pr_url,
                        "head_sha": head_sha, "base_sha": base_sha}, "the writer opened the pull request")
@@ -503,11 +528,17 @@ class PostgresStore:
 
     def mark_failed(self, *, request_id, reason, now):
         with self.pool.connection() as conn:
-            before = self._locked(conn, request_id)["state"]
-            if before not in ("writing", "pr_open"):
-                raise Conflict("wrong_state")
-            row = conn.execute("UPDATE request SET state = 'failed', updated_at = %s, failure_reason = %s WHERE id = %s RETURNING *",
-                               (now, reason, request_id)).fetchone()
+            locked = self._locked(conn, request_id)
+            before = locked["state"]
+            superseding = locked["kind"] == AGENT_KIND and reason == SUPERSEDED
+            if before not in (("approved", "writing", "pr_open") if superseding else ("writing", "pr_open")):
+                raise Conflict("wrong_state")  # an older agent definition still approved fails as superseded without being claimed (0014)
+            try:
+                with conn.transaction():
+                    row = conn.execute("UPDATE request SET state = 'failed', updated_at = %s, failure_reason = %s WHERE id = %s RETURNING *",
+                                       (now, reason, request_id)).fetchone()
+            except errors.RaiseException as exc:  # 0014: superseded only while a newer one is open
+                raise _trigger_conflict(exc) from None
             self._log(conn, now, "writer", None, "request.failed", "request", request_id, {"state": before},
                       {"state": "failed", "failure_reason": reason}, reason)
             return _request(row)
@@ -1253,3 +1284,57 @@ class PostgresStore:
             finally:
                 if held:
                     conn.execute("SELECT pg_advisory_unlock(%s)", (SP_LOCK,))
+
+    # ---- agent definitions (spec 2026-11-17, migration 0014) ----
+
+    def create_agent_definition(self, *, request_id, person_id, repo, draft, now):
+        check_agent_definition(request_id, person_id, repo, draft)
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute("INSERT INTO request (id, kind, repo, state, draft, final, requested_by, created_at, updated_at) "
+                                       "VALUES (%s, 'agent_definition', %s, 'approved', %s, %s, %s, %s, %s) RETURNING *",
+                                       (request_id, repo, Jsonb(dict(draft)), Jsonb(dict(draft)), person_id, now, now)).fetchone()
+            except errors.UniqueViolation:
+                raise Conflict("request_exists") from None
+            except errors.ForeignKeyViolation:
+                raise Conflict("unknown_person") from None
+            except errors.RaiseException as exc:  # 0014: the app is decommissioned
+                raise _trigger_conflict(exc) from None
+            self._log(conn, now, "person", person_id, "request.created", "request", request_id, None,
+                      {"state": "approved", "repo": repo, "draft": dict(draft)}, "agent definition saved in the portal")
+            return _request(row)
+
+    def record_request_error(self, *, request_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("an error is 1 to 300 characters")
+        try:
+            with self.pool.connection() as conn:
+                locked = self._locked(conn, request_id)
+                if locked["kind"] != AGENT_KIND or locked["state"] not in ("writing", "pr_open"):
+                    raise Conflict("wrong_state")
+                try:
+                    with conn.transaction():
+                        conn.execute("UPDATE request SET attempts = attempts + 1, last_error = %s, updated_at = %s WHERE id = %s",
+                                     (error, now, request_id))
+                except errors.RaiseException as exc:  # 0014: only the writer counts them (the collector's own guard, 0013)
+                    raise _trigger_conflict(exc) from None
+        except errors.InsufficientPrivilege:  # the web may not set attempts, the collector not read the request whole: the writer's only
+            raise Conflict("wrong_role") from None
+
+    def replace_agent_observed(self, rows, *, observed_at):
+        rows = list(rows)
+        check_agent_observed(rows)
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM agent_observed")
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO agent_observed (repo, commit_sha, agent, problem, observed_at) VALUES (%s, %s, %s, %s, %s)",
+                                [(r.repo, r.commit, _json(r.agent), r.problem, observed_at) for r in rows])
+
+    def agent_observed(self, repo=None):
+        with self.pool.connection() as conn:
+            if repo is None:
+                rows = conn.execute("SELECT * FROM agent_observed ORDER BY lower(repo)").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM agent_observed WHERE lower(repo) = lower(%s)", (str(repo),)).fetchall()
+        return [AgentObserved(r["repo"], r["commit_sha"], r["agent"], r["problem"], r["observed_at"]) for r in rows]

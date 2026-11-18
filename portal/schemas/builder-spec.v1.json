@@ -8,7 +8,7 @@
   "$defs": {"single_line": {"not": {"pattern": "[\\r\\n]"}}},
   "properties": {
     "app_name": {"type": "string", "pattern": "^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$", "allOf": [{"$ref": "#/$defs/single_line"}]},
-    "app_type": {"enum": ["python", "node", "static"]},
+    "app_type": {"enum": ["python", "node", "static", "agent"]},
     "entrypoint": {"type": "string", "pattern": "^[A-Za-z0-9_.][A-Za-z0-9_./:-]*$", "allOf": [{"$ref": "#/$defs/single_line"}, {"not": {"pattern": "(^|/)\\.\\.(/|:|$)"}}]},
     "server": {"enum": ["uvicorn", "gunicorn"]},
     "port": {"type": "integer", "minimum": 1024, "maximum": 65535},

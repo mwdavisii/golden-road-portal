@@ -12,7 +12,8 @@ from .store.base import LIFECYCLE_ACTIONS, MAX_REASON, MIN_REASON, TASK_NUMBER
 log = logging.getLogger(__name__)
 
 # (decided while planning: item 5) the platform's own repositories, in PORTAL_ORG: never decommissioned (archived) through the portal
-PLATFORM_REPOS = ("platform-pipeline", "scorecard-factory", "golden-road-deploy", "golden-road-portal", "golden-road-agents", "security-scans")
+PLATFORM_REPOS = ("platform-pipeline", "scorecard-factory", "golden-road-deploy", "golden-road-portal", "golden-road-agents", "security-scans",
+                  "golden-road-agent-template")
 ACTION_WORDS = {"suspend": "Suspend", "resume": "Resume", "decommission": "Decommission"}
 
 NOT_ADMIN = "Only a portal admin can suspend, resume or decommission an app."

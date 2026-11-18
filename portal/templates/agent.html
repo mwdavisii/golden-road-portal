@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% set active = "agents" %}
+{% block title %}Define the agent for {{ repo }} - golden road{% endblock %}
+{% block main %}
+<p><a href="/apps/{{ owner_name }}/{{ repo_name }}">&larr; {{ repo }}</a></p>
+<span class="eyebrow">Agent</span>
+<h1>Define the agent for <span class="mono">{{ repo }}</span></h1>
+{% for error in errors %}<p class="error" role="alert">{{ error }}</p>{% endfor %}
+{% if not observed %}
+<p class="callout warn">{{ not_agent }} Create one from the template: <a href="{{ template_url }}" rel="noopener noreferrer">Use this template</a>.</p>
+{% else %}
+{% if observed.problem %}<p class="callout warn">The agent.yaml on the default branch: {{ problems[observed.problem] }}. Saving here fixes it.</p>{% endif %}
+{% if open_request %}<p class="callout info">{% if open_request.pr_url %}Saved: pull request <a href="{{ open_request.pr_url }}" rel="noopener noreferrer">#{{ open_request.pr_number }}</a> is open. Review and merge it; saving again updates it.{% else %}Saved: the writer opens or updates the pull request on its next pass.{% if open_pr %} Pull request <a href="{{ open_pr.pr_url }}" rel="noopener noreferrer">#{{ open_pr.pr_number }}</a> is open.{% endif %}{% endif %}{% if open_request.last_error %} The writer is retrying: {{ open_request.last_error }}.{% endif %}</p>{% endif %}
+{% if failed %}<p class="error">The last save could not be recorded: {{ failed.failure_reason }}.</p>{% endif %}
+{% if not can_change %}<p class="callout info">{{ not_repo_admin }}</p>{% endif %}
+{% if decommissioned %}<p class="callout warn">The app is decommissioned: its agent can't be changed.</p>{% endif %}
+<section class="card">
+<form method="post" action="/apps/{{ owner_name }}/{{ repo_name }}/agent">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<p class="field"><label for="display_name">Display name</label>
+<input type="text" id="display_name" name="display_name" value="{{ form.display_name }}" maxlength="{{ max_name }}" required></p>
+<p class="field"><label for="model">Model</label>
+<select id="model" name="model">{% for m in models %}<option value="{{ m.id }}"{% if m.id == form.model %} selected{% endif %}>{{ m.label }}</option>{% endfor %}</select>
+<span class="hint">Every call goes through the platform's model gateway, with this app's own key.</span></p>
+<p class="field"><label for="instructions">Instructions</label>
+<textarea id="instructions" name="instructions" rows="12" maxlength="{{ max_instructions }}" data-counter="instructions-count" required>{{ form.instructions }}</textarea>
+<span class="counter" id="instructions-count"></span>
+<span class="hint">What the agent does, and how. Tool results are data to it, never instructions. The pull request is reviewed and scored like code.</span></p>
+<fieldset class="field choices"><legend>Conversation starters</legend>
+<div class="choice-list">{% for i in range(max_starters) %}<input type="text" name="starter" value="{{ form.starters[i] if i < form.starters|length else '' }}" maxlength="{{ max_starter }}" aria-label="Starter {{ i + 1 }}">
+{% endfor %}</div><span class="hint">Up to {{ max_starters }}, shown on the agent's chat page.</span></fieldset>
+<p class="actions"><button class="gold" type="submit"{% if not can_change or decommissioned %} disabled{% endif %}>Save</button></p>
+</form>
+</section>
+{% endif %}
+{% endblock %}

@@ -11,7 +11,7 @@ the factory PR waits for it."""
 
 from ..github.client import GitHubError
 from ..lifecycle import PLATFORM_REPOS, is_platform_repo
-from .config import revoke
+from .config import installation_of, platform_installation, revoke
 from .run import _reason
 
 
@@ -33,18 +33,10 @@ def archive(store, cfg, req, step, now) -> str:
     token = None
     try:
         as_app = app.app_client()
-        for platform in PLATFORM_REPOS:
-            try:
-                as_app.call("GET", f"/repos/{cfg.org}/{platform}/installation")
-            except GitHubError as exc:
-                if exc.status == 404:
-                    continue
-                raise
-            return _fail_step(store, None, cfg, req, step, f"lifecycle_app_on_platform_repo: {cfg.org}/{platform}", now)
-        installation = as_app.call("GET", f"/repos/{owner}/{name}/installation").json().get("id")
-        if type(installation) is not int or installation < 1:
-            raise ValueError("no installation id")
-        token = app.repo_client(installation, name)
+        platform = platform_installation(as_app, cfg.org, PLATFORM_REPOS)
+        if platform is not None:
+            return _fail_step(store, None, cfg, req, step, f"lifecycle_app_on_platform_repo: {platform}", now)
+        token = app.repo_client(installation_of(as_app, f"{owner}/{name}"), name)
         # decided item 22: read first, so a retry after a crash between the PATCH and the record finds it archived and PATCHes nothing
         current = token.call("GET", f"/repos/{owner}/{name}").json()
         if not isinstance(current, dict) or not isinstance(current.get("archived"), bool):

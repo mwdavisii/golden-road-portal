@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from ..binding_record import (ENVIRONMENTS, BindingRefused, CloudflareUnavailable, SecretServerUnavailable, environment_state, next_binding,
                               secret_tokens)
 from ..bindings import effects
+from ..compose import GRAPH_HOST
 from ..directory import overlay
 from ..ids import new_id
 from ..lifecycle import decommissioned_words
@@ -25,6 +26,7 @@ from ..store.base import DATE_REASONS, Conflict
 from .access import ADMIN, APP_ADMIN
 from .flash import redirect
 from .render import page
+from .routes_agents import card as agent_card
 from .routes_lifecycle import banner, panel
 from .routes_service_principals import card as service_principal_card
 from .secret_steps import DIGITS, SECRET_SERVER_DOWN
@@ -139,11 +141,15 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
     reviews = [i for i in state.store.rereview_items() if i.repo.lower() == repo.lower() and i.reason in DATE_REASONS]
     record = records[0] if records else None
     lifecycle_state = state.store.lifecycle_state(repo)
+    card, fx = agent_card(state.store, repo, shown), effects(shown)
+    if card is not None and fx["client_id"] is not None:  # compose gives an agent with an identity Graph's host too (graph_read)
+        fx["egress"] = fx["egress"] + [GRAPH_HOST]
     return page(request, "app.html", status, repo=repo, owner_name=owner_name, repo_name=repo_name, registration=registration, directory=directory,
                 record=record, reviews=reviews, cmdb=cmdb_card(state.store, state.settings, repo, record, request.state.principal.person.id),
                 environment=environment, environments=ENVIRONMENTS, current=current, open_request=open_one, failed=failed,
                 can_change=request.state.app_repo_admin,
                 sp_card=service_principal_card(state, repo, request.state.principal, request.state.app_repo_admin),
+                agent_card=card,
                 principals=directory.principals_for(org, repo) if directory else [],
                 warehouses=directory.warehouses_for(identity["directory_id"]) if directory and identity else [],
                 gateway=state.settings.mcp_gateways[environment],
@@ -154,7 +160,7 @@ def app_page(request, environment, status=200, errors=(), confirm=None):
                             if state.settings.skills_catalog and state.settings.skills_catalog.skill(s["name"], state.settings.skills_catalog.main)},
                 gateway_moved=bool(((current or {}).get("mcp") or {}).get("servers"))
                               and current["mcp"]["gateway"] != state.settings.mcp_gateways[environment],
-                effects=effects(shown), shown_secrets=sorted((shown or {}).get("secrets") or [], key=lambda s: s["env"]),
+                effects=fx, shown_secrets=sorted((shown or {}).get("secrets") or [], key=lambda s: s["env"]),
                 current_secrets=sorted((current or {}).get("secrets") or [], key=lambda s: s["env"]),
                 errors=list(errors), confirm=confirm,
                 decommissioned=lifecycle_state is not None and lifecycle_state.state == "decommissioned",

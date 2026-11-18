@@ -1729,3 +1729,230 @@ def test_no_principal_is_created_for_an_app_decommissioned_after_its_request(sto
         store.create_service_principal(request_id=req.id, principal_id=SP_ID, client_id=CLIENT_ID, now=T0)
     assert err.value.code == "decommissioned"
     assert store.service_principals() == [] and store.service_principal_request(req.id).state == "approved"
+
+
+# ---- agent definitions (spec 2026-11-17, migration 0014) ----
+
+from portal.store.base import AgentObserved  # noqa: E402
+
+AGENT = {"schema": "agent/v1", "display_name": "Calendar helper", "model": "chat-default", "instructions": "Help the team.", "starters": []}
+AGENT_PR = dict(branch="portal/agent-definition", pr_number=3, pr_url="https://github.com/acme/notes/pull/3", head_sha="a" * 40,
+                base_sha="b" * 40)
+
+
+def agent_request(store, person, request_id=None, now=T0, draft=None):
+    return store.create_agent_definition(request_id=request_id or new_rid(), person_id=person.id, repo="acme/notes", draft=draft or AGENT,
+                                         now=now)
+
+
+def test_an_agent_definition_starts_approved_its_draft_its_record(store):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    assert (req.kind, req.state, req.draft, req.final, req.attempts, req.last_error) == ("agent_definition", "approved", AGENT, AGENT, 0, None)
+    assert store.get_request(req.id) == req
+    entry = store.audit_for("request", req.id)[0]
+    assert (entry.action, entry.actor_id, entry.reason) == ("request.created", person.id, "agent definition saved in the portal")
+
+
+def test_several_may_be_open_for_one_repo(store):
+    person, _, _ = sign_in(store)
+    first, second = agent_request(store, person), agent_request(store, person, now=T0 + HOUR)
+    assert {r.id for r in store.requests_in(("approved",)) if r.kind == "agent_definition"} == {first.id, second.id}
+
+
+def test_an_agent_definition_never_reuses_a_request_id_and_names_a_known_person(store):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    with pytest.raises(Conflict) as caught:
+        agent_request(store, person, request_id=req.id)
+    assert caught.value.code == "request_exists"
+    with pytest.raises(Conflict) as caught:
+        store.create_agent_definition(request_id=new_rid(), person_id="p_" + "9" * 32, repo="acme/notes", draft=AGENT, now=T0)
+    assert caught.value.code == "unknown_person"
+
+
+@pytest.mark.parametrize("draft", [{**AGENT, "schema": "agent/v2"}, {**AGENT, "colour": "blue"}, {**AGENT, "display_name": ""},
+                                   {k: v for k, v in AGENT.items() if k != "model"}, {**AGENT, "instructions": "Help.\x07"},
+                                   {**AGENT, "starters": ["a", "b", "c", "d", "e"]}, ["not", "a", "mapping"]])
+def test_a_draft_that_isn_t_agent_v1_is_refused(store, draft):
+    person, _, _ = sign_in(store)
+    with pytest.raises(ValueError):
+        agent_request(store, person, draft=draft)
+    assert store.requests_by(person.id) == []
+
+
+def test_the_writer_claims_it_and_counts_each_failure_it_retries(store):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    with pytest.raises(Conflict):  # approved: nothing to retry yet
+        store.record_request_error(request_id=req.id, error="early", now=T0)
+    claimed = store.claim_approved(now=T0 + HOUR)
+    assert claimed.id == req.id and claimed.state == "writing"
+    store.record_request_error(request_id=req.id, error="github: 502 GET /repos/acme/notes", now=T0 + 2 * HOUR)
+    store.record_request_error(request_id=req.id, error="no_agent_app: PORTAL_AGENT_APP_ID is not set", now=T0 + 3 * HOUR)
+    found = store.get_request(req.id)
+    assert (found.state, found.attempts, found.last_error) == ("writing", 2, "no_agent_app: PORTAL_AGENT_APP_ID is not set")
+    opened = store.mark_pr_open(request_id=req.id, now=T0 + 4 * HOUR, **AGENT_PR)
+    store.record_request_error(request_id=req.id, error="github: 503 GET /repos/acme/notes/pulls/3", now=T0 + 5 * HOUR)
+    assert store.get_request(req.id).attempts == 3 and opened.state == "pr_open"
+    assert store.mark_merged(request_id=req.id, merge_sha="c" * 40, now=T0 + 6 * HOUR).state == "merged"
+    with pytest.raises(Conflict):
+        store.record_request_error(request_id=req.id, error="late", now=T0 + 7 * HOUR)
+
+
+@pytest.mark.parametrize("error", ["", "x" * 301, None])
+def test_a_retried_error_is_1_to_300_characters(store, error):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    store.claim_approved(now=T0)
+    with pytest.raises(ValueError):
+        store.record_request_error(request_id=req.id, error=error, now=T0)
+    assert store.get_request(req.id).attempts == 0
+
+
+def test_an_agent_definition_s_pull_request_is_on_its_one_branch(store):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    store.claim_approved(now=T0)
+    with pytest.raises(Conflict) as caught:
+        store.mark_pr_open(request_id=req.id, now=T0, **{**AGENT_PR, "branch": "portal/other"})
+    assert caught.value.code == "wrong_state" and store.get_request(req.id).state == "writing"
+
+
+def test_a_superseded_agent_definition_fails_with_its_reason(store):
+    person, _, _ = sign_in(store)
+    older, newer = agent_request(store, person), agent_request(store, person, now=T0 + HOUR)
+    failed = store.mark_failed(request_id=older.id, reason="superseded", now=T0 + HOUR)  # from approved: it is never claimed
+    assert (failed.state, failed.failure_reason) == ("failed", "superseded") and store.get_request(newer.id).state == "approved"
+
+
+# ---- the newest agent definition wins (review I1): the stores and 0014 hold it, not only the writer ----
+
+def test_the_writer_claims_the_newest_definition_and_never_an_older_one(store):
+    person, _, _ = sign_in(store)
+    older, newer = agent_request(store, person), agent_request(store, person, now=T0 + HOUR)
+    other = store.create_agent_definition(request_id=new_rid(), person_id=person.id, repo="acme/tools", draft=AGENT, now=T0)
+    assert [store.claim_approved(now=T0 + HOUR).id for _ in range(2)] == [other.id, newer.id]
+    assert store.claim_approved(now=T0 + HOUR) is None and store.get_request(older.id).state == "approved"
+
+
+def test_an_older_definition_opens_no_pull_request_once_a_newer_one_is_open(store):
+    person, _, _ = sign_in(store)
+    older = agent_request(store, person)
+    store.claim_approved(now=T0)
+    newer = agent_request(store, person, request_id=None, now=T0 + HOUR)
+    with pytest.raises(Conflict) as caught:
+        store.mark_pr_open(request_id=older.id, now=T0 + HOUR, **AGENT_PR)
+    assert caught.value.code == "newer_definition" and store.get_request(older.id).state == "writing"
+    store.mark_failed(request_id=older.id, reason="superseded", now=T0 + HOUR)
+    assert store.claim_approved(now=T0 + HOUR).id == newer.id
+    assert store.mark_pr_open(request_id=newer.id, now=T0 + HOUR, **AGENT_PR).state == "pr_open"
+
+
+def test_an_open_pull_request_is_superseded_and_the_newer_definition_takes_it_over(store):
+    person, _, _ = sign_in(store)
+    older = agent_request(store, person)
+    store.claim_approved(now=T0)
+    store.mark_pr_open(request_id=older.id, now=T0, **AGENT_PR)
+    newer = agent_request(store, person, now=T0 + HOUR)
+    assert store.mark_failed(request_id=older.id, reason="superseded", now=T0 + HOUR).state == "failed"
+    assert store.claim_approved(now=T0 + HOUR).id == newer.id
+    opened = store.mark_pr_open(request_id=newer.id, now=T0 + HOUR, **AGENT_PR)  # the same branch, the same pull request, updated
+    assert (opened.state, opened.pr_number) == ("pr_open", AGENT_PR["pr_number"])
+
+
+def test_only_a_newer_open_definition_supersedes(store):
+    person, _, _ = sign_in(store)
+    alone = agent_request(store, person)
+    for reason in ("superseded", "pr_closed"):  # approved: it fails only as superseded, and only with a newer one open
+        with pytest.raises(Conflict) as caught:
+            store.mark_failed(request_id=alone.id, reason=reason, now=T0)
+        assert caught.value.code == "wrong_state"
+    store.claim_approved(now=T0)
+    with pytest.raises(Conflict) as caught:
+        store.mark_failed(request_id=alone.id, reason="superseded", now=T0)
+    assert caught.value.code == "wrong_state"
+    newer = agent_request(store, person, now=T0 + HOUR)
+    with pytest.raises(Conflict):  # the newest is superseded by nothing
+        store.mark_failed(request_id=newer.id, reason="superseded", now=T0 + HOUR)
+    assert store.mark_failed(request_id=alone.id, reason="pr_closed", now=T0 + HOUR).failure_reason == "pr_closed"
+
+
+@pytest.mark.parametrize("pr_url", ["https://github.com/acme/other/pull/3", "https://github.com/acme/notes/pull/4",
+                                    "https://evil.example/x/acme/notes/pull/3", "http://github.com/acme/notes/pull/3"])
+def test_an_agent_definition_s_pull_request_is_its_repo_s(store, pr_url):
+    person, _, _ = sign_in(store)
+    req = agent_request(store, person)
+    store.claim_approved(now=T0)
+    with pytest.raises(Conflict) as caught:
+        store.mark_pr_open(request_id=req.id, now=T0, **{**AGENT_PR, "pr_url": pr_url})
+    assert caught.value.code == "wrong_state"
+    assert store.mark_pr_open(request_id=req.id, now=T0, **{**AGENT_PR, "pr_url": "https://GitHub.com/ACME/notes/pull/3"}).state == "pr_open"
+
+
+def test_only_an_agent_definition_records_an_error_this_way(store):
+    person, _, _ = sign_in(store)
+    reg = store.create_registration(person_id=person.id, now=T0, draft={"schema": "registration-draft/v1", "repo": "acme/tools",
+                                                                       "purpose": "Builds tools.", "data_classification": "public"})
+    with pytest.raises(Conflict):
+        store.record_request_error(request_id=reg.id, error="x", now=T0)
+    with pytest.raises(Conflict) as caught:
+        store.record_request_error(request_id=new_rid(), error="x", now=T0)
+    assert caught.value.code == "not_found"
+
+
+def test_another_kind_keeps_no_attempts_on_its_request(store):
+    owner, _ = people(store)
+    req = sp_request(store, owner.id, T0)
+    store.record_service_principal_failure(request_id=req.id, error="graph: 503", now=T0)
+    found = store.get_request(req.id)
+    assert (found.attempts, found.last_error) == (0, None)  # a service principal request's are on its own view (0013)
+    assert store.service_principal_request(req.id).attempts == 1
+
+
+def test_an_agent_definition_is_refused_for_a_decommissioned_app(store):
+    owner, admin = people(store)
+    req, _ = writing_lifecycle(store, admin, action="decommission")
+    every_step_done(store, req)
+    store.apply_lifecycle(request_id=req.id, merge_sha=None, note=COMPLETED, now=T0)
+    with pytest.raises(Conflict) as caught:
+        agent_request(store, owner)
+    assert caught.value.code == "decommissioned"
+
+
+def test_the_observed_agents_are_replaced_in_one_go(store):
+    rows = [AgentObserved("acme/notes", "a" * 40, AGENT, None, T0), AgentObserved("acme/Tools", "b" * 40, None, "agent_yaml_invalid", T0)]
+    store.replace_agent_observed(rows, observed_at=T0 + HOUR)
+    assert [o.repo for o in store.agent_observed()] == ["acme/notes", "acme/Tools"]
+    assert store.agent_observed()[0].observed_at == T0 + HOUR
+    assert store.agent_observed("ACME/NOTES")[0].agent == AGENT and store.agent_observed("acme/tools")[0].problem == "agent_yaml_invalid"
+    assert store.agent_observed("acme/other") == []
+    store.replace_agent_observed([], observed_at=T0 + HOUR)
+    assert store.agent_observed() == []
+
+
+@pytest.mark.parametrize("row", [AgentObserved("acme/notes", "a" * 40, None, None, T0), AgentObserved("acme/notes", "a" * 40, AGENT, "agent_yaml_invalid", T0),
+                                 AgentObserved("acme/notes", "short", AGENT, None, T0), AgentObserved("acme/notes", "a" * 40, None, "other", T0),
+                                 AgentObserved("acme/notes", "a" * 40, {**AGENT, "schema": "x"}, None, T0),
+                                 AgentObserved("not a repo", "a" * 40, AGENT, None, T0)])
+def test_an_observed_agent_is_its_agent_or_its_problem(store, row):
+    store.replace_agent_observed([AgentObserved("acme/kept", "c" * 40, AGENT, None, T0)], observed_at=T0)
+    with pytest.raises(ValueError):
+        store.replace_agent_observed([row], observed_at=T0)
+    assert [o.repo for o in store.agent_observed()] == ["acme/kept"]  # a refused pass changes nothing
+
+
+def test_one_repo_is_observed_once_in_any_case(store):
+    rows = [AgentObserved("acme/notes", "a" * 40, AGENT, None, T0), AgentObserved("ACME/notes", "b" * 40, None, "agent_yaml_missing", T0)]
+    with pytest.raises(ValueError):
+        store.replace_agent_observed(rows, observed_at=T0)
+
+
+def test_the_new_evidence_problems_are_kept(store):
+    person, _, _ = sign_in(store)
+    reg = store.create_registration(person_id=person.id, now=T0, draft={"schema": "registration-draft/v1", "repo": "acme/tools",
+                                                                       "purpose": "Builds tools.", "data_classification": "public"})
+    store.add_evidence_problem(request_id=reg.id, submission=1, problem="agent_yaml_missing", now=T0)
+    assert store.evidence_problem_for(reg.id, 1) == "agent_yaml_missing"
+    store.add_evidence_problem(request_id=reg.id, submission=1, problem="agent_yaml_invalid", now=T0 + HOUR)
+    assert store.evidence_problem_for(reg.id, 1) == "agent_yaml_invalid"

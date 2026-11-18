@@ -29,6 +29,20 @@
 <p class="callout info">No portal registration; the writer checks the factory's intake record before it records a change.</p>
 {% endif %}
 {{ lifecycle_panel(lifecycle_panel_info, owner_name, repo_name) }}
+{% if agent_card %}
+<section class="card agent">
+<div class="card-head"><h2>Agent</h2></div>
+{% if agent_card.problem %}<p class="callout warn">The agent.yaml on the default branch: {{ agent_card.problem }}.</p>
+{% else %}<dl class="facts"><div><dt>Name</dt><dd>{{ agent_card.display_name }}</dd></div><div><dt>Model</dt><dd class="mono">{{ agent_card.model }}</dd></div></dl>
+<pre class="prose">{{ agent_card.preview }}</pre>{% endif %}
+<h3>What the runtime gets in {{ environment }}</h3>
+<ul>{% for t in agent_card.view.tools %}<li><span class="mono">{{ t.name }}</span>: {{ t.detail }}</li>
+{% else %}<li>No tools: the model alone, through the platform gateway.</li>{% endfor %}</ul>
+{% if agent_card.view.skills %}<p>Skills, added to its instructions: <span class="mono">{{ agent_card.view.skills|join(", ") }}</span></p>{% endif %}
+<p class="hint">Always the model, through the platform's model gateway with this app's own key. Pick its MCP servers, skills and data under Connections.</p>
+{% if can_change and not decommissioned %}<p class="actions"><a class="button secondary" href="/apps/{{ owner_name }}/{{ repo_name }}/agent">Define the agent</a></p>{% endif %}
+</section>
+{% endif %}
 {% if directory or settings.secret_server or settings.cloudflare or settings.skills_catalog %}
 <div class="card-head"><h2>Connections</h2>
 <nav class="tabs" aria-label="Environment">{% for env in environments %}<a href="/apps/{{ owner_name }}/{{ repo_name }}?environment={{ env }}"{% if env == environment %} aria-current="page"{% endif %}>{{ env }}</a>{% endfor %}</nav></div>

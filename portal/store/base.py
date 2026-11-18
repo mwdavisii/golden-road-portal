@@ -16,7 +16,7 @@ LINK_SOURCES = ("github-oauth", "admin")
 
 
 class Conflict(Exception):
-    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable, decommissioned, command_open, not_lifecycle, name_taken, task_taken, principal_exists, decided."""
+    """The store refused a change. code: not_found, wrong_state, open_request_exists, link_taken, self_link, self_decision, repo_changed, request_exists, unknown_person, evidence_exists, not_awaiting, no_evidence, stale_evidence, evidence_mismatch, below_floor, run_seen, item_exists, item_open, no_event, event_exists, closed, own_app, wrong_reason, wrong_role, item_changed, record_unreadable, decommissioned, command_open, not_lifecycle, name_taken, task_taken, principal_exists, decided, newer_definition."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -163,6 +163,8 @@ class Request:
     submission: int = 1  # counts up each time a sent-back request is resubmitted; the platform's evidence is per submission
     floor_override: dict | None = None  # {by, at, reason}: the approver's written reason for approving below the floor
     ownership_acknowledged_at: dt.datetime | None = None  # a registration's "I understand what owning this app means" (0011); None before
+    attempts: int = 0  # an agent definition's failures the writer retries (0014: 0013's columns); 0 for every other kind here
+    last_error: str | None = None  # and the last one's error
 
 
 @dc.dataclass(frozen=True)
@@ -188,7 +190,8 @@ class Awaiting:
     submission: int
 
 
-PROBLEMS = ("rules_missing", "rules_invalid", "rules_unreadable", "repo_unreadable", "record_unreadable", "record_case_mismatch")
+PROBLEMS = ("rules_missing", "rules_invalid", "rules_unreadable", "repo_unreadable", "record_unreadable", "record_case_mismatch",
+            "agent_yaml_missing", "agent_yaml_invalid")  # the last two: an agent repo's main has no valid agent.yaml yet (0014)
 
 
 @dc.dataclass(frozen=True)
@@ -692,6 +695,66 @@ def check_close_notes(approved, close_notes) -> None:
         raise ValueError(f"a rejection keeps the task's close notes, at most {MAX_CLOSE_NOTES} characters")
 
 
+# ---- agent definitions (spec 2026-11-17, migration 0014) ----
+
+AGENT_KIND = "agent_definition"
+AGENT_BRANCH = "portal/agent-definition"  # an agent definition's one branch (decided while planning: item 26; 0014 holds it)
+AGENT_PROBLEMS = ("agent_yaml_missing", "agent_yaml_invalid")
+SUPERSEDED = "superseded"  # the reason an older agent definition fails: a newer open one for its repo wins (0014)
+
+
+def agent_pr_url_ok(repo, pr_number, pr_url) -> bool:
+    """An agent definition's pull request is its own repo's (0014's update guard holds the same, any case)."""
+    return isinstance(pr_url, str) and isinstance(pr_number, int) and re.fullmatch(
+        rf"https://[^/]+/{re.escape(repo)}/pull/{pr_number}", pr_url, re.IGNORECASE) is not None
+
+
+@dc.dataclass(frozen=True)
+class AgentObserved:
+    """An agent repo as the collector last saw it (0014's agent_observed): its agent.yaml's document, or why it can't be used."""
+    repo: str
+    commit: str
+    agent: dict | None
+    problem: str | None
+    observed_at: dt.datetime
+
+
+def _agent_v1(doc) -> bool:
+    """True for a valid agent/v1 document that agent.yaml writes and reads back as itself (portal/agent_file, the builder's rules)."""
+    from ..agent_file import AgentFileError, dump, load
+    try:
+        return isinstance(doc, dict) and load(dump(doc).encode("utf-8")) == doc
+    except AgentFileError:
+        return False
+
+
+def check_agent_definition(request_id, person_id, repo, draft) -> None:
+    """An agent definition's id has the portal's format, it names a person and a repo, and its draft is a valid agent/v1 (0014's insert
+    trigger holds its shape again). The platform's model list is the web's to check (portal/agent_models.json)."""
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        raise ValueError("an agent definition's id is not a portal request id")
+    if not isinstance(person_id, str) or not PERSON_ID.fullmatch(person_id) or not isinstance(repo, str) or not REPO_NAME.fullmatch(repo):
+        raise ValueError("an agent definition names its person and its repo")
+    if not _agent_v1(draft):
+        raise ValueError("an agent definition's draft is not a valid agent/v1")
+
+
+def check_agent_observed(rows) -> None:
+    """Each observed agent names its repo (once, in any case) and its commit, and has its agent/v1 document or one problem, not both."""
+    seen = set()
+    for row in rows:
+        if not isinstance(row, AgentObserved) or not isinstance(row.repo, str) or not REPO_NAME.fullmatch(row.repo) \
+                or not isinstance(row.commit, str) or not SHA40.fullmatch(row.commit):
+            raise ValueError("an observed agent names its repo and its commit")
+        if row.repo.lower() in seen:
+            raise ValueError("an agent repo is observed once")
+        seen.add(row.repo.lower())
+        if (row.agent is None) == (row.problem is None) or (row.problem is not None and row.problem not in AGENT_PROBLEMS):
+            raise ValueError("an observed agent has its agent.yaml or one of the problems, not both")
+        if row.agent is not None and not _agent_v1(row.agent):
+            raise ValueError("an observed agent's document is not a valid agent/v1")
+
+
 class Store(Protocol):
     def sign_in(self, *, issuer, subject, display_name, email, groups, roles, now, max_age) -> tuple[Person, str, str]: ...
     def get_session(self, token, *, now, idle) -> Session | None: ...
@@ -809,3 +872,12 @@ class Store(Protocol):
     def add_mock_task_decision(self, *, task_number, state, close_notes, actor_id, now) -> MockTaskDecision: ...  # the web's, once per task
     def mock_task_decisions(self) -> list[MockTaskDecision]: ...  # oldest first
     def service_principal_lock(self): ...  # a context manager: True while this pass alone runs the collector's step
+
+    # ---- agent definitions (spec 2026-11-17, migration 0014) ----
+    # the web's: approved at once (no admin approval: the PR's review and checks are the gate), its draft and its record the agent/v1;
+    # several may be open for one repo (the writer fails the older as superseded)
+    def create_agent_definition(self, *, request_id, person_id, repo, draft, now) -> Request: ...
+    # the writer's, on an agent definition in writing or pr_open: one more attempt and its error; the request stays where it is (no cap)
+    def record_request_error(self, *, request_id, error, now) -> None: ...
+    def replace_agent_observed(self, rows, *, observed_at) -> None: ...  # the collector's, all at once
+    def agent_observed(self, repo=None) -> list[AgentObserved]: ...  # by lower(repo); one repo's (any case) when given

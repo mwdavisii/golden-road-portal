@@ -16,6 +16,7 @@ from .base import (ACTION_STEPS, COMMANDS, DATE_REASONS, LIFECYCLE_STATES, MAX_S
                    token_hash, PendingEvent, Watermark, MockTaskDecision, ServicePrincipal,
                    ServicePrincipalRequest, check_close_notes, check_decision, check_principal, check_service_principal_request,
                    check_task_ref)
+from .base import AGENT_BRANCH, AGENT_KIND, SUPERSEDED, agent_pr_url_ok, check_agent_definition, check_agent_observed
 
 
 REGISTERED = ("approved", "writing", "pr_open", "merged")  # a registration an admin approved
@@ -47,6 +48,7 @@ class MemoryStore:
         self._sp = {}  # request_id -> {task_number, task_sys_id, attempts, last_error, close_notes, note_sent_at}
         self._principals = {}  # id -> ServicePrincipal
         self._decisions = {}  # task_number -> MockTaskDecision
+        self._agents = {}  # lower(repo) -> AgentObserved
 
     def _log(self, now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason):
         self._audit.append(AuditEntry(now, actor_kind, actor_id, action, subject_kind, subject_id, before, after, reason))
@@ -331,7 +333,8 @@ class MemoryStore:
 
     def claim_approved(self, *, now):
         with self._lock:
-            ready = sorted((r for r in self._requests.values() if r.state == "approved" and r.kind != "service_principal"),
+            ready = sorted((r for r in self._requests.values() if r.state == "approved" and r.kind != "service_principal"
+                            and not self._newer_agent(r)),  # an older agent definition is superseded, never written (0014)
                            key=lambda r: (r.decided_at or r.created_at, r.id))  # a binding has no decision; a service principal is the collector's
             if not ready:
                 return None
@@ -348,8 +351,13 @@ class MemoryStore:
 
     def mark_pr_open(self, *, request_id, branch, pr_number, pr_url, head_sha, base_sha, now):
         with self._lock:
-            if self._need(request_id).kind == "lifecycle":  # its pull requests are on its steps (0012)
+            kind = self._need(request_id).kind
+            if kind == "lifecycle":  # its pull requests are on its steps (0012)
                 raise Conflict("wrong_state")
+            if kind == AGENT_KIND and (branch != AGENT_BRANCH or not agent_pr_url_ok(self._requests[request_id].repo, pr_number, pr_url)):
+                raise Conflict("wrong_state")  # its one branch, and a pull request of its own repo (0014)
+            if self._need(request_id).state == "writing" and self._newer_agent(self._requests[request_id]):
+                raise Conflict("newer_definition")
             return self._move(request_id, ("writing",), "pr_open", now, "the writer opened the pull request",
                               branch=branch, pr_number=pr_number, pr_url=pr_url, head_sha=head_sha, base_sha=base_sha)
 
@@ -359,7 +367,18 @@ class MemoryStore:
 
     def mark_failed(self, *, request_id, reason, now):
         with self._lock:
-            return self._move(request_id, ("writing", "pr_open"), "failed", now, reason, failure_reason=reason)
+            req = self._need(request_id)
+            if req.kind == AGENT_KIND and reason == SUPERSEDED and not self._newer_agent(req):
+                raise Conflict("wrong_state")  # superseded only by a newer open one (0014)
+            # an older agent definition still approved fails as superseded without being claimed
+            ready = ("approved", "writing", "pr_open") if req.kind == AGENT_KIND and reason == SUPERSEDED else ("writing", "pr_open")
+            return self._move(request_id, ready, "failed", now, reason, failure_reason=reason)
+
+    def _newer_agent(self, req):
+        """True when req is an agent definition and a newer one for its repo is open: the newest wins (0014)."""
+        return req.kind == AGENT_KIND and any(
+            r.kind == AGENT_KIND and r.id != req.id and r.repo.lower() == req.repo.lower() and r.state in OPEN_STATES
+            and (r.created_at, r.id) > (req.created_at, req.id) for r in self._requests.values())
 
     # ---- observed: the factory's intake records (the collector replaces them all in one go) ----
 
@@ -981,3 +1000,41 @@ class MemoryStore:
     def service_principal_lock(self):
         """One process holds a MemoryStore: the lock is always free."""
         yield True
+
+    # ---- agent definitions (spec 2026-11-17, migration 0014) ----
+
+    def create_agent_definition(self, *, request_id, person_id, repo, draft, now):
+        check_agent_definition(request_id, person_id, repo, draft)
+        with self._lock:
+            self._not_decommissioned(repo)
+            if person_id not in self._people:
+                raise Conflict("unknown_person")
+            if request_id in self._requests:
+                raise Conflict("request_exists")
+            req = Request(request_id, AGENT_KIND, repo, "approved", dict(draft), person_id, now, now, final=dict(draft))
+            self._requests[req.id] = req
+            self._log(now, "person", person_id, "request.created", "request", req.id, None,
+                      {"state": "approved", "repo": repo, "draft": dict(draft)}, "agent definition saved in the portal")
+            return req
+
+    def record_request_error(self, *, request_id, error, now):
+        if not isinstance(error, str) or not 1 <= len(error) <= MAX_STEP_REASON:
+            raise ValueError("an error is 1 to 300 characters")
+        with self._lock:
+            req = self._need(request_id)
+            if req.kind != AGENT_KIND or req.state not in ("writing", "pr_open"):
+                raise Conflict("wrong_state")
+            self._requests[req.id] = dc.replace(req, attempts=req.attempts + 1, last_error=error, updated_at=now)
+
+    def replace_agent_observed(self, rows, *, observed_at):
+        rows = list(rows)
+        check_agent_observed(rows)
+        with self._lock:
+            self._agents = {r.repo.lower(): dc.replace(r, observed_at=observed_at) for r in rows}
+
+    def agent_observed(self, repo=None):
+        with self._lock:
+            if repo is not None:
+                found = self._agents.get(str(repo).lower())
+                return [found] if found else []
+            return [self._agents[k] for k in sorted(self._agents)]

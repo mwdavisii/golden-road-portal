@@ -52,6 +52,8 @@ def test_approve_is_disabled_and_refused_without_evidence(portal):
     ("rules_invalid", "the factory's config/registration.yaml is not valid"),
     ("rules_unreadable", "the factory's config/registration.yaml can't be read"),
     ("repo_unreadable", "the portal's read App can't read this repository"),
+    ("agent_yaml_missing", "this is an agent repo, and its default branch has no agent.yaml yet"),
+    ("agent_yaml_invalid", "isn't a valid agent/v1 with one of the platform's models"),
 ])
 def test_the_page_says_why_the_evidence_is_waiting(portal, problem, sentence):
     req = fresh(portal)

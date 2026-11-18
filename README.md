@@ -80,6 +80,7 @@ Anything missing or malformed stops the process at startup.
 | `PORTAL_SECRET_SERVER` | Optional; as for the web (`mock` or unset; `PORTAL_SECRET_SERVER_URL` must stay unset). A binding's secrets are re-checked against it before they are written |
 | `PORTAL_CLOUDFLARE`, `PORTAL_MCP_GATEWAY_TEST`, `PORTAL_MCP_GATEWAY_PROD` | Optional; as for the web. A binding's MCP servers are re-checked against them before they are written |
 | `PORTAL_SKILLS_CATALOG` | Optional; as for the web. A binding's skills are re-checked against it, and the skills ConfigMap is built from it |
+| `PORTAL_AGENT_APP_ID`, `PORTAL_AGENT_APP_KEY_FILE` | Optional (0.8.0); the agent App and its RSA private key (a PEM file, never printed), both or neither. Without them every agent definition waits with `no_agent_app`. Another App than the write App and the lifecycle App (the writer exits 2 otherwise), and than the read App (the writer can't check that one: it never holds the read App's id). See "Build an agent" below |
 | `PORTAL_REPO_ADMINS_STALE_AFTER` | Optional; the web's setting, and it must be the same value (the homelab kit passes both processes the one config map key; empty is the default, 600). A binding's requester must have been seen as the repo's admin within it, or it fails with `requester_not_admin` |
 
 It checks the write App's bypass before the first pass and again before every pass, and writes nothing in a pass whose check finds a
@@ -395,6 +396,68 @@ columns `task_number`, `task_sys_id`, `attempts`, `last_error`, `close_notes` an
 per task by `portal_web`, read by the web and the collector); the view `service_principal_request`, which is all the collector reads
 of the kind (it still never reads a registration's draft). The kind has its own insert and update triggers, names are unique in any
 case, and a task belongs to one request of either kind. The Approvals page lists registrations only.
+
+## Build an agent (0.8.0, mock model, Databricks and Graph)
+
+Mock only: the model, Databricks and Graph calls an agent makes are served by mocks in the PoC (the runtime's tests and
+`agent_runtime.mock_gateway`). Nothing in the portal calls a model.
+
+An agent app is a repo made from `golden-road-agent-template`: `agent.yaml` (`agent/v1`) and the builder's generated files, nothing
+else. The platform's agent runtime runs it. The portal writes `agent.yaml` by pull request; a person merges it. The template is
+itself a platform repo (`portal/lifecycle.py` `PLATFORM_REPOS`): the writer never writes to it.
+
+**The pages.** `/agents/new` (anyone signed in) links GitHub's "Use this template" page for the template
+(`https://<github host>/<PORTAL_ORG>/golden-road-agent-template/generate`, built from the settings) and lists the person's admin
+repos, as the collector last saw them, that the collector saw as agent repos, each with **Define the agent**.
+`/apps/<owner>/<repo>/agent` (the repo's admin, or a portal admin; others get 404) is the form: a display name (1 to 64 characters on
+one line), a model from `portal/agent_models.json` (`agent-models/v1`, held equal to `platform.json`'s `agent_models` by a test), the
+instructions (1 to 8000 characters) and up to 4 conversation starters (200 characters each, one line). It starts from the open
+definition's draft, else `agent.yaml` as the collector read it. Only the repo's admin saves (a portal admin who isn't one gets 403);
+a decommissioned app is a 409; a repo the collector didn't see as an agent repo is a 409 with the template link; a bad field is a
+400 naming it ("Model: pick one of the platform's models."), and a document `agent_file` refuses is a 400 with its reason. The
+app page has an Agent card for a repo the collector saw as an agent repo: the name, the model, the instructions' first lines (or the
+collector's problem), and, for the tab's environment, what the runtime gets from the binding the page shows: each MCP server,
+`databricks_query` when Databricks and the Azure identity are bound, `graph_read` when the Azure identity is bound, the skills, and
+always the model through the platform gateway. For an agent with an Azure identity the Connections egress line also lists
+`graph.microsoft.com`, which compose adds for agents only. My requests lists a definition as "Agent (<display name>)".
+
+**The request.** A save is a request of kind `agent_definition`, `approved` at once (no admin approval: the PR's review and checks
+are the gate), its record its draft (an `agent/v1` document). Several may be open per repo; the newest wins: each writer pass first
+fails every older approved one as `superseded`, and a definition whose turn finds a newer open one is `superseded` before anything
+is written.
+
+**The writer** uses the agent App (Contents: write, Pull requests: write, Metadata: read), installed with "Only select
+repositories" on agent repos only. The write App's installation covers only the factory and the deploy repo, and the lifecycle App
+has Administration: write only, so neither could do this. Before each request it asks, as the App, for the App's installation on
+each of the platform repos (each must be a 404, else the request waits with `agent_app_on_platform_repo: <org>/<repo>`) and on the
+app's repo (an installation on all repositories waits with `agent_app_on_all_repositories`); then it mints one token for that one
+repo with exactly `contents: write` and `pull_requests: write` (a wider or narrower one, or one that lists any other repository, is
+revoked unused), reads `GET /app` for its bot login, and revokes the token after use (`DELETE /installation/token`), on success or
+failure. It refuses (fails the request) `decommissioned`, `platform_repo`, `requester_not_admin` (the requester's admin rights are
+checked again), `agent_yaml_invalid`, `not_an_agent_repo` (no `builder-spec.json` with `app_type: agent` at the default branch),
+`already_on_main` and `pr_not_ours` (an open PR from the branch that isn't the agent App's bot's into the default branch; every page
+of the open PRs is read). On branch `portal/agent-definition` it commits the new `agent.yaml` (a two-line header comment naming the
+request, then the keys in `agent/v1` order): into its open PR when there is one (the PR updates in place, and its title and body are
+sent again), else on the branch deleted and created again from the default branch, with a new PR titled
+`Define the agent for <repo> (portal request <id>)` whose body fences the instructions. It never merges: a person merges it. The
+writer records the merge once `agent.yaml` at the merge commit is what it wrote, into the default branch (else
+`merged_file_differs`); a PR closed unmerged fails `pr_closed`. A merge it missed (it stopped after its `PUT`) is found among the
+App's closed PRs and recorded. A GitHub failure, an App installed too wide, or no agent App (`no_agent_app`) keeps the request where
+it is with one more attempt and the error, and the next pass tries again, with no attempt cap; the Agent page shows "The writer is
+retrying: <error>."
+
+**The collector**'s `agents` part reads every page of the read App's installation repositories, `builder-spec.json` at each one's
+default-branch head and, for `app_type: agent`, its `agent.yaml`; it replaces `agent_observed` (the agent, or `agent_yaml_missing` /
+`agent_yaml_invalid`) in one go, and a pass GitHub can't answer changes nothing. One repo's odd answer leaves that repo out. Its
+line is `collectors: agents: N agent repos (N with a problem)`. It makes a few GitHub calls per repository of the installation on
+every pass. A registration of an agent app waits, with the evidence problem `agent_yaml_missing` or `agent_yaml_invalid`, until its
+default branch holds a valid `agent.yaml`; the evidence document itself doesn't change.
+
+**Data (`0014`, forward-only).** The kind with its own insert and update triggers (only `portal_writer` moves it, and an older
+definition is never claimed or opened once a newer one is open for its repo), the `attempts` and `last_error` columns for it (the
+writer may update those two), `agent_observed` (inserted by `portal_collector`, read by `portal_web`), the shape check
+`agent_v1_shape` as the database's backstop, and the two evidence problems. An older portal image must not run against it: its
+writer would claim agent definitions it doesn't know.
 
 ## Development
 

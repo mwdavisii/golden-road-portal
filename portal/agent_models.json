@@ -1,0 +1,4 @@
+{
+  "schema": "agent-models/v1",
+  "models": [{"id": "chat-default", "label": "Default chat model"}]
+}

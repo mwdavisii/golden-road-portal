@@ -1822,3 +1822,17 @@ def test_a_pr_for_an_app_decommissioned_meanwhile_is_never_merged(portal):
     run_once(portal.store, client(gh), writer_config(), T0)
     after = portal.store.get_request(req.id)
     assert (after.state, after.failure_reason) == ("failed", "decommissioned") and not gh.called("PUT", R + "/pulls/12/merge")
+
+
+# ---- an agent app (spec 2026-11-17 A5, decided while planning item 10): the writer composes its gateway key ----
+
+def test_an_agent_release_without_a_binding_composes_its_gateway_key():
+    from portal.writer.run import compose_bytes
+    objects = [o for o in yaml.safe_load_all(MANIFESTS) if o]
+    objects[1]["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "AGENT_GATEWAY_URL", "value": "https://llm.example.org/v1"})
+    manifests = "---\n".join(yaml.safe_dump(o, sort_keys=False) for o in objects).encode()
+    release = ("# Written by the bump workflow.\n" + yaml.safe_dump(release_doc(manifests_sha256=hashlib.sha256(manifests).hexdigest()),
+                                                                     sort_keys=False)).encode()
+    out = [o for o in yaml.safe_load_all(compose_bytes("acme/notes", "test", release, manifests, None)) if o]
+    assert out[-1]["kind"] == "ExternalSecret" and out[-1]["spec"]["data"] == [
+        {"secretKey": "AGENT_GATEWAY_KEY", "remoteRef": {"key": "/golden-road/agent-gateway-keys/agent-acme--notes-test", "property": "key"}}]

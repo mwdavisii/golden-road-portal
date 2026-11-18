@@ -94,6 +94,8 @@ PAGES = [("anonymous", "/"), ("anonymous", "/register"), ("owner", "/"), ("owner
          ("owner", "/apps/acme/notes/service-principals/new"), ("owner", "/requests/{sp}"),   # the service principal form, its request
          ("owner", "/apps/acme/notes?sp=1"),   # the card's created principals and requests
          ("admin", "/mock/servicenow/tasks/SCTASK0010007"),   # the mock approver's Approve and Reject
+         ("owner", "/agents/new"), ("owner", "/apps/acme/notes/agent"), ("owner", "/apps/acme/notes/agent?observed=1"),   # build an agent
+         ("owner", "/apps/acme/notes?agent=1"),   # the Agent card
          ("other", "/requests/{request}")]   # the last is the error page (404, through base.html)
 
 
@@ -130,7 +132,9 @@ RENDERS = {"/apps/acme/notes?confirm=azure-identity": "Remove the Azure identity
            "/requests/{lifecycle}": "What ServiceNow was told", "/mock/servicenow/tasks/SCTASK0010001": "<h3>Work note</h3>", "/apps/acme/notes/lifecycle/decommission": 'name="confirm_repo"',
            "/apps/acme/notes/service-principals/new": 'data-tier="requestable"', "/requests/{sp}": "Waiting for approval in SCTASK0010007",
            "/apps/acme/notes?sp=1": "Created in the portal",
-           "/mock/servicenow/tasks/SCTASK0010007": "Mock: acting as the ServiceNow approver"}
+           "/mock/servicenow/tasks/SCTASK0010007": "Mock: acting as the ServiceNow approver",
+           "/agents/new": "Use this template", "/apps/acme/notes/agent": "isn&#39;t an agent repo",
+           "/apps/acme/notes/agent?observed=1": 'name="instructions"', "/apps/acme/notes?agent=1": "<h2>Agent</h2>"}
 
 
 def prepare(portal, path):
@@ -219,6 +223,9 @@ def prepare(portal, path):
     if path == "/mock/servicenow/tasks/SCTASK0010007":   # a pending service principal request whose task the collector opened
         from test_portal_service_principal_pages import opened_by_the_collector, with_servicenow
         opened_by_the_collector(with_servicenow(portal))
+    if "observed=1" in path or "agent=1" in path:   # an agent repo as the collector saw it (the pages ignore the query)
+        from test_portal_agent_pages import observe
+        observe(portal)
     if "confirm=" in path:
         from test_portal_apps import link_identity_and_merge
         link_identity_and_merge(portal)

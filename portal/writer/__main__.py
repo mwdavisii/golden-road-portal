@@ -1,8 +1,9 @@
 """`python -m portal.writer [--once]`: the only process that writes to git (P17). It checks the write App's bypass at startup and
 refuses to run if it covers more than the plan allows, and checks it again at the start of every pass, writing nothing in a pass
 whose check finds a problem. Then it claims approved requests, writes, opens PRs and merges after checks. It holds the write
-App's key. It also holds the lifecycle App's key (spec 2026-11-02 L9; optional: without it, a decommission is refused), and prints
-neither key nor any token.
+App's key. It also holds the lifecycle App's key (spec 2026-11-02 L9; optional: without it, a decommission is refused) and the agent App's (spec 2026-11-17; optional: without it, an agent definition
+waits), each another App than the write App, and prints no key and no token. The agent App must also be another App than the
+read App (the collector's): the writer never holds that App's id, so it can't check it, and the kit says so.
 
 Exit codes: 0 after `--once`, 2 for a missing or bad setting or key, 3 for a refusal to start (the bypass check found a problem)."""
 
@@ -24,7 +25,7 @@ from ..github.client import GitHub
 from ..settings import (ORG, SettingsError, cloudflare_from, github_bases, mcp_gateways_from, no_cloudflare_account, no_secret_server_url,
                         parse_role_groups, skills_catalog_from)
 from .bypass import check_bypass, write_login
-from .config import LifecycleApp, WriterConfig
+from .config import AgentApp, LifecycleApp, WriterConfig
 from .run import run_once
 
 CHECK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/-]{0,99}")
@@ -69,15 +70,25 @@ def _key(path: str, name: str = "PORTAL_WRITE_APP_KEY_FILE") -> bytes:
     return raw
 
 
-def _lifecycle_app(env, api):
-    """PORTAL_LIFECYCLE_APP_ID and PORTAL_LIFECYCLE_APP_KEY_FILE (spec 2026-11-02 L9): both set, or neither (no lifecycle App: a
-    decommission is refused, suspend and resume go on). main gives it the writer's HTTP client."""
-    app_id, path = env.get("PORTAL_LIFECYCLE_APP_ID", ""), env.get("PORTAL_LIFECYCLE_APP_KEY_FILE", "")
+def _app(env, api, prefix, cls):
+    """PORTAL_<prefix>_APP_ID and PORTAL_<prefix>_APP_KEY_FILE: both set, or neither (None). main gives the App the writer's HTTP client."""
+    id_name, key_name = f"PORTAL_{prefix}_APP_ID", f"PORTAL_{prefix}_APP_KEY_FILE"
+    app_id, path = env.get(id_name, ""), env.get(key_name, "")
     if not app_id and not path:
         return None
     if not app_id or not path:
-        raise SettingsError("PORTAL_LIFECYCLE_APP_ID and PORTAL_LIFECYCLE_APP_KEY_FILE are set together, or neither")
-    return LifecycleApp(_int(env, "PORTAL_LIFECYCLE_APP_ID"), _key(path, "PORTAL_LIFECYCLE_APP_KEY_FILE"), api)
+        raise SettingsError(f"{id_name} and {key_name} are set together, or neither")
+    return cls(_int(env, id_name), _key(path, key_name), api)
+
+
+def _lifecycle_app(env, api):
+    """The lifecycle App (spec 2026-11-02 L9), optional: without it a decommission is refused, suspend and resume go on."""
+    return _app(env, api, "LIFECYCLE", LifecycleApp)
+
+
+def _agent_app(env, api):
+    """The agent App (spec 2026-11-17; decided while planning: item 27), optional: without it an agent definition waits (no_agent_app)."""
+    return _app(env, api, "AGENT", AgentApp)
 
 
 def _check_list(env, name, required) -> tuple[str, ...]:
@@ -153,9 +164,11 @@ def _load(env):
                        directory=_directory(env), secret_server=_secret_server(env),
                        repo_admins_stale_after=stale, cloudflare=cloudflare, mcp_gateways=gateways,
                        skills_catalog=skills_catalog_from(env.get("PORTAL_SKILLS_CATALOG", "")),
-                       lifecycle_app=_lifecycle_app(env, api))
+                       lifecycle_app=_lifecycle_app(env, api), agent_app=_agent_app(env, api))
     if cfg.lifecycle_app is not None and cfg.lifecycle_app.app_id == app_id:
         raise SettingsError("PORTAL_LIFECYCLE_APP_ID must be another App than PORTAL_WRITE_APP_ID: the write App never archives")
+    if cfg.agent_app is not None and cfg.agent_app.app_id in (app_id, getattr(cfg.lifecycle_app, "app_id", None)):
+        raise SettingsError("PORTAL_AGENT_APP_ID must be another App than PORTAL_WRITE_APP_ID and PORTAL_LIFECYCLE_APP_ID")
     return cfg, key, installation, api, url, interval
 
 
@@ -171,6 +184,8 @@ def main(argv=None, env=os.environ, *, http=None, store=None, sleep=time.sleep, 
     http = http or httpx.Client(timeout=30)
     if cfg.lifecycle_app is not None:
         cfg = dc.replace(cfg, lifecycle_app=dc.replace(cfg.lifecycle_app, http=http))
+    if cfg.agent_app is not None:
+        cfg = dc.replace(cfg, agent_app=dc.replace(cfg.agent_app, http=http))
     as_app = GitHub(api, http, lambda: app_jwt(cfg.app_id, key, int(time.time())))
     as_installation = GitHub(api, http, InstallationToken(http, api, cfg.app_id, key, installation))
     if store is None:

@@ -67,6 +67,12 @@ def test_a_platform_repository_is_never_decommissioned(name):
     assert ask("decommission", repo=f"other/{name}") is None
 
 
+def test_the_agent_template_is_a_platform_repository():
+    """(decided while planning: item 35) The template every agent repo comes from is the platform's, never decommissioned."""
+    assert lifecycle.is_platform_repo("acme/golden-road-agent-template", "acme")
+    assert not lifecycle.is_platform_repo("acme/agent-calendar", "acme")
+
+
 @pytest.mark.parametrize("task, reason, problems", [
     ("SCTASK0010001", "Critical vulnerability", []),
     ("SCTASK001", "Critical vulnerability", [lifecycle.BAD_TASK]),

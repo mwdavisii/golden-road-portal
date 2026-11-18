@@ -68,6 +68,11 @@ ROUTES = {
     # create a service principal (spec 2026-11-16 S2): the app's admin, or a portal admin; an empty form is a 400 (no name, no scope)
     ("GET", "/apps/{owner}/{repo}/service-principals/new"): {A: 303, O: 200, X: 404, P: 404, D: 200},
     ("POST", "/apps/{owner}/{repo}/service-principals/new"): {A: 401, O: 400, X: 404, P: 404, D: 400},
+    # build an agent (spec 2026-11-17 A12): the list is anyone's; the Agent page the app's admin or a portal admin; saving the repo's admin
+    # (acme/notes is not an agent repo here, so the repo's admin is told so, 409, before the empty form)
+    ("GET", "/agents/new"): signed_in(200),
+    ("GET", "/apps/{owner}/{repo}/agent"): {A: 303, O: 200, X: 404, P: 404, D: 200},
+    ("POST", "/apps/{owner}/{repo}/agent"): {A: 401, O: 409, X: 404, P: 404, D: 403},
     # lifecycle (spec 2026-11-02 rule 1): a portal admin only; the app's own admin passes APP_ADMIN and is refused (403). acme/notes has no
     # intake record observed here, so the admin's form is refused as not registered (409), before any task is checked
     ("GET", "/apps/{owner}/{repo}/lifecycle/{action}"): {A: 303, O: 403, X: 404, P: 404, D: 409},
@@ -119,8 +124,9 @@ def test_a_forged_roles_header_changes_nothing(portal, route, who):
 # the app page's environment selector: ?environment=prod (GET) or environment=prod (POST) gets what the plain route gets, and a
 # bad environment is a 400 for whoever passes the route's Access requirement (that requirement is checked first). The lifecycle routes
 # take no environment: an action is for every environment of the app; nor do the service principal routes: a principal is the app's,
-# linked per environment afterwards
-APP_ROUTES = sorted(r for r in ROUTES if r[1].startswith("/apps/") and "/lifecycle/" not in r[1] and "/service-principals/" not in r[1])
+# linked per environment afterwards; nor does the Agent page: agent.yaml is the same in every environment
+APP_ROUTES = sorted(r for r in ROUTES if r[1].startswith("/apps/") and "/lifecycle/" not in r[1] and "/service-principals/" not in r[1]
+                    and not r[1].endswith("/agent"))
 
 
 @pytest.mark.parametrize("who", PRINCIPALS)
