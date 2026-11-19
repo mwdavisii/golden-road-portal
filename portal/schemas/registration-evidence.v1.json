@@ -16,7 +16,7 @@
     "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "allOf": [{"$ref": "#/$defs/single_line"}]},
     "spec_present": {"type": "boolean"},
     "data_classification": {"oneOf": [{"$ref": "#/$defs/classification"}, {"type": "null"}]},
-    "app_type": {"enum": ["python", "node", "static", null]},
+    "app_type": {"enum": ["python", "node", "static", "agent", null]},
     "resources_tier": {"enum": ["default", "medium", null]},
     "egress": {
       "type": "array",

@@ -194,6 +194,8 @@ def show(request: Request, request_id: str, principal=REQUESTER_OR_ADMIN):
         return lifecycle_request_page(request, found, principal)
     if found.kind == "service_principal":
         return service_principal_request_page(request, found, principal)
+    if found.kind == "agent_definition":  # its state, its pull request and its error are on the app's Agent page (the stored repo)
+        return RedirectResponse(f"/apps/{found.repo}/agent", status_code=303)
     store = request.app.state.store
     context = evidence_context(store, found)
     return page(request, "request.html", req=found, mine=found.requested_by == principal.person.id, errors=[],

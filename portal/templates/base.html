@@ -24,6 +24,7 @@
 {% if principal.signed_in %}
 {{ nav_link("/me", "me", "Me") }}
 {{ nav_link("/register", "register", "Register") }}
+{{ nav_link("/agents/new", "agents", "Build an agent") }}
 {{ nav_link("/requests", "requests", "My requests") }}
 {% if principal.is_admin %}
 <p class="nav-heading" id="nav-admin">Admin</p>

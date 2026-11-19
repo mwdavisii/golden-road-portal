@@ -13,7 +13,7 @@ import re
 
 import yaml
 
-from .bindings import SKILLS_DIR, effects, mcp_secret_path, mcp_token_name
+from .bindings import ENVIRONMENTS, SKILLS_DIR, agent_key_path, effects, mcp_secret_path, mcp_token_name
 
 NAMESPACE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 KINDS = ["ServiceAccount", "Deployment", "Service", "NetworkPolicy", "CiliumNetworkPolicy"]
@@ -25,10 +25,15 @@ EXTERNAL_SECRET_STORE = "delinea-secret-server"  # the platform's ClusterSecretS
 EXTERNAL_SECRET_SUFFIX = "-delinea"
 # Env names the platform's own integrations set. A secret may never take one. deploy-verify also holds every secret to the builder's
 # reserved names and prefixes (builder.spec), which this file can't import: the portal holds it byte for byte.
-PLATFORM_ENV_PREFIXES = ("AZURE_", "DATABRICKS_", "SECRETSERVER_", "MCP_", "CF_ACCESS_")
+PLATFORM_ENV_PREFIXES = ("AZURE_", "DATABRICKS_", "SECRETSERVER_", "MCP_", "CF_ACCESS_", "AGENT_")
 PLATFORM_ENV_NAMES = ("SKILLS_DIR",)
 # The app's Cloudflare service token: two entries of the one ExternalSecret, after the secrets', by property of the Secret Server secret.
 MCP_TOKEN_KEYS = (("CF_ACCESS_CLIENT_ID", "client-id"), ("CF_ACCESS_CLIENT_SECRET", "client-secret"))
+# An agent app (spec 2026-11-17): the builder puts AGENT_GATEWAY_URL in its signed Deployment, and nothing else can (AGENT_ is reserved),
+# so that is how compose knows one. Its gateway key is the ExternalSecret's last entry, from the key's fixed path.
+AGENT_URL_ENV = "AGENT_GATEWAY_URL"
+AGENT_KEY = ("AGENT_GATEWAY_KEY", "key")
+GRAPH_HOST = "graph.microsoft.com"  # graph_read: an agent app with an Azure identity bound reaches Microsoft Graph v1.0 (spec 2026-11-17 A6)
 # Skills: one ConfigMap per environment, mounted read-only at SKILLS_DIR. The limits are what one binding's ConfigMap holds (spec S4).
 SKILLS_SUFFIX = "-skills"
 SKILLS_VOLUME = "skills"
@@ -117,6 +122,29 @@ def parse_manifests(text: str, image: str) -> list:
     return objects
 
 
+def is_agent(objects: list) -> bool:
+    """The checked objects are an agent app's: its container's env names AGENT_GATEWAY_URL."""
+    try:
+        env = objects[1]["spec"]["template"]["spec"]["containers"][0].get("env") or []
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return False
+    return isinstance(env, list) and any(isinstance(e, dict) and e.get("name") == AGENT_URL_ENV for e in env)
+
+
+def agent_key_for(objects: list, repo, environment) -> str | None:
+    """The checked objects' gateway key path: None for any app but an agent, else the path the repo and environment fix. Raises
+    ComposeError for an agent without them (or with an owner or environment that has no key name). Compose and deploy-verify both
+    ask this, so they can't disagree on which apps get a key or where it is."""
+    if not is_agent(objects):
+        return None
+    if not isinstance(repo, str) or environment not in ENVIRONMENTS:
+        raise ComposeError("an agent app's environment needs its repo and environment: its gateway key's path is fixed by them")
+    try:
+        return agent_key_path(repo, environment)
+    except ValueError as exc:
+        raise ComposeError(str(exc)) from None
+
+
 def refuse_workload_identity_keys(objects: list) -> None:
     """Only the platform's binding switches the workload identity on, so the app's manifests may carry no azure.workload.identity/
     key in the ServiceAccount's or the pod template's labels or annotations, with or without a binding. Reads only."""
@@ -135,14 +163,17 @@ def refuse_workload_identity_keys(objects: list) -> None:
                 raise ComposeError(f"{what} {key} carry {', '.join(taken)}, which only the platform's binding may set")
 
 
-def external_secret(app: str, secrets, mcp=None) -> dict:
-    """The one ExternalSecret an environment's secrets and MCP token become: ESO's secretserver provider reads each by id (or, for
-    the token, its fixed path) and field slug, from the platform's ClusterSecretStore, into a Secret the ExternalSecret owns. The
-    secrets' entries come first, then the token's two. Names, ids and paths only, never a value."""
+def external_secret(app: str, secrets, mcp=None, agent_key=None) -> dict:
+    """The one ExternalSecret an environment's secrets, MCP token and agent gateway key become: ESO's secretserver provider reads
+    each by id (or, for the token and the key, its fixed path) and field slug, from the platform's ClusterSecretStore, into a Secret
+    the ExternalSecret owns. The secrets' entries come first, then the token's two, then the agent's gateway key. Names, ids and
+    paths only, never a value."""
     name = app + EXTERNAL_SECRET_SUFFIX
     data = [{"secretKey": env, "remoteRef": {"key": str(sid), "property": slug}} for env, sid, slug in secrets]
     if mcp:
         data += [{"secretKey": key, "remoteRef": {"key": mcp["secret_path"], "property": prop}} for key, prop in MCP_TOKEN_KEYS]
+    if agent_key:
+        data.append({"secretKey": AGENT_KEY[0], "remoteRef": {"key": agent_key, "property": AGENT_KEY[1]}})
     return {"apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret", "metadata": {"name": name},
             "spec": {"refreshInterval": "1h", "secretStoreRef": {"kind": "ClusterSecretStore", "name": EXTERNAL_SECRET_STORE},
                      "target": {"name": name, "creationPolicy": "Owner"},
@@ -233,15 +264,17 @@ def _container_env(deployment: dict, names) -> list:
     return env
 
 
-def apply_binding(objects: list, binding, skills=None) -> list:
+def apply_binding(objects: list, binding, skills=None, agent_key=None) -> list:
     """Add the binding's workload identity, env, egress and skills mount to the checked objects, in place, and return the objects to
-    append, in order: the skills ConfigMap, then the ExternalSecret for its secrets and MCP token (each only when there is one).
+    append, in order: the skills ConfigMap, then the ExternalSecret for its secrets, MCP token and agent_key (an agent app's gateway
+    key's Secret Server path, or None), each only when there is one.
     The Azure Workload Identity webhook on the cluster injects the projected token; the platform adds only the annotation, the label
     and plain values. Plain env (the identity's, Databricks', MCP_URL, MCP_SERVERS, SKILLS_DIR) and egress apply with or without an
     identity. Egress uses the builder's own FQDN rule shape for declared egress, after the rules it generated (the DNS rule toFQDNs
     needs among them), and a rule already there is not added twice. Secrets, then the token's two keys, each become a secretKeyRef
-    env entry into the ExternalSecret's target, after the plain env. `skills` is {name: {path: text}} for exactly the binding's
-    skills. An env name the app already sets, or the binding already set, is refused, never overwritten."""
+    env entry into the ExternalSecret's target, after the plain env, and so does the gateway key, last. `skills` is
+    {name: {path: text}} for exactly the binding's skills. An env name the app already sets, or the binding already set, is
+    refused, never overwritten."""
     refuse_workload_identity_keys(objects)
     try:
         fx = effects(binding)
@@ -254,20 +287,24 @@ def apply_binding(objects: list, binding, skills=None) -> list:
     if fx["env"]:
         env = _container_env(deployment, [name for name, _ in fx["env"]])
         env.extend({"name": name, "value": value} for name, value in fx["env"])
-    if fx["egress"]:
+    egress = fx["egress"]
+    if agent_key and fx["client_id"] is not None:  # only an agent's runtime calls Graph (graph_read); any other app's egress is as before
+        egress = egress + [GRAPH_HOST]
+    if egress:
         spec = cilium.get("spec")
         rules = spec.setdefault("egress", []) if isinstance(spec, dict) else None
         if not isinstance(rules, list):
             raise ComposeError("the CiliumNetworkPolicy has no egress list")
-        for host in fx["egress"]:
+        for host in egress:
             rule = {"toFQDNs": [{"matchName": host}], "toPorts": [{"ports": [{"port": "443", "protocol": "TCP"}]}]}
             if rule not in rules:
                 rules.append(rule)
-    if not (fx["skills"] or fx["secrets"] or fx["mcp"]):
+    if not (fx["skills"] or fx["secrets"] or fx["mcp"] or agent_key):
         return []
     app = deployment["metadata"].get("name")
     if not isinstance(app, str) or not NAMESPACE.fullmatch(app):
-        raise ComposeError("the Deployment's name is not a DNS-1123 label, so its skills, secrets and MCP token have no object names")
+        raise ComposeError("the Deployment's name is not a DNS-1123 label, "
+                           "so its skills, secrets, MCP token or gateway key have no object names")
     extras = []
     if fx["skills"]:
         given = skills if isinstance(skills, dict) else {}
@@ -280,15 +317,16 @@ def apply_binding(objects: list, binding, skills=None) -> list:
         config_map, volume = skills_config_map(app, given)
         _mount_skills(deployment, volume)
         extras.append(config_map)
-    if fx["secrets"] or fx["mcp"]:
+    if fx["secrets"] or fx["mcp"] or agent_key:
         platform = sorted(name for name, _, _ in fx["secrets"] if name.startswith(PLATFORM_ENV_PREFIXES) or name in PLATFORM_ENV_NAMES)
         if platform:
             raise ComposeError(f"a secret can't be {', '.join(platform)}: "
                                f"{'/'.join(PLATFORM_ENV_PREFIXES)} and {'/'.join(PLATFORM_ENV_NAMES)} names are the platform's")
-        keys = [name for name, _, _ in fx["secrets"]] + ([key for key, _ in MCP_TOKEN_KEYS] if fx["mcp"] else [])
+        keys = ([name for name, _, _ in fx["secrets"]] + ([key for key, _ in MCP_TOKEN_KEYS] if fx["mcp"] else [])
+                + ([AGENT_KEY[0]] if agent_key else []))
         env = _container_env(deployment, keys)
         env.extend({"name": name, "valueFrom": {"secretKeyRef": {"name": app + EXTERNAL_SECRET_SUFFIX, "key": name}}} for name in keys)
-        extras.append(external_secret(app, fx["secrets"], fx["mcp"]))
+        extras.append(external_secret(app, fx["secrets"], fx["mcp"], agent_key))
     return extras
 
 
@@ -306,14 +344,18 @@ def apply_lifecycle(objects: list, lifecycle) -> None:
     spec["replicas"] = 0
 
 
-def compose(manifests_text: str, image: str, binding, namespace=None, skills=None, lifecycle=None) -> str:
+def compose(manifests_text: str, image: str, binding, namespace=None, skills=None, lifecycle=None, repo=None, environment=None) -> str:
     """composed.yaml: the signed objects, checked, with the binding (or none) applied, then its skills ConfigMap, if it pins skills
-    (`skills` is their files, {name: {path: text}}), and its ExternalSecret, if it has secrets or MCP servers, last. With a lifecycle
-    (lifecycle.yaml's document) that is suspended, the Deployment runs no pods. Deterministic for the same inputs. With a
+    (`skills` is their files, {name: {path: text}}), and its ExternalSecret, if it has secrets or MCP servers or is an agent's,
+    last. With a lifecycle (lifecycle.yaml's document) that is suspended, the Deployment runs no pods. Deterministic for the same
+    inputs. With a
     namespace (golden-road-deploy always passes release.yaml's), a Namespace object of that name comes first: neither Flux's
-    targetNamespace nor an Argo CD Application without CreateNamespace creates it, so a manual resume or sync would fail."""
+    targetNamespace nor an Argo CD Application without CreateNamespace creates it, so a manual resume or sync would fail.
+    An agent app's manifests (is_agent) need its repo and environment: the ExternalSecret then also holds its gateway key, from the
+    path they fix, in every environment, with a binding or none. Any other app's output doesn't depend on them."""
     objects = parse_manifests(manifests_text, image)
-    objects += apply_binding(objects, binding, skills)
+    agent_key = agent_key_for(objects, repo, environment)
+    objects += apply_binding(objects, binding, skills, agent_key)
     apply_lifecycle(objects, lifecycle)
     if namespace is not None:
         if not isinstance(namespace, str) or not NAMESPACE.fullmatch(namespace):

@@ -561,7 +561,8 @@ def test_a_decommission_ends_with_the_archive_and_the_task_closed(portal):
     assert as_lifecycle_token(world) == TOKEN_CALLS, "the token reads the repository, archives it, and is revoked"
     app_calls = [(c["method"], c["path"]) for c in world.calls if c["path"].endswith("/installation") or c["path"].startswith("/app/")]
     assert app_calls == [("GET", f"/repos/acme/{p}/installation") for p in ("platform-pipeline", "scorecard-factory", "golden-road-deploy",
-                                                                            "golden-road-portal", "golden-road-agents", "security-scans")] + [
+                                                                            "golden-road-portal", "golden-road-agents", "security-scans",
+                                                                            "golden-road-agent-template")] + [
         ("GET", "/repos/acme/notes/installation"), ("POST", "/app/installations/77/access_tokens")]
     passes(portal, world, 1, dcfg(world))
     assert steps(portal, req)[2].state == "pr_open" and list(world.pulls) == [(deploy, 1), (factory, 1)]
@@ -1810,3 +1811,23 @@ def test_a_command_open_when_the_recheck_refuses_the_request_is_finished_with_a_
     assert portal.store.open_lifecycle_command(req.id) is None
     assert note(portal, req, "command") == ("Abandon asked by Admin was not carried out: the platform refused the request before "
                                             "changing anything (nothing_to_suspend).")
+
+
+# ---- an agent app (spec 2026-11-17 A5): a suspension keeps its gateway key, so a resume needs nothing fetched again ----
+
+def test_a_suspended_agent_keeps_its_gateway_key(portal):
+    from portal_fakes import FIXTURES
+    objects = [o for o in yaml.safe_load_all((FIXTURES / "deploy/manifests.yaml").read_bytes()) if o]
+    objects[1]["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "AGENT_GATEWAY_URL", "value": "https://llm.example.org/v1"})
+    world = RepoWorld()
+    deploy, _ = deploy_world(world, manifests="---\n".join(yaml.safe_dump(o, sort_keys=False) for o in objects).encode())
+    req = lifecycle_request(portal.store, portal.people, T0)
+    passes(portal, world, 2)
+    assert steps(portal, req)[0].state == "done" and world.pull(deploy, 1)["merged"]
+    for env in ("test", "prod"):
+        out = [o for o in yaml.safe_load_all(world.files(deploy)[f"apps/acme/notes/{env}/composed.yaml"]) if o]
+        assert deployment(world.files(deploy)[f"apps/acme/notes/{env}/composed.yaml"])["spec"]["replicas"] == 0
+        assert out[-1]["kind"] == "ExternalSecret" and out[-1]["spec"]["data"] == [
+            {"secretKey": "AGENT_GATEWAY_KEY", "remoteRef": {"key": f"/golden-road/agent-gateway-keys/agent-acme--notes-{env}", "property": "key"}}]
+        env_names = [e["name"] for e in deployment(world.files(deploy)[f"apps/acme/notes/{env}/composed.yaml"])["spec"]["template"]["spec"]["containers"][0]["env"]]
+        assert env_names[-1] == "AGENT_GATEWAY_KEY"

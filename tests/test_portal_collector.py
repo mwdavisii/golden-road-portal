@@ -10,6 +10,13 @@ from portal.store.memory import MemoryStore
 API = "https://api.github.com"
 
 
+@pytest.fixture(autouse=True)
+def no_agents_part(monkeypatch):
+    """No test here reaches GitHub through the agents part (spec 2026-11-17): its own tests are test_portal_collector_agents.py."""
+    import portal.collectors.__main__ as entry
+    monkeypatch.setattr(entry, "collect_agents", lambda gh, store, *, now: {"agents": 0, "problems": 0})
+
+
 def github():
     gh = FakeGitHub()
     gh.on("GET", "/installation/repositories", (200, {"repositories": [{"full_name": "acme/notes"}, {"full_name": "acme/tools"}]}))
@@ -223,6 +230,47 @@ def test_each_part_records_its_status_and_the_interval_so_the_page_can_tell_a_st
     assert code == 1 and status["repo_admins"].problem is None and status["repo_admins"].counts == {"interval_seconds": 120}
     assert status["evidence"].problem == "failed" and status["evidence"].last_ok_at is None
 
+
+
+def test_the_agents_part_runs_after_repo_admins_and_says_what_it_saw(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+
+    class Store:
+        def close(self):
+            pass
+
+    seen = []
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: Store())
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, *, now: seen.append("repo_admins") or 0)
+    monkeypatch.setattr(entry, "collect_agents", lambda gh, store, *, now: seen.append("agents") or {"agents": 2, "problems": 1})
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: seen.append("evidence") or {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    code, err = run_main(["--once"], env_with(tmp_path))
+    assert seen[:3] == ["repo_admins", "agents", "evidence"]
+    assert "collectors: agents: 2 agent repos (1 with a problem)" in err
+
+
+def test_an_agents_part_that_fails_is_logged_and_the_pass_goes_on(tmp_path, monkeypatch):
+    import portal.collectors.__main__ as entry
+    import portal.store.postgres as postgres
+
+    class Store:
+        def close(self):
+            pass
+
+    seen = []
+    monkeypatch.setattr(postgres, "PostgresStore", lambda url: Store())
+    monkeypatch.setattr(entry, "InstallationToken", lambda *a, **k: (lambda: "ghs_x"))
+    monkeypatch.setattr(entry, "collect", lambda gh, store, *, now: 0)
+    monkeypatch.setattr(entry, "collect_agents", lambda gh, store, *, now: (_ for _ in ()).throw(GitHubError(502, "GET", "/repos/acme/x")))
+    monkeypatch.setattr(entry, "collect_evidence", lambda gh, store, **k: seen.append("evidence") or {"computed": 0, "waiting": 0})
+    monkeypatch.setattr(entry, "collect_intake", lambda gh, store, **k: {"records": 0, "unreadable": 0, "opened": 0, "closed": 0})
+    monkeypatch.setattr(entry, "collect_events", lambda gh, store, **k: {"stored": 0, "skipped": 0})
+    code, err = run_main(["--once"], env_with(tmp_path))
+    assert code == 1 and seen == ["evidence"] and "collectors: agents failed: 502 GET /repos/acme/x" in err
 
 
 # ---- 0.6.0: the CMDB part (PORTAL_SERVICENOW) ----

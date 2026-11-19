@@ -1,5 +1,6 @@
 """`python -m portal.collectors [--once]`: the minimal collector. Reads the read App's credentials and the database URL from the
-environment, and every PORTAL_COLLECT_INTERVAL seconds records the repo admins and computes the evidence of each waiting registration
+environment, and every PORTAL_COLLECT_INTERVAL seconds records the repo admins, observes the agent repos (spec 2026-11-17: each
+one's agent.yaml, or why it can't be used, for the web's agent pages) and computes the evidence of each waiting registration
 (PORTAL_ORG names the factory's owner, PORTAL_MODEL_GATEWAY_HOSTS the platform's model gateway hosts). Each pass also observes the
 factory's intake records and opens or closes the review-date items (PORTAL_REVIEW_DUE_SOON_DAYS), and reads the scorecard's re-review
 events from run artifacts onto the re-review list (PORTAL_REREVIEW_SIGNALS). Without actions: read, the events part is skipped and the
@@ -28,6 +29,7 @@ from ..graph_scopes import CatalogError, load_mock as load_scopes
 from ..rereview import BadSetting, parse_days, parse_signals
 from ..service_principals import Replayed
 from ..settings import HOST, ORG, SettingsError, https_url, github_bases, no_servicenow_url, servicenow_from
+from .agents import collect_agents
 from .cmdb import collect_cmdb, seed_mock
 from .events import ARTIFACT_HOSTS, collect_events
 from .evidence import collect_evidence
@@ -124,6 +126,7 @@ def main(argv=None, env=os.environ) -> int:
                 if sp_unusable is None else _raise(sp_unusable)),)  # skipped: the part is failed each pass, by the error's type
             for name, part, run in (
                     ("repo_admins", "repo_admins", lambda: f"{collect(gh, store, now=dt.datetime.now(dt.UTC))} rows"),
+                    ("agents", None, lambda: _agents_note(collect_agents(gh, store, now=dt.datetime.now(dt.UTC)))),
                     ("evidence", "evidence", lambda: _evidence_note(collect_evidence(gh, store, org=org, gateway_hosts=gateway_hosts,
                                                                          now=dt.datetime.now(dt.UTC)))),
                     ("intake", "intake", lambda: _intake_note(collect_intake(gh, store, org=org, today=dt.datetime.now(dt.UTC).date(),
@@ -169,6 +172,10 @@ def _status(store, part, ok, interval) -> None:
             store.set_rereview_status(source=part, problem=None, counts={"interval_seconds": interval}, now=dt.datetime.now(dt.UTC))
     except Exception as exc:  # noqa: BLE001 - logged by type; the next part still runs
         print(f"collectors: {part} status not recorded: {type(exc).__name__}", file=sys.stderr)
+
+
+def _agents_note(result) -> str:
+    return f"{result['agents']} agent repos ({result['problems']} with a problem)"
 
 
 def _evidence_note(result) -> str:

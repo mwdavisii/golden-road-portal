@@ -9,7 +9,9 @@
   "rules_unreadable": "the factory's config/registration.yaml can't be read",
   "repo_unreadable": "the portal's read App can't read this repository",
   "record_unreadable": "the portal's read App can't read this repository's intake record in the factory, so a change can't be compared with it",
-  "record_case_mismatch": "the factory holds this repository's intake record under another spelling of its name too (GitHub's paths are case-sensitive): rename or remove the extra one in the factory"} %}
+  "record_case_mismatch": "the factory holds this repository's intake record under another spelling of its name too (GitHub's paths are case-sensitive): rename or remove the extra one in the factory",
+  "agent_yaml_missing": "this is an agent repo, and its default branch has no agent.yaml yet: define the agent on its Agent page, and merge the pull request",
+  "agent_yaml_invalid": "this is an agent repo, and the agent.yaml on its default branch isn't a valid agent/v1 with one of the platform's models: fix it on its Agent page"} %}
 {% if not evidence %}
 <p class="callout info">Waiting for the platform's evidence: the collector computes it on its next pass.</p>
 {% if problem %}<p class="error warn">{{ reasons.get(problem, "the evidence could not be computed") }}</p>{% endif %}

@@ -27,6 +27,7 @@ MESSAGES = {
     "stop": "Stop requested: the writer closes the steps still to do on its next pass",
     "service_principal": "Service principal requested: the collector creates it, or opens its ServiceNow task, on its next pass",
     "task_decided": "Decision stored: the collector reads the task on its next pass",
+    "agent_saved": "Saved: the writer opens or updates the agent's pull request on its next pass",
 }
 
 

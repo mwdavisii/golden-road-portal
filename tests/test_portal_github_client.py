@@ -43,6 +43,27 @@ def test_pagination_follows_next_on_the_api_host_only():
     assert [c["path"] for c in gh.calls] == ["/installation/repositories", "/installation/repositories"]
 
 
+def test_with_no_page_cap_every_next_page_is_followed():
+    gh = FakeGitHub()
+    pages = [(200, [n], {"link": f'<{API}/installation/repositories?page={n + 2}>; rel="next"'}) for n in range(59)] + [(200, [59])]
+    gh.on("GET", "/installation/repositories", *pages)
+    client = GitHub(API, httpx.Client(transport=transport(gh)), lambda: "ghs_x")
+    assert list(client.paginate("/installation/repositories", max_pages=None)) == list(range(60))
+
+
+
+@pytest.mark.parametrize("links", [
+    ["/installation/repositories?page=2", "/installation/repositories?page=2"],  # the same next page again
+    ["/installation/repositories?page=2", "/installation/repositories?page=3", "/installation/repositories?page=2"],  # a cycle
+])
+def test_with_no_page_cap_a_next_link_that_repeats_is_an_error_not_a_loop(links):
+    gh = FakeGitHub()
+    gh.on("GET", "/installation/repositories", *[(200, [n], {"link": f'<{API}{link}>; rel="next"'}) for n, link in enumerate(links)])
+    client = GitHub(API, httpx.Client(transport=transport(gh)), lambda: "ghs_x")
+    with pytest.raises(GitHubError, match="a next page repeats") as err:
+        list(client.paginate("/installation/repositories", max_pages=None))
+    assert err.value.status == 200 and len(gh.calls) <= len(links) + 1
+
 def test_an_unexpected_status_is_a_github_error_without_github_s_text():
     gh = FakeGitHub().on("GET", "/repos/acme/x", (500, {"message": "<html>boom"}))
     with pytest.raises(GitHubError) as err:

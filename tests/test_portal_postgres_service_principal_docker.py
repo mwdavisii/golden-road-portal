@@ -584,7 +584,7 @@ def test_0013_applies_to_a_populated_database_migrated_through_0012(pg_server, m
                 "schema": "registration-draft/v1", "repo": "acme/notes", "purpose": "Stores short team notes.", "data_classification": "public"})
             bid = "r_" + "b" * 32
             web.create_binding(request_id=bid, person_id=owner.id, final=binding_final("acme/notes", owner.id, bid), now=NOW)
-            monkeypatch.setattr(migrate, "migrations", lambda: every)
+            monkeypatch.setattr(migrate, "migrations", lambda: [p for p in every if p.stem[:4] <= "0013"])  # 0014 has its own test
             assert migrate.apply(dsn()) == ["0013_service_principals"] and migrate.apply(dsn()) == []
             assert store.get_request(reg.id).state == "pending" and store.service_principal_requests() == []
             assert writer.claim_approved(now=NOW).id == bid

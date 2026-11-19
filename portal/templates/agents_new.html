@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% set active = "agents" %}
+{% block title %}Build an agent - golden road{% endblock %}
+{% block main %}
+<span class="eyebrow">Agents</span>
+<h1>Build an agent</h1>
+<p class="callout info">An agent here is a model with instructions, skills, MCP servers and data, and no code of its own: the platform's runtime runs it. You write its instructions in the portal, and pick its skills, MCP servers and data on its app page, per environment, as for any app.</p>
+<section class="card">
+<div class="card-head"><h2>1. Create the repo</h2></div>
+<p>Create your agent's repository from the platform's template, named <span class="mono">agent-&lt;name&gt;</span> in lower-case letters, digits and -.</p>
+<p class="actions"><a class="button gold" href="{{ template_url }}" rel="noopener noreferrer">Use this template</a></p>
+<p class="hint">Then ask the platform team to add it to the portal's read App and agent App. The portal finds the repo on the collector's next pass.</p>
+</section>
+<section class="card">
+<div class="card-head"><h2>2. Define the agent</h2></div>
+{% if repos %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Repository</th><th scope="col">agent.yaml</th><th scope="col"></th></tr></thead>
+<tbody>{% for r in repos %}<tr><td class="mono">{{ r.repo }}</td><td>{% if r.problem %}{{ problems[r.problem] }}{% else %}{{ r.display_name }}{% endif %}</td><td><a class="button secondary" href="/apps/{{ r.owner }}/{{ r.name }}/agent">Define the agent</a></td></tr>
+{% endfor %}</tbody></table></div>
+{% elif stale_note %}
+<p class="callout warn" role="status">{{ stale_note }}</p>
+{% else %}
+<p class="empty">No agent repo of yours yet, as the collector last saw your repositories.</p>
+{% endif %}
+<p class="hint">Then register it, and pick its skills, MCP servers and data on its app page, as for any app.</p>
+</section>
+{% endblock %}

@@ -397,7 +397,7 @@ def git_sha(raw: bytes) -> str:
 # What the read installation is granted (the collector's App): Metadata and Contents, read only. A call needing more gets 403.
 READ_PERMISSIONS = {"metadata": "read", "contents": "read"}
 READ_WITH_ACTIONS = {**READ_PERMISSIONS, "actions": "read"}  # the read App from 0.5.1: it lists scorecard runs and downloads their artifacts
-KNOWN_FILES = ("builder-spec.json", ".builder.lock", "requirements.txt", "package-lock.json", "config/registration.yaml")
+KNOWN_FILES = ("builder-spec.json", ".builder.lock", "requirements.txt", "package-lock.json", "config/registration.yaml", "agent.yaml")
 
 
 def repo_at(gh, repo, files, *, commit="a" * 40, branch="main", modes=None):
@@ -521,7 +521,8 @@ class RepoWorld:
     trees ({path: bytes}). It answers the calls the writer makes: the repo, refs, the contents API (GET; PUT and DELETE, one commit
     each), commits with their files, the Git Trees API, pull requests (list, create, read, files, merge, close, comment), check runs and
     the workflow run behind each (every check passes unless `checks` says otherwise), and for the lifecycle App: a repo's installation,
-    its token and the archive. A person merges with merge(), pushes with push(), moves main with advance_main(). An unknown call fails.
+    its token and the archive, and for the agent App (spec 2026-11-17): GET /app, a repo's installation, a token for one repository,
+the token's /installation/repositories, and the PRs it opens as its own bot. A person merges with merge(), pushes with push(), moves main with advance_main(). An unknown call fails.
 
     Its answers have the shapes writer.run's checks read: a check run names its suite, head_sha and the one PR (_run_is_ours), the
     suite's one workflow run is a pull_request run for the PR's branch and tip from the repo itself, and a commit names its one parent
@@ -541,6 +542,15 @@ class RepoWorld:
         self.calls = []
         self.comments = []  # (repo, number, body)
         self.writer_login = "golden-road-portal-writer[bot]"  # who opens a PR through the API (the write App's bot)
+        self.agent_app_id = 424244  # the agent App (spec 2026-11-17; decided while planning: item 27): agent_app() signs as it
+        self.agent_installed = {}  # repo -> the agent App's installation id there
+        self.agent_token = "ghs_" + "A" * 36
+        self.agent_token_requests = []  # (installation id, the request's body)
+        self.agent_token_permissions = None  # what GitHub grants the agent token (None: what was asked)
+        self.agent_token_repos = []  # the repositories the agent token was last granted (full names)
+        self.agent_login = "golden-road-portal-agent[bot]"  # who opens a PR with the agent App's token
+        self.agent_selection = {}  # repo -> the agent App's installation's repository_selection there ("selected" unless set)
+        self.max_per_page = 100  # GitHub's largest page: a list asks per_page and gets at most this many, with a link to the next
         self._n = 0
 
     # ---- set up and act as people ----
@@ -618,30 +628,46 @@ class RepoWorld:
                 entries.append({"path": head, "mode": "100644", "type": "blob", "sha": git_sha(content)})
         return {"sha": sha, "truncated": False, "tree": entries}
 
-    def _as_lifecycle_app(self, request) -> bool:
-        """The call carries an RS256 App JWT issued by the lifecycle App (its signature is the real GitHub's to check)."""
+    def _app_of(self, request) -> str | None:
+        """"lifecycle" or "agent": the App whose RS256 JWT the call carries (its signature is the real GitHub's to check), else None."""
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         try:
             payload = token.split(".")[1]
             claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-            return jwt.get_unverified_header(token).get("alg") == "RS256" and claims.get("iss") == str(self.lifecycle_app_id)
+            if jwt.get_unverified_header(token).get("alg") != "RS256":
+                return None
         except (jwt.PyJWTError, IndexError, ValueError):
-            return False
+            return None
+        return {str(self.lifecycle_app_id): "lifecycle", str(self.agent_app_id): "agent"}.get(claims.get("iss"))
 
     def _pr_view(self, repo, pull):
         # GitHub keeps a merged PR's head, and a PR's last head once its branch is deleted
         tip = pull["last_tip"] if pull.get("merged") else self.repos[repo].get(pull["head"]["ref"], pull.get("last_tip"))
         return {**{k: v for k, v in pull.items() if k not in ("base_sha", "last_tip")}, "head": {**pull["head"], "sha": tip, "repo": {"full_name": repo}},
-                "base": {"ref": "main", "sha": pull["base_sha"]},  # the base at the PR's last sync: the writer never updates it
+                "base": {"ref": pull.get("base_ref", "main"), "sha": pull["base_sha"]},  # the base at the PR's last sync: the writer never updates it
                 "mergeable_state": "behind" if pull["base_sha"] != self.repos[repo]["main"] else "clean"}
 
     def handle(self, request):
         method, path, params = request.method, request.url.path, dict(request.url.params)
         body = json.loads(request.content) if request.content else None
         self.calls.append({"method": method, "path": path, "query": params, "body": body, "auth": request.headers.get("authorization", "")})
-        as_app = path.startswith("/app/") or path.endswith("/installation")
-        if as_app and not self._as_lifecycle_app(request):
+        as_app = path == "/app" or path.startswith("/app/") or path.endswith("/installation")
+        app = self._app_of(request) if as_app else None
+        if as_app and app is None:
             return httpx.Response(401, json={"message": "A JSON web token could not be decoded"})
+        if method == "GET" and path == "/app":
+            return httpx.Response(200, json={"id": self.agent_app_id if app == "agent" else self.lifecycle_app_id,
+                                             "slug": "golden-road-portal-agent" if app == "agent" else "golden-road-portal-lifecycle"})
+        if method == "POST" and app == "agent" and (m := re.fullmatch(r"/app/installations/(\d+)/access_tokens", path)):
+            # GitHub answers the repositories the token reaches (of that installation) with the permissions it granted
+            self.agent_token_requests.append((int(m.group(1)), body))
+            self.revoked.discard(self.agent_token)
+            names = (body or {}).get("repositories", [])
+            self.agent_token_repos = [r for r, i in sorted(self.agent_installed.items()) if i == int(m.group(1)) and r.split("/")[1] in names]
+            return httpx.Response(201, json={"token": self.agent_token, "expires_at": "2026-11-18T00:00:00Z",
+                                             "permissions": self.agent_token_permissions or (body or {}).get("permissions", {}),
+                                             "repository_selection": "selected",
+                                             "repositories": [{"name": r.split("/")[1], "full_name": r} for r in self.agent_token_repos]})
         if method == "POST" and (m := re.fullmatch(r"/app/installations/(\d+)/access_tokens", path)):
             self.token_requests.append((int(m.group(1)), body))
             self.revoked.discard(self.lifecycle_token)
@@ -652,17 +678,24 @@ class RepoWorld:
         if request.headers.get("authorization") in {f"Bearer {t}" for t in self.revoked}:
             return httpx.Response(401, json={"message": "Bad credentials"})
         if method == "DELETE" and path == "/installation/token":
-            if request.headers.get("authorization") != f"Bearer {self.lifecycle_token}":
+            token = request.headers.get("authorization", "").removeprefix("Bearer ")
+            if token not in (self.lifecycle_token, self.agent_token):
                 return httpx.Response(401, json={"message": "Bad credentials"})
-            self.revoked.add(self.lifecycle_token)
+            self.revoked.add(token)
             return httpx.Response(204)
+        if method == "GET" and path == "/installation/repositories":
+            if request.headers.get("authorization") != f"Bearer {self.agent_token}":
+                raise AssertionError("RepoWorld lists an installation's repositories for the agent token only")
+            repos = [{"name": r.split("/")[1], "full_name": r} for r in self.agent_token_repos]
+            return httpx.Response(200, json={"total_count": len(repos), "repositories": repos})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)(/.*)?", path)
         if m is None or m.group(1) not in self.repos and not path.endswith("/installation"):
             return httpx.Response(404, json={"message": "Not Found"})
         repo, rest = m.group(1), m.group(2) or ""
         if rest == "/installation":
-            found = self.installed.get(repo)
-            return httpx.Response(200, json={"id": found}) if found else httpx.Response(404, json={"message": "Not Found"})
+            found = (self.agent_installed if app == "agent" else self.installed).get(repo)
+            selection = self.agent_selection.get(repo, "selected") if app == "agent" else "selected"
+            return httpx.Response(200, json={"id": found, "repository_selection": selection}) if found else httpx.Response(404, json={"message": "Not Found"})
         if rest == "" and method == "GET":
             return httpx.Response(200, json={"full_name": repo, "default_branch": "main", "archived": repo in self.archived})
         if rest == "" and method == "PATCH":
@@ -719,16 +752,22 @@ class RepoWorld:
             return httpx.Response(200 if status != "added" else 201,
                                   json={"commit": {"sha": sha}, "content": None if method == "DELETE" else {"sha": git_sha(tree[file_path])}})
         if rest == "/pulls" and method == "GET":
-            head = params.get("head", "").split(":", 1)[-1]
+            head, state = params.get("head", "").split(":", 1)[-1], params.get("state", "open")  # GitHub lists open ones unless asked
             # GitHub's list answers the pull-request-simple shape: merged_at and merge_commit_sha, but no "merged" (only GET /pulls/{n} has it)
-            return httpx.Response(200, json=[{k: v for k, v in self._pr_view(repo, p).items() if k != "merged"}
-                                             for (r, _), p in sorted(self.pulls.items()) if r == repo and p["head"]["ref"] == head])
+            found = [{k: v for k, v in self._pr_view(repo, p).items() if k != "merged"}
+                     for (r, _), p in sorted(self.pulls.items()) if r == repo and p["head"]["ref"] == head and state in ("all", p["state"])]
+            per_page, page = min(int(params.get("per_page", 30)), self.max_per_page), int(params.get("page", 1))
+            shown = found[(page - 1) * per_page:page * per_page]
+            more = len(found) > page * per_page
+            link = {"link": f'<https://{self.api_host}{path}?head={params.get("head", "")}&state={state}&per_page={per_page}&page={page + 1}>; rel="next"'}
+            return httpx.Response(200, json=shown, headers=link if more else None)
         if rest == "/pulls" and method == "POST":
             number = 1 + max([n for (r, n) in self.pulls if r == repo], default=0)
             self.pulls[(repo, number)] = {"number": number, "html_url": f"https://github.com/{repo}/pull/{number}", "state": "open", "merged": False,
                                           "merged_at": None, "merge_commit_sha": None,
                                           "title": body["title"], "body": body["body"], "head": {"ref": body["head"]}, "base_sha": self.repos[repo]["main"],
-                                          "user": {"login": self.writer_login, "type": "Bot"}}
+                                          "user": {"login": self.agent_login if request.headers.get("authorization") == f"Bearer {self.agent_token}"
+                                                   else self.writer_login, "type": "Bot"}}
             return httpx.Response(201, json=self._pr_view(repo, self.pulls[(repo, number)]))
         if (p := re.fullmatch(r"/pulls/(\d+)(/files|/merge)?", rest)):
             pull = self.pulls[(repo, int(p.group(1)))]
@@ -743,7 +782,7 @@ class RepoWorld:
             if method == "PATCH":
                 if pull["merged"] and "state" in body:
                     return httpx.Response(422, json={"message": "a merged pull request can't be closed or reopened"})
-                pull.update({k: v for k, v in body.items() if k in ("state", "body")})
+                pull.update({k: v for k, v in body.items() if k in ("state", "title", "body")})
                 return httpx.Response(200, json=self._pr_view(repo, pull))
             return httpx.Response(200, json=self._pr_view(repo, pull))
         if method == "POST" and (i := re.fullmatch(r"/issues/(\d+)/comments", rest)):
@@ -841,6 +880,17 @@ def lifecycle_app(world, app_id=None):
     global LIFECYCLE_KEY
     LIFECYCLE_KEY = LIFECYCLE_KEY or pem(new_rsa_key())
     return LifecycleApp(app_id or world.lifecycle_app_id, LIFECYCLE_KEY, "https://api.github.com", httpx.Client(transport=transport(world)))
+
+
+AGENT_KEY = None  # one RSA key for every agent App in a run
+
+
+def agent_app(world, app_id=None):
+    """The real agent App (writer.config.AgentApp) talking to `world`."""
+    from portal.writer.config import AgentApp
+    global AGENT_KEY
+    AGENT_KEY = AGENT_KEY or pem(new_rsa_key())
+    return AgentApp(app_id or world.agent_app_id, AGENT_KEY, "https://api.github.com", httpx.Client(transport=transport(world)))
 
 
 LIFECYCLE_REASON = "Critical vulnerability CVE-2026-0001; suspended until patched"

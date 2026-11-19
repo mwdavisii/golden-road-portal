@@ -9,7 +9,8 @@ are the same in binding/v1 and binding/v2).
 binding/v2 also names MCP servers on the environment's shared Cloudflare gateway and skills pinned to a catalog commit (spec
 2026-10-31). MCP servers become plain env (MCP_URL, MCP_SERVERS), the gateway's egress, and the app's Cloudflare service token, read
 from Secret Server at a path fixed by the repo and environment; skills become SKILLS_DIR and a read-only mount. Neither needs an
-Azure identity."""
+Azure identity. An agent app (spec 2026-11-17) also gets its gateway key, read from Secret Server at a path fixed by the repo and
+environment."""
 
 import re
 
@@ -34,6 +35,27 @@ def mcp_token_name(repo: str, environment: str) -> str:
 def mcp_secret_path(repo: str, environment: str) -> str:
     """The token's Secret Server path. Fixed by the repo and environment, so no binding can point an app at another app's token."""
     return f"{MCP_SECRET_FOLDER}/{mcp_token_name(repo, environment)}"
+
+
+AGENT_KEY_FOLDER = "/golden-road/agent-gateway-keys"  # Secret Server: an agent app's model gateway key per environment (spec 2026-11-17 A5)
+ENVIRONMENTS = ("test", "prod")  # the platform's environments: the gateway key's name ends in one
+
+
+def agent_key_name(repo: str, environment: str) -> str:
+    """agent-<owner>--<repo>-<env>, lower case, one-to-one as mcp_token_name is. Raises ValueError for an owner GitHub wouldn't allow
+    or an environment that is not the platform's."""
+    owner, _, name = repo.lower().partition("/")
+    if not MCP_OWNER.fullmatch(owner) or not name:
+        raise ValueError(f"{repo[:200]!r} has an owner that is not a GitHub owner, so it has no gateway key name")
+    if environment not in ENVIRONMENTS:
+        raise ValueError(f"{str(environment)[:80]!r} is not a platform environment ({'/'.join(ENVIRONMENTS)}), "
+                         "so it has no gateway key name")
+    return f"agent-{owner}--{name}-{environment}"
+
+
+def agent_key_path(repo: str, environment: str) -> str:
+    """The gateway key's Secret Server path: fixed by the repo and environment, so no app can be pointed at another app's key."""
+    return f"{AGENT_KEY_FOLDER}/{agent_key_name(repo, environment)}"
 
 
 def _mcp(binding: dict):
