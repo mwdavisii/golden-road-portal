@@ -17,6 +17,7 @@ anyio==4.15.1 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94
     # via
     #   -c requirements.txt
+    #   fastapi
     #   httpx
     #   starlette
 attrs==26.1.0 \
@@ -206,9 +207,9 @@ cryptography==50.0.2 \
     # via
     #   -c requirements.txt
     #   pyjwt
-fastapi==0.161.1 \
-    --hash=sha256:4076b88434452e20289379068e976c4a04c65ffc8e6be31510106e150a422f0f \
-    --hash=sha256:a1363080cf9aeedecd99f4e1a23669d7e77542227f6536f4d7bbd59f07ecaa94
+fastapi==0.162.5 \
+    --hash=sha256:1ca37f64f61c99cebd38636e67525fb721c5e8c1169f07f2a35d73b0a63265d4 \
+    --hash=sha256:5303c67415fde762889ca337db79d27b755b8bd09cef314fa7a4340bb30bfd2b
     # via
     #   -c requirements.txt
     #   -r requirements.in
